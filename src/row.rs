@@ -420,7 +420,7 @@ impl Row {
 
     /// Retrieve a column's data for a given column index.
     #[track_caller]
-    pub fn get_column_data<'a, I>(&'a self, idx: I) -> crate::Result<ColumnData<'static>>
+    pub fn get_column_data<'a, I>(&'a self, idx: I) -> crate::Result<&'a ColumnData<'static>>
     where
         I: QueryIdx,
     {
@@ -428,7 +428,7 @@ impl Row {
             Error::Conversion(format!("Could not find column with index {}", idx).into())
         })?;
 
-        self.data.get(idx).unwrap()
+        Ok(self.data.get(idx).unwrap())
     }
 }
 
