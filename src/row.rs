@@ -413,13 +413,22 @@ impl Row {
         R: FromSql<'a>,
         I: QueryIdx,
     {
+        let data = self.get_column_data(idx)?;
+
+        R::from_sql(data)
+    }
+
+    /// Retrieve a column's data for a given column index.
+    #[track_caller]
+    pub fn get_column_data<'a, I>(&'a self, idx: I) -> crate::Result<ColumnData<'static>>
+    where
+        I: QueryIdx,
+    {
         let idx = idx.idx(self).ok_or_else(|| {
             Error::Conversion(format!("Could not find column with index {}", idx).into())
         })?;
 
-        let data = self.data.get(idx).unwrap();
-
-        R::from_sql(data)
+        self.data.get(idx).unwrap()
     }
 }
 
