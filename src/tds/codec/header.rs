@@ -92,6 +92,14 @@ impl PacketHeader {
         }
     }
 
+    pub fn sspi(id: u8) -> Self {
+        Self {
+            ty: PacketType::Sspi,
+            status: PacketStatus::EndOfMessage,
+            ..Self::new(0, id)
+        }
+    }
+
     pub fn batch(id: u8) -> Self {
         Self {
             ty: PacketType::SQLBatch,
