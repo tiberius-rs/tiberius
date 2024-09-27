@@ -252,3 +252,101 @@ where
 
     Ok(())
 }
+
+macro_rules! test_bulk_columns {
+    ($name:ident($total_generated:literal $(, $sql_type:literal)+ $(, ($cols:expr, $generator:expr ))+ $(,)?)) => {
+        paste::item! {
+            #[test_on_runtimes]
+            async fn [< bulk_load_optional_ $name >]<S>(mut conn: tiberius::Client<S>) -> Result<()>
+            where
+                S: AsyncRead + AsyncWrite + Unpin + Send,
+            {
+                use tiberius::IntoRow;
+
+                let table = format!("##{}", random_table().await);
+                let column_defs = &[$($sql_type,)+];
+
+                conn.execute(
+                    &format!(
+                        "CREATE TABLE {} (id INT IDENTITY PRIMARY KEY, {})",
+                        table,
+                        column_defs.join(", "),
+                    ),
+                    &[],
+                )
+                    .await?;
+
+                let mut count = 0;
+
+                $(
+                    let mut req = conn.bulk_insert_columns(&table, $cols).await?;
+                    for i in $generator {
+                        let row = i.into_row();
+                        req.send(row).await?;
+                    }
+
+                    let res = req.finalize().await?;
+                    count += res.total();
+                )+
+                assert_eq!($total_generated, count);
+
+                Ok(())
+            }
+
+            #[test_on_runtimes]
+            async fn [< bulk_load_required_ $name >]<S>(mut conn: tiberius::Client<S>) -> Result<()>
+            where
+                S: AsyncRead + AsyncWrite + Unpin + Send,
+            {
+                use tiberius::IntoRow;
+                let table = format!("##{}", random_table().await);
+                let column_defs = &[$(format!("{} NOT NULL", $sql_type),)+];
+
+                conn.execute(
+                    &format!(
+                        "CREATE TABLE {} (id INT IDENTITY PRIMARY KEY, {})",
+                        table,
+                        column_defs.join(", "),
+                    ),
+                    &[],
+                )
+                    .await?;
+
+                let mut count = 0;
+
+                $(
+                    let mut req = conn.bulk_insert_columns(&table, $cols).await?;
+                    for i in $generator {
+                        let row = i.into_row();
+                        req.send(row).await?;
+                    }
+
+                    let res = req.finalize().await?;
+                    count += res.total();
+                )+
+                assert_eq!($total_generated, count);
+
+                Ok(())
+            }
+
+        }
+    };
+}
+
+test_bulk_columns!(ab_ba_default_columns(
+    200,
+    "a INT",
+    "b FLOAT",
+    "c INT DEFAULT 0",
+    (&["a", "b"], vec![(1i32, 1f64); 100]),
+    (&["b", "a"], vec![(2f64, 2i32); 100]),
+));
+
+test_bulk_columns!(ab_ba_override_default_columns(
+    200,
+    "a INT",
+    "b FLOAT",
+    "c INT DEFAULT 0",
+    (&["a", "b", "c"], vec![(1i32, 1f64, 10i32); 100]),
+    (&["b", "c", "a"], vec![(2f64, 20i32, 2i32); 100]),
+));
