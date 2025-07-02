@@ -222,28 +222,21 @@ impl<'a> QueryStream<'a> {
     /// of querying.
     pub async fn into_results(mut self) -> crate::Result<Vec<Vec<Row>>> {
         let mut results: Vec<Vec<Row>> = Vec::new();
-        let mut result: Option<Vec<Row>> = None;
+        let mut result: Vec<Row> = if self.try_next().await?.is_some() {
+            Vec::new()
+        } else {
+            return Ok(results);
+        };
 
         while let Some(item) = self.try_next().await? {
-            match (item, &mut result) {
-                (QueryItem::Row(row), None) => {
-                    result = Some(vec![row]);
-                }
-                (QueryItem::Row(row), Some(ref mut result)) => result.push(row),
-                (QueryItem::Metadata(_), None) => {
-                    result = Some(Vec::new());
-                }
-                (QueryItem::Metadata(_), ref mut previous_result) => {
-                    results.push(previous_result.take().unwrap());
-                    result = None;
-                }
+            if let QueryItem::Row(row) = item {
+                result.push(row);
+            } else {
+                results.push(result);
+                result = Vec::new();
             }
         }
-
-        if let Some(result) = result {
-            results.push(result);
-        }
-
+        results.push(result);
         Ok(results)
     }
 
