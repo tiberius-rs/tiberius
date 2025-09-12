@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::env;
 use std::sync::Once;
+use tiberius::ColumnData;
 use tiberius::{IntoSql, Result, TokenRow};
 
 #[cfg(all(feature = "tds73", feature = "chrono"))]
@@ -395,3 +396,36 @@ test_bulk_type!(datetime2_7(
     100,
     vec![DateTime::from_timestamp(1658524194, 123456789); 100].into_iter()
 ));
+
+#[test_on_runtimes]
+async fn read_and_write_to_keyword_columns<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+
+    conn.simple_query(format!("CREATE TABLE {} ([End] INT)", table))
+        .await?;
+
+    let mut req = conn.bulk_insert(&table).await.unwrap();
+    for num in [6, 7, 8] {
+        let mut row = TokenRow::new();
+        row.push(ColumnData::I32(Some(num)));
+        req.send(row).await.unwrap();
+    }
+    let result = req.finalize().await.unwrap();
+    assert_eq!(result.rows_affected(), &[3]);
+
+    let rows = conn
+        .query(format!("SELECT [End] FROM {}", table), &[])
+        .await?
+        .into_first_result()
+        .await?;
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(Some(6), rows[0].get(0));
+    assert_eq!(Some(7), rows[1].get(0));
+    assert_eq!(Some(8), rows[2].get(0));
+
+    Ok(())
+}

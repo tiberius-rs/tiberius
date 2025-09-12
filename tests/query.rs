@@ -401,6 +401,33 @@ where
 }
 
 #[test_on_runtimes]
+async fn read_and_write_to_keyword_columns<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+
+    conn.simple_query(format!("CREATE TABLE {} ([End] INT)", table))
+        .await?;
+
+    let res = conn
+        .execute(format!("INSERT INTO {} ([End]) VALUES (5)", table), &[])
+        .await?;
+
+    assert_eq!(1, res.total());
+
+    let rows = conn
+        .query(format!("SELECT [End] FROM {}", table), &[])
+        .await?
+        .into_first_result()
+        .await?;
+
+    assert_eq!(Some(5), rows[0].get(0));
+
+    Ok(())
+}
+
+#[test_on_runtimes]
 async fn execute_insert_update_delete<S>(mut conn: tiberius::Client<S>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
