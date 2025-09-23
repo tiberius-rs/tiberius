@@ -186,9 +186,10 @@ impl Debug for Numeric {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}.{:0pad$}",
-            self.int_part(),
-            self.dec_part(),
+            "{}{}.{:0pad$}",
+            if self.value() < 0 { "-" } else { "" },
+            self.int_part().abs(),
+            self.dec_part().abs(),
             pad = self.scale as usize
         )
     }
@@ -366,6 +367,24 @@ mod tests {
         let n = Numeric::new_with_scale(57705, 2);
         assert_eq!(n.int_part(), 577);
         assert_eq!(n.dec_part(), 5);
+    }
+
+    #[test]
+    fn numeric_to_string() {
+        assert_eq!(Numeric::new_with_scale(123, 0).to_string(), "123.0");
+        assert_eq!(Numeric::new_with_scale(123, 1).to_string(), "12.3");
+        assert_eq!(Numeric::new_with_scale(123, 2).to_string(), "1.23");
+        assert_eq!(Numeric::new_with_scale(123, 3).to_string(), "0.123");
+        assert_eq!(Numeric::new_with_scale(123, 4).to_string(), "0.0123");
+        assert_eq!(Numeric::new_with_scale(123, 36).to_string(), "0.000000000000000000000000000000000123");
+        assert_eq!(Numeric::new_with_scale(123, 37).to_string(), "0.0000000000000000000000000000000000123");
+        assert_eq!(Numeric::new_with_scale(-123, 0).to_string(), "-123.0");
+        assert_eq!(Numeric::new_with_scale(-123, 1).to_string(), "-12.3");
+        assert_eq!(Numeric::new_with_scale(-123, 2).to_string(), "-1.23");
+        assert_eq!(Numeric::new_with_scale(-123, 3).to_string(), "-0.123");
+        assert_eq!(Numeric::new_with_scale(-123, 4).to_string(), "-0.0123");
+        assert_eq!(Numeric::new_with_scale(-123, 36).to_string(), "-0.000000000000000000000000000000000123");
+        assert_eq!(Numeric::new_with_scale(-123, 37).to_string(), "-0.0000000000000000000000000000000000123");
     }
 
     #[test]
