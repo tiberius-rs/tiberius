@@ -32,6 +32,7 @@ pub struct Config {
     pub(crate) trust: TrustConfig,
     pub(crate) auth: AuthMethod,
     pub(crate) readonly: bool,
+    pub(crate) packet_size: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +66,7 @@ impl Default for Config {
             trust: TrustConfig::Default,
             auth: AuthMethod::None,
             readonly: false,
+            packet_size: None,
         }
     }
 }
@@ -113,6 +115,22 @@ impl Config {
     /// - Defaults to no name specified.
     pub fn application_name(&mut self, name: impl ToString) {
         self.application_name = Some(name.to_string());
+    }
+
+    /// Sets the TDS packet size for the connection.
+    ///
+    /// Larger packet sizes can improve bulk insert performance by reducing
+    /// the number of network round-trips. Valid values are 512 to 32767.
+    /// The server may negotiate a different size.
+    ///
+    /// - Defaults to 4096 bytes.
+    pub fn packet_size(&mut self, size: u32) {
+        self.packet_size = Some(size);
+    }
+
+    /// Gets the configured packet size, if set.
+    pub fn get_packet_size(&self) -> Option<u32> {
+        self.packet_size
     }
 
     /// Set the preferred encryption level.
