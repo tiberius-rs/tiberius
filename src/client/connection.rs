@@ -106,6 +106,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 config.host,
                 config.application_name,
                 config.readonly,
+                config.packet_size,
                 prelogin,
             )
             .await?;
@@ -293,6 +294,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         server_name: Option<String>,
         application_name: Option<String>,
         readonly: bool,
+        packet_size: Option<u32>,
         prelogin: PreloginMessage,
     ) -> crate::Result<Self> {
         let mut login_message = LoginMessage::new();
@@ -310,6 +312,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         }
 
         login_message.readonly(readonly);
+
+        if let Some(size) = packet_size {
+            login_message.packet_size(size);
+        }
 
         match auth {
             #[cfg(all(windows, feature = "winauth"))]
