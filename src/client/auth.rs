@@ -1,18 +1,15 @@
 use std::fmt::Debug;
+use zeroize::Zeroizing;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SqlServerAuth {
     user: String,
-    password: String,
+    password: Zeroizing<String>,
 }
 
 impl SqlServerAuth {
-    pub(crate) fn user(&self) -> &str {
-        &self.user
-    }
-
-    pub(crate) fn password(&self) -> &str {
-        &self.password
+    pub(crate) fn into_credentials(self) -> (String, Zeroizing<String>) {
+        (self.user, self.password)
     }
 }
 
@@ -79,7 +76,7 @@ impl AuthMethod {
     pub fn sql_server(user: impl ToString, password: impl ToString) -> Self {
         Self::SqlServer(SqlServerAuth {
             user: user.to_string(),
-            password: password.to_string(),
+            password: Zeroizing::new(password.to_string()),
         })
     }
 
@@ -102,5 +99,27 @@ impl AuthMethod {
     /// Construct a new configuration with AAD auth token.
     pub fn aad_token(token: impl ToString) -> Self {
         Self::AADToken(token.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthMethod;
+    use zeroize::Zeroize;
+
+    #[test]
+    fn sql_server_password_can_be_consumed_and_zeroized() {
+        let AuthMethod::SqlServer(auth) = AuthMethod::sql_server("sa", "secret") else {
+            unreachable!();
+        };
+
+        let (user, mut password) = auth.into_credentials();
+
+        assert_eq!("sa", user);
+        assert_eq!("secret", password.as_str());
+
+        password.zeroize();
+
+        assert!(password.is_empty());
     }
 }
