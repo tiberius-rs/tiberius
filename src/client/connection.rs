@@ -198,14 +198,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         Ok(())
     }
 
-    async fn send_sensitive_login<'a>(
+    async fn send_sensitive_login(
         &mut self,
         mut header: PacketHeader,
-        item: LoginMessage<'a>,
+        mut payload: Zeroizing<Vec<u8>>,
     ) -> crate::Result<()> {
         self.flushed = false;
         let packet_size = (self.context.packet_size() as usize) - HEADER_BYTES;
-        let mut payload = item.encode_to_vec()?;
         let mut offset = 0;
 
         while offset < payload.len() {
@@ -466,11 +465,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
 
                 login_message.user_name(user);
                 login_message.password(password.as_str());
+                let payload = login_message.encode_to_vec()?;
+                password.zeroize();
 
                 let id = self.context.next_packet_id();
-                self.send_sensitive_login(PacketHeader::login(id), login_message)
+                self.send_sensitive_login(PacketHeader::login(id), payload)
                     .await?;
-                password.zeroize();
                 self = self.post_login_encryption(encryption);
             }
             AuthMethod::AADToken(token) => {
