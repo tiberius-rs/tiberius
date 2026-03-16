@@ -20,7 +20,7 @@ use asynchronous_codec::Framed;
 use bytes::BytesMut;
 #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
 use codec::TokenSspi;
-use futures_util::io::{AsyncRead, AsyncWrite};
+use futures_util::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use futures_util::ready;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{Stream, TryStream, TryStreamExt};
@@ -39,6 +39,7 @@ use task::Poll;
 use tracing::{event, Level};
 #[cfg(all(windows, feature = "winauth"))]
 use winauth::{windows::NtlmSspiBuilder, NextBytes};
+use zeroize::{Zeroize, Zeroizing};
 
 /// A `Connection` is an abstraction between the [`Client`] and the server. It
 /// can be used as a `Stream` to fetch [`Packet`]s from and to `send` packets
@@ -193,6 +194,46 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         }
 
         self.flush_sink().await?;
+
+        Ok(())
+    }
+
+    async fn send_sensitive_login<'a>(
+        &mut self,
+        mut header: PacketHeader,
+        item: LoginMessage<'a>,
+    ) -> crate::Result<()> {
+        self.flushed = false;
+        let packet_size = (self.context.packet_size() as usize) - HEADER_BYTES;
+        let mut payload = item.encode_to_vec()?;
+        let mut offset = 0;
+
+        while offset < payload.len() {
+            let end = cmp::min(payload.len(), offset + packet_size);
+
+            if end == payload.len() {
+                header.set_status(PacketStatus::EndOfMessage);
+            } else {
+                header.set_status(PacketStatus::NormalMessage);
+            }
+
+            let mut frame = Zeroizing::new(Vec::with_capacity(HEADER_BYTES + end - offset));
+            header.encode(&mut *frame)?;
+            frame.extend_from_slice(&payload[offset..end]);
+
+            let size = (frame.len() as u16).to_be_bytes();
+            frame[2] = size[0];
+            frame[3] = size[1];
+
+            event!(Level::TRACE, "Sending a packet ({} bytes)", frame.len(),);
+
+            (&mut *self.transport).write_all(frame.as_slice()).await?;
+            frame.zeroize();
+            payload[offset..end].zeroize();
+            offset = end;
+        }
+
+        (&mut *self.transport).flush().await?;
 
         Ok(())
     }
@@ -421,11 +462,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 self = self.post_login_encryption(encryption);
             }
             AuthMethod::SqlServer(auth) => {
-                login_message.user_name(auth.user());
-                login_message.password(auth.password());
+                let (user, mut password) = auth.into_credentials();
+
+                login_message.user_name(user);
+                login_message.password(password.as_str());
 
                 let id = self.context.next_packet_id();
-                self.send(PacketHeader::login(id), login_message).await?;
+                self.send_sensitive_login(PacketHeader::login(id), login_message)
+                    .await?;
+                password.zeroize();
                 self = self.post_login_encryption(encryption);
             }
             AuthMethod::AADToken(token) => {
