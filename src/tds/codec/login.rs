@@ -5,6 +5,7 @@ use enumflags2::{bitflags, BitFlags};
 use io::{Cursor, Write};
 use std::fmt::Debug;
 use std::{borrow::Cow, io};
+use zeroize::{Zeroize, Zeroizing};
 
 uint_enum! {
     #[repr(u32)]
@@ -243,10 +244,8 @@ impl<'a> LoginMessage<'a> {
     pub fn packet_size(&mut self, size: u32) {
         self.packet_size = size;
     }
-}
 
-impl<'a> Encode<BytesMut> for LoginMessage<'a> {
-    fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
+    pub(crate) fn encode_to_vec(self) -> crate::Result<Zeroizing<Vec<u8>>> {
         let mut cursor = Cursor::new(Vec::with_capacity(512));
 
         // Space for the length
@@ -369,7 +368,7 @@ impl<'a> Encode<BytesMut> for LoginMessage<'a> {
             for codepoint in fed_auth_ext.fed_auth_token.encode_utf16() {
                 token.write_u16::<LittleEndian>(codepoint)?;
             }
-            let token = token.into_inner();
+            let mut token = token.into_inner();
 
             // options (1) + TokenLength(4) + Token.length + nonce.length
             let feature_ext_length =
@@ -386,6 +385,7 @@ impl<'a> Encode<BytesMut> for LoginMessage<'a> {
 
             cursor.write_u32::<LittleEndian>(token.len() as u32)?;
             cursor.write_all(token.as_slice())?;
+            token.zeroize();
 
             if let Some(nonce) = fed_auth_ext.nonce {
                 cursor.write_all(nonce.as_ref())?;
@@ -397,7 +397,15 @@ impl<'a> Encode<BytesMut> for LoginMessage<'a> {
         cursor.set_position(0);
         cursor.write_u32::<LittleEndian>(cursor.get_ref().len() as u32)?;
 
-        dst.extend(cursor.into_inner());
+        Ok(Zeroizing::new(cursor.into_inner()))
+    }
+}
+
+impl<'a> Encode<BytesMut> for LoginMessage<'a> {
+    fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
+        let mut encoded = self.encode_to_vec()?;
+        dst.extend_from_slice(encoded.as_slice());
+        encoded.zeroize();
 
         Ok(())
     }
