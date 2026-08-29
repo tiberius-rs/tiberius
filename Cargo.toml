@@ -178,7 +178,13 @@ chrono = "0.4.38"
 indoc = "1.0.7"
 
 [package.metadata.docs.rs]
-features = ["all", "docs"]
+features = ["all"]
+# docs.rs builds on nightly with this cfg set, enabling #[doc(cfg(...))]
+# annotations (feature(doc_cfg)) without requiring nightly for normal builds.
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 
 [features]
 all = [
@@ -199,7 +205,6 @@ tds73 = []
 # Enables TDS 8.0 support, including the `Strict` encryption level (TLS before
 # the TDS prelogin, TDS 8.0 "strict" mode). Requires a TLS backend.
 tds80 = ["tds73"]
-docs = []
 sql-browser-async-std = ["async-std"]
 sql-browser-tokio = ["tokio", "tokio-util"]
 sql-browser-smol = ["async-io", "async-net", "futures-lite"]

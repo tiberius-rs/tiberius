@@ -42,7 +42,7 @@ pub enum Error {
     Tls(String),
     #[cfg(any(all(unix, feature = "integrated-auth-gssapi"), doc))]
     #[cfg_attr(
-        feature = "docs",
+        docsrs,
         doc(cfg(all(unix, feature = "integrated-auth-gssapi")))
     )]
     /// An error from the GSSAPI library.
@@ -149,7 +149,7 @@ impl From<connection_string::Error> for Error {
 
 #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
 #[cfg_attr(
-    feature = "docs",
+    docsrs,
     doc(cfg(all(unix, feature = "integrated-auth-gssapi")))
 )]
 impl From<libgssapi::error::Error> for Error {
