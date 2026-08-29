@@ -18,20 +18,33 @@ pub enum TypeLength {
 /// Describes a type of a column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeInfo {
+    /// A fixed-length type, whose size is fully determined by the type itself.
     FixedLen(FixedLenType),
+    /// A variable-length type with an explicit size (and optional collation).
     VarLenSized(VarLenContext),
+    /// A variable-length type carrying a precision and scale, such as `decimal`
+    /// and `numeric`.
     VarLenSizedPrecision {
+        /// The underlying variable-length type.
         ty: VarLenType,
+        /// The reserved size of the column in bytes.
         size: usize,
+        /// The total number of digits.
         precision: u8,
+        /// The number of digits to the right of the decimal point.
         scale: u8,
     },
+    /// The `xml` type, with an optional associated schema.
     Xml {
+        /// The XML schema associated with the column, if any.
         schema: Option<Arc<XmlSchema>>,
+        /// The reserved size of the column in bytes.
         size: usize,
     },
 }
 
+/// The context of a variable-length column: its underlying type, size and
+/// optional collation.
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub struct VarLenContext {
     r#type: VarLenType,
@@ -40,6 +53,8 @@ pub struct VarLenContext {
 }
 
 impl VarLenContext {
+    /// Create a new variable-length context from a type, length and optional
+    /// collation.
     pub fn new(r#type: VarLenType, len: usize, collation: Option<Collation>) -> Self {
         Self {
             r#type,
@@ -56,6 +71,11 @@ impl VarLenContext {
     /// Get the var len context's len.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// `true` if the column reserves no length.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// Get the var len context's collation.
