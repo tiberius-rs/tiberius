@@ -9,6 +9,11 @@ uint_enum! {
         /// the server.
         ReturnStatus = 0x79,
 
+        /// Describes the data type, length, and name of column data that
+        /// result from a COMPUTE clause (`ALTMETADATA`). This token describes
+        /// the format of the following `ALTROW` data streams.
+        AltMetaData = 0x88,
+
         /// Describes the result setfor interpretation of following ROW data
         /// streams
         ColMetaData = 0x81,
@@ -49,6 +54,11 @@ uint_enum! {
         /// Used to send a row with null bitmap compression, as defined by the
         /// COLMETADATA token.
         NbcRow = 0xD2,
+
+        /// Used to send a complete row of computed data, as defined by the
+        /// `ALTMETADATA` token, to the client. This is the row produced by a
+        /// COMPUTE or COMPUTE BY clause.
+        AltRow = 0xD3,
 
         /// The SSPI token returned during the login process.
         Sspi = 0xED,
