@@ -2,8 +2,8 @@ use crate::tds::codec::TokenSspi;
 use crate::{
     client::Connection,
     tds::codec::{
-        TokenColInfo, TokenColMetaData, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck,
-        TokenInfo, TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
+        TokenColMetaData, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck,
+        TokenFedAuthInfo, TokenInfo, TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
     },
     Error, SqlReadBytes, TokenType,
 };
@@ -31,7 +31,7 @@ pub enum ReceivedToken {
     LoginAck(TokenLoginAck),
     Sspi(TokenSspi),
     FeatureExtAck(TokenFeatureExtAck),
-    SessionState(TokenSessionState),
+    FedAuthInfo(TokenFedAuthInfo),
     Error(TokenError),
 }
 
@@ -219,16 +219,10 @@ where
         Ok(ReceivedToken::FeatureExtAck(ack))
     }
 
-    async fn get_session_state(&mut self) -> crate::Result<ReceivedToken> {
-        let state = TokenSessionState::decode(self.conn).await?;
-        event!(
-            Level::TRACE,
-            "SessionState seq_no={} recoverable={} states={}",
-            state.seq_no,
-            state.is_recoverable(),
-            state.states.len()
-        );
-        Ok(ReceivedToken::SessionState(state))
+    async fn get_fed_auth_info(&mut self) -> crate::Result<ReceivedToken> {
+        let info = TokenFedAuthInfo::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?info);
+        Ok(ReceivedToken::FedAuthInfo(info))
     }
 
     async fn get_sspi(&mut self) -> crate::Result<ReceivedToken> {
@@ -267,7 +261,7 @@ where
                 TokenType::Info => this.get_info().await?,
                 TokenType::LoginAck => this.get_login_ack().await?,
                 TokenType::Sspi => this.get_sspi().await?,
-                TokenType::SessionState => this.get_session_state().await?,
+                TokenType::FedAuthInfo => this.get_fed_auth_info().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
             };
 
