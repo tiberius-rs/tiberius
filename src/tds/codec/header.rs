@@ -118,6 +118,18 @@ impl PacketHeader {
         }
     }
 
+    /// A client-to-server Attention Signal packet (packet type `0x06`,
+    /// MS-TDS section 2.2.1.6). The message carries no payload, so it is
+    /// always a single, end-of-message packet used to request cancellation
+    /// of the request currently in flight on the connection.
+    pub fn attention(id: u8) -> Self {
+        Self {
+            ty: PacketType::AttentionSignal,
+            status: PacketStatus::EndOfMessage,
+            ..Self::new(0, id)
+        }
+    }
+
     pub fn set_status(&mut self, status: PacketStatus) {
         self.status = status;
     }
@@ -184,5 +196,55 @@ impl Decode<BytesMut> for PacketHeader {
         };
 
         Ok(header)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::codec::Packet;
+
+    #[test]
+    fn attention_packet_header_fields() {
+        let header = PacketHeader::attention(42);
+
+        assert_eq!(header.r#type() as u8, PacketType::AttentionSignal as u8);
+        assert_eq!(header.r#type() as u8, 0x06);
+        // An attention message is always a single end-of-message packet.
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+    }
+
+    #[test]
+    fn attention_packet_header_encodes_to_eight_bytes() {
+        let header = PacketHeader::attention(42);
+
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf).unwrap();
+
+        // 8-byte fixed header, no payload.
+        assert_eq!(buf.len(), 8);
+        assert_eq!(
+            &buf[..],
+            &[
+                0x06, // type: attention signal
+                0x01, // status: end of message
+                0x00, 0x00, // length (patched by Packet::encode)
+                0x00, 0x00, // spid
+                42,   // packet id
+                0x00, // window
+            ]
+        );
+    }
+
+    #[test]
+    fn attention_packet_encodes_with_length_of_header() {
+        // A full attention packet has an empty payload, so the wire length
+        // is exactly the 8 header bytes.
+        let packet = Packet::new(PacketHeader::attention(1), BytesMut::new());
+
+        let mut buf = BytesMut::new();
+        packet.encode(&mut buf).unwrap();
+
+        assert_eq!(&buf[..], &[0x06, 0x01, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00]);
     }
 }
