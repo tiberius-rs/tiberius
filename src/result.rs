@@ -1,7 +1,9 @@
-pub use crate::tds::stream::{QueryItem, ResultMetadata};
+pub use crate::tds::stream::{CommandItem, QueryItem, ResultMetadata};
 use crate::{
     client::Connection,
-    tds::stream::{ReceivedToken, TokenStream},
+    error::Error,
+    tds::stream::{CommandReturnValue, ReceivedToken, TokenStream},
+    FromSql, Row,
 };
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::TryStreamExt;
@@ -111,5 +113,100 @@ impl IntoIterator for ExecuteResult {
 
     fn into_iter(self) -> Self::IntoIter {
         self.rows_affected.into_iter()
+    }
+}
+
+/// A materialized result from executing a [`Command`], carrying the number of
+/// affected rows, the return code, the values of any OUT parameters and any
+/// record sets returned by the command.
+///
+/// [`Command`]: crate::Command
+///
+/// # Example
+///
+/// ```no_run
+/// # use tiberius::{Config, Command};
+/// # use tokio_util::compat::TokioAsyncWriteCompatExt;
+/// # use std::env;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let c_str = env::var("TIBERIUS_TEST_CONNECTION_STRING").unwrap_or(
+/// #     "server=tcp:localhost,1433;integratedSecurity=true;TrustServerCertificate=true".to_owned(),
+/// # );
+/// # let config = Config::from_ado_string(&c_str)?;
+/// # let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+/// # tcp.set_nodelay(true)?;
+/// # let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+/// let mut cmd = Command::new("dbo.usp_SomeStoredProc");
+///
+/// cmd.bind_param("@foo", 34i32);
+/// cmd.bind_out_param("@bar", "bar");
+/// let res = cmd.exec(&mut client).await?.into_command_result().await?;
+///
+/// let rv: Option<&str> = res.try_return_value("@bar")?;
+/// let rc = res.return_code();
+/// let ra = res.rows_affected();
+///
+/// let rs0 = res.to_query_result(0);
+/// # Ok(())
+/// # }
+/// ```
+///
+#[derive(Debug)]
+pub struct CommandResult {
+    pub(crate) rows_affected: Vec<u64>,
+    pub(crate) return_code: u32,
+    pub(crate) return_values: Vec<CommandReturnValue>,
+    pub(crate) query_results: Vec<Vec<Row>>,
+}
+
+impl<'a> CommandResult {
+    /// A slice of the numbers of rows affected, in the same order as the
+    /// statements ran by the command.
+    pub fn rows_affected(&self) -> &[u64] {
+        self.rows_affected.as_slice()
+    }
+
+    /// The return code of the command, as returned by the server.
+    pub fn return_code(&self) -> u32 {
+        self.return_code
+    }
+
+    /// The number of returned values (OUT parameters) available.
+    pub fn return_values_len(&self) -> usize {
+        self.return_values.len()
+    }
+
+    /// Gets a returned value by its OUT parameter name, converting it to `T`.
+    /// Returns `None` if the value is `NULL`, and an error if no OUT parameter
+    /// with the given name was returned.
+    pub fn try_return_value<T>(&'a self, name: &str) -> crate::Result<Option<T>>
+    where
+        T: FromSql<'a>,
+    {
+        let col_data = self
+            .return_values
+            .iter()
+            .find(|p| p.name.eq(name))
+            .ok_or_else(|| {
+                Error::Conversion(format!("Could not find return value {}", name).into())
+            })?;
+
+        T::from_sql(&col_data.data)
+    }
+
+    /// Gets a returned record set by its zero-based index. Returns `None` if the
+    /// index is out of range.
+    pub fn to_query_result(&self, idx: usize) -> Option<&Vec<Row>> {
+        self.query_results.get(idx)
+    }
+}
+
+impl IntoIterator for CommandResult {
+    type Item = Vec<Row>;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.query_results.into_iter()
     }
 }

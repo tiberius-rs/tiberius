@@ -14,6 +14,7 @@ pub use auth::*;
 pub use config::*;
 pub(crate) use connection::*;
 
+use crate::tds::codec::{MetaDataColumn, RpcValue};
 use crate::tds::stream::ReceivedToken;
 use crate::{
     result::ExecuteResult,
@@ -648,12 +649,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             RpcParam {
                 name: Cow::Borrowed("stmt"),
                 flags: BitFlags::empty(),
-                value: ColumnData::String(Some(query.into())),
+                value: RpcValue::Scalar(ColumnData::String(Some(query.into()))),
             },
             RpcParam {
                 name: Cow::Borrowed("params"),
                 flags: BitFlags::empty(),
-                value: ColumnData::I32(Some(0)),
+                value: RpcValue::Scalar(ColumnData::I32(Some(0))),
             },
         ]
     }
@@ -679,12 +680,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             rpc_params.push(RpcParam {
                 name: Cow::Owned(format!("@P{}", i + 1)),
                 flags: BitFlags::empty(),
-                value: param,
+                value: RpcValue::Scalar(param),
             });
         }
 
         if let Some(params) = rpc_params.iter_mut().find(|x| x.name == "params") {
-            params.value = ColumnData::String(Some(param_str.into()));
+            params.value = RpcValue::Scalar(ColumnData::String(Some(param_str.into())));
         }
 
         let req = TokenRpcRequest::new(
@@ -697,6 +698,57 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         self.connection.send(PacketHeader::rpc(id), req).await?;
 
         Ok(())
+    }
+
+    /// Sends a named-procedure RPC request with the given parameters. The caller
+    /// is responsible for flushing the connection beforehand and for consuming
+    /// the resulting token stream.
+    pub(crate) async fn rpc_run_command<'a, 'b>(
+        &'a mut self,
+        command_name: Cow<'b, str>,
+        rpc_params: Vec<RpcParam<'b>>,
+    ) -> crate::Result<()>
+    where
+        'a: 'b,
+    {
+        let req = TokenRpcRequest::new(
+            command_name,
+            rpc_params,
+            self.connection.context().transaction_descriptor(),
+        );
+
+        let id = self.connection.context_mut().next_packet_id();
+        self.connection.send(PacketHeader::rpc(id), req).await?;
+
+        Ok(())
+    }
+
+    /// Runs a batch query solely to retrieve its column metadata. Used to
+    /// resolve the column layout of a table-valued parameter type.
+    pub(crate) async fn query_run_for_metadata<'b>(
+        &mut self,
+        query: String,
+    ) -> crate::Result<Option<Vec<MetaDataColumn<'b>>>> {
+        self.connection.flush_stream().await?;
+
+        let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
+
+        let id = self.connection.context_mut().next_packet_id();
+        self.connection.send(PacketHeader::batch(id), req).await?;
+
+        let token_stream = TokenStream::new(&mut self.connection).try_unfold();
+
+        let columns = token_stream
+            .try_fold(None, |mut columns, token| async move {
+                if let ReceivedToken::NewResultset(metadata) = token {
+                    columns = Some(metadata.columns.clone());
+                };
+
+                Ok(columns)
+            })
+            .await?;
+
+        Ok(columns)
     }
 }
 
