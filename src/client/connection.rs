@@ -226,7 +226,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
 
             event!(Level::TRACE, "Sending a packet ({} bytes)", frame.len(),);
 
-            (&mut *self.transport).write_all(frame.as_slice()).await?;
+            self.transport.write_all(frame.as_slice()).await?;
             frame.zeroize();
             payload[offset..end].zeroize();
             offset = end;
