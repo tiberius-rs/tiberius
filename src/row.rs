@@ -430,6 +430,18 @@ impl Row {
 
         Ok(self.data.get(idx).unwrap())
     }
+
+    /// Consumes the row, returning the underlying [`TokenRow`] holding the raw
+    /// column data as received from the server.
+    ///
+    /// This is useful when direct access to the raw [`ColumnData`] values is
+    /// needed instead of converting them through [`get`] or [`try_get`].
+    ///
+    /// [`get`]: #method.get
+    /// [`try_get`]: #method.try_get
+    pub fn into_token_row(self) -> TokenRow<'static> {
+        self.data
+    }
 }
 
 impl IntoIterator for Row {
