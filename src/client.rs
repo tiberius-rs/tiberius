@@ -326,7 +326,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// # tcp.set_nodelay(true)?;
     /// # let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
     /// let create_table = r#"
-    ///     CREATE TABLE ##bulk_test (
+    ///     CREATE TABLE ##bulk_test_columns (
     ///         id INT IDENTITY PRIMARY KEY,
     ///         foo INT NOT NULL,
     ///         bar FLOAT NOT NULL
@@ -336,7 +336,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// client.simple_query(create_table).await?;
     ///
     /// // Start the bulk insert with the client.
-    /// let mut req = client.bulk_insert_columns("##bulk_test", &["foo", "bar"]).await?;
+    /// let mut req = client.bulk_insert_columns("##bulk_test_columns", &["foo", "bar"]).await?;
     ///
     /// for (i, j) in [(0i32, 0f64), (1i32, 1f64), (2i32, 2f64)] {
     ///     let row = (i, j).into_row();
