@@ -22,12 +22,13 @@
 use std::convert::TryFrom;
 
 use byteorder::{ByteOrder, LittleEndian};
+use bytes::{BufMut, BytesMut};
 use futures_util::io::AsyncReadExt;
 
 use crate::{
     error::Error,
     sql_read_bytes::SqlReadBytes,
-    tds::{codec::guid, Collation, Numeric},
+    tds::{codec::guid, codec::Encode, Collation, Numeric},
     ColumnData, FixedLenType, VarLenType,
 };
 
@@ -245,6 +246,200 @@ where
     ))))
 }
 
+/// The maximum length in bytes of the character/binary payload a `sql_variant`
+/// can carry. `sql_variant` cannot hold the `(max)`/LOB variants, so anything
+/// larger cannot be represented.
+const MAX_VARIANT_PAYLOAD: usize = 8000;
+
+/// Encodes a [`ColumnData`] value as a `SQL_VARIANT` (`0x62`) value into `dst`.
+///
+/// The wire layout mirrors [`decode`] (MS-TDS §2.2.5.5.3): a 4 byte total
+/// length followed by the base-type byte, a property-bytes count, the
+/// type-specific property metadata and the raw value. A `NULL` value of any
+/// variant is written as a zero total length.
+///
+/// The base type written for a given [`ColumnData`] variant is the same one the
+/// decoder maps back onto that variant, so the two are symmetric. [`ColumnData::Xml`]
+/// has no `sql_variant` base type and returns a [`crate::Error::Conversion`].
+pub(crate) fn encode(dst: &mut BytesMut, data: ColumnData<'_>) -> crate::Result<()> {
+    // The value part is built up first so its total length can be prefixed.
+    let mut body = BytesMut::new();
+
+    let has_value = match data {
+        ColumnData::Bit(Some(val)) => {
+            body.put_u8(FixedLenType::Bit as u8);
+            body.put_u8(0);
+            body.put_u8(val as u8);
+            true
+        }
+        ColumnData::U8(Some(val)) => {
+            body.put_u8(FixedLenType::Int1 as u8);
+            body.put_u8(0);
+            body.put_u8(val);
+            true
+        }
+        ColumnData::I16(Some(val)) => {
+            body.put_u8(FixedLenType::Int2 as u8);
+            body.put_u8(0);
+            body.put_i16_le(val);
+            true
+        }
+        ColumnData::I32(Some(val)) => {
+            body.put_u8(FixedLenType::Int4 as u8);
+            body.put_u8(0);
+            body.put_i32_le(val);
+            true
+        }
+        ColumnData::I64(Some(val)) => {
+            body.put_u8(FixedLenType::Int8 as u8);
+            body.put_u8(0);
+            body.put_i64_le(val);
+            true
+        }
+        ColumnData::F32(Some(val)) => {
+            body.put_u8(FixedLenType::Float4 as u8);
+            body.put_u8(0);
+            body.put_f32_le(val);
+            true
+        }
+        ColumnData::F64(Some(val)) => {
+            body.put_u8(FixedLenType::Float8 as u8);
+            body.put_u8(0);
+            body.put_f64_le(val);
+            true
+        }
+        ColumnData::DateTime(Some(dt)) => {
+            body.put_u8(FixedLenType::Datetime as u8);
+            body.put_u8(0);
+            dt.encode(&mut body)?;
+            true
+        }
+        ColumnData::SmallDateTime(Some(dt)) => {
+            body.put_u8(FixedLenType::Datetime4 as u8);
+            body.put_u8(0);
+            dt.encode(&mut body)?;
+            true
+        }
+        ColumnData::Guid(Some(uuid)) => {
+            body.put_u8(VarLenType::Guid as u8);
+            body.put_u8(0);
+            let mut bytes = *uuid.as_bytes();
+            guid::reorder_bytes(&mut bytes);
+            body.extend_from_slice(&bytes);
+            true
+        }
+        ColumnData::Numeric(Some(num)) => {
+            body.put_u8(VarLenType::Numericn as u8);
+            // propData = precision (1 byte) + scale (1 byte)
+            body.put_u8(2);
+            body.put_u8(num.precision());
+            body.put_u8(num.scale());
+
+            // `Numeric::encode` emits a leading length byte followed by the
+            // sign byte and the little-endian magnitude. A sql_variant value
+            // carries no length byte, so drop it and keep sign + magnitude.
+            let mut tmp = BytesMut::new();
+            num.encode(&mut tmp)?;
+            body.extend_from_slice(&tmp[1..]);
+            true
+        }
+        ColumnData::String(Some(ref s)) => {
+            let utf16: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+
+            if utf16.len() > MAX_VARIANT_PAYLOAD {
+                return Err(Error::Conversion(
+                    format!(
+                        "sql_variant: string of {} bytes exceeds the {} byte limit",
+                        utf16.len(),
+                        MAX_VARIANT_PAYLOAD
+                    )
+                    .into(),
+                ));
+            }
+
+            body.put_u8(VarLenType::NVarchar as u8);
+            // propData = collation (5 bytes) + max length (2 bytes)
+            body.put_u8(7);
+            // A zero collation lets the server apply the database default, as
+            // done elsewhere when encoding strings without a known collation.
+            body.extend_from_slice(&[0u8; 5]);
+            body.put_u16_le(MAX_VARIANT_PAYLOAD as u16);
+            body.extend_from_slice(&utf16);
+            true
+        }
+        ColumnData::Binary(Some(ref bytes)) => {
+            if bytes.len() > MAX_VARIANT_PAYLOAD {
+                return Err(Error::Conversion(
+                    format!(
+                        "sql_variant: binary of {} bytes exceeds the {} byte limit",
+                        bytes.len(),
+                        MAX_VARIANT_PAYLOAD
+                    )
+                    .into(),
+                ));
+            }
+
+            body.put_u8(VarLenType::BigVarBin as u8);
+            // propData = max length (2 bytes)
+            body.put_u8(2);
+            body.put_u16_le(MAX_VARIANT_PAYLOAD as u16);
+            body.extend_from_slice(bytes);
+            true
+        }
+        #[cfg(feature = "tds73")]
+        ColumnData::Date(Some(date)) => {
+            body.put_u8(VarLenType::Daten as u8);
+            body.put_u8(0);
+            date.encode(&mut body)?;
+            true
+        }
+        #[cfg(feature = "tds73")]
+        ColumnData::Time(Some(time)) => {
+            body.put_u8(VarLenType::Timen as u8);
+            // propData = scale (1 byte)
+            body.put_u8(1);
+            body.put_u8(time.scale());
+            time.encode(&mut body)?;
+            true
+        }
+        #[cfg(feature = "tds73")]
+        ColumnData::DateTime2(Some(dt)) => {
+            body.put_u8(VarLenType::Datetime2 as u8);
+            // propData = scale (1 byte)
+            body.put_u8(1);
+            body.put_u8(dt.time().scale());
+            dt.encode(&mut body)?;
+            true
+        }
+        #[cfg(feature = "tds73")]
+        ColumnData::DateTimeOffset(Some(dto)) => {
+            body.put_u8(VarLenType::DatetimeOffsetn as u8);
+            // propData = scale (1 byte)
+            body.put_u8(1);
+            body.put_u8(dto.datetime2().time().scale());
+            dto.encode(&mut body)?;
+            true
+        }
+        ColumnData::Xml(Some(_)) => {
+            return Err(Error::Conversion(
+                "sql_variant: xml is not a valid sql_variant base type".into(),
+            ));
+        }
+        // Every `None` value (and a null XML) is a NULL sql_variant.
+        _ => false,
+    };
+
+    if has_value {
+        dst.put_u32_le(body.len() as u32);
+        dst.extend_from_slice(&body);
+    } else {
+        // A zero total length is the NULL sql_variant representation.
+        dst.put_u32_le(0);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +564,125 @@ mod tests {
 
         let data = decode(&mut variant_reader(&payload)).await.unwrap();
         assert_eq!(data, ColumnData::Date(Some(Date::new(730119))));
+    }
+
+    /// Encodes `value` as a sql_variant then decodes it back, asserting the
+    /// round-trip is lossless and that the whole buffer is consumed.
+    async fn round_trip(value: ColumnData<'static>) {
+        let mut buf = BytesMut::new();
+        encode(&mut buf, value.clone()).expect("encode must succeed");
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let decoded = decode(reader).await.expect("decode must succeed");
+
+        assert_eq!(decoded, value);
+
+        reader
+            .read_u8()
+            .await
+            .expect_err("decode must consume the entire buffer");
+    }
+
+    #[tokio::test]
+    async fn round_trip_bit() {
+        round_trip(ColumnData::Bit(Some(true))).await;
+        round_trip(ColumnData::Bit(Some(false))).await;
+    }
+
+    #[tokio::test]
+    async fn round_trip_integers() {
+        round_trip(ColumnData::U8(Some(200))).await;
+        round_trip(ColumnData::I16(Some(-1234))).await;
+        round_trip(ColumnData::I32(Some(42))).await;
+        round_trip(ColumnData::I64(Some(-9_000_000_000))).await;
+    }
+
+    #[tokio::test]
+    async fn round_trip_floats() {
+        round_trip(ColumnData::F32(Some(1.5))).await;
+        round_trip(ColumnData::F64(Some(-2.5))).await;
+    }
+
+    #[tokio::test]
+    async fn round_trip_guid() {
+        let uuid = uuid::Uuid::from_u128(0x0102030405060708090a0b0c0d0e0f10);
+        round_trip(ColumnData::Guid(Some(uuid))).await;
+    }
+
+    #[tokio::test]
+    async fn round_trip_numeric() {
+        round_trip(ColumnData::Numeric(Some(Numeric::new_with_scale(123, 2)))).await;
+        round_trip(ColumnData::Numeric(Some(Numeric::new_with_scale(-4567, 4)))).await;
+        round_trip(ColumnData::Numeric(Some(Numeric::new_with_scale(
+            10i128.pow(30),
+            0,
+        ))))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn round_trip_string() {
+        round_trip(ColumnData::String(Some("hello€".into()))).await;
+        round_trip(ColumnData::String(Some("".into()))).await;
+    }
+
+    #[tokio::test]
+    async fn round_trip_binary() {
+        round_trip(ColumnData::Binary(Some(vec![1u8, 2, 3, 4, 5].into()))).await;
+        round_trip(ColumnData::Binary(Some(vec![].into()))).await;
+    }
+
+    #[tokio::test]
+    async fn round_trip_datetime() {
+        use crate::tds::time::{DateTime, SmallDateTime};
+
+        round_trip(ColumnData::DateTime(Some(DateTime::new(200, 3000)))).await;
+        round_trip(ColumnData::SmallDateTime(Some(SmallDateTime::new(
+            200, 3000,
+        ))))
+        .await;
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn round_trip_temporal_tds73() {
+        use crate::tds::time::{Date, DateTime2, DateTimeOffset, Time};
+
+        round_trip(ColumnData::Date(Some(Date::new(730119)))).await;
+        round_trip(ColumnData::Time(Some(Time::new(222, 7)))).await;
+        round_trip(ColumnData::DateTime2(Some(DateTime2::new(
+            Date::new(55),
+            Time::new(222, 7),
+        ))))
+        .await;
+        round_trip(ColumnData::DateTimeOffset(Some(DateTimeOffset::new(
+            DateTime2::new(Date::new(55), Time::new(222, 7)),
+            -8,
+        ))))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn round_trip_null() {
+        // A NULL of any variant decodes to the generic null representation.
+        let mut buf = BytesMut::new();
+        encode(&mut buf, ColumnData::I32(None)).expect("encode must succeed");
+        let decoded = decode(&mut buf.into_sql_read_bytes()).await.unwrap();
+        assert_eq!(decoded, ColumnData::String(None));
+    }
+
+    #[tokio::test]
+    async fn xml_is_rejected() {
+        use crate::xml::XmlData;
+        use std::borrow::Cow;
+
+        let mut buf = BytesMut::new();
+        let err = encode(
+            &mut buf,
+            ColumnData::Xml(Some(Cow::Owned(XmlData::new("<a/>")))),
+        )
+        .expect_err("xml must not encode as a sql_variant");
+
+        assert!(matches!(err, Error::Conversion(_)));
     }
 }
