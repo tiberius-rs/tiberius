@@ -19,6 +19,7 @@ mod string;
 mod text;
 #[cfg(feature = "tds73")]
 mod time;
+mod udt;
 mod var_len;
 mod xml;
 
@@ -177,6 +178,7 @@ impl<'a> ColumnData<'a> {
                 _ => todo!(),
             },
             TypeInfo::Xml { schema, size } => xml::decode(src, *size, schema.clone()).await?,
+            TypeInfo::Udt(_) => udt::decode(src).await?,
         };
 
         Ok(res)
