@@ -110,6 +110,7 @@ impl<'a> Display for MetaDataColumn<'a> {
                     8 => write!(f, "float")?,
                     _ => unreachable!(),
                 },
+                VarLenType::SSVariant => write!(f, "sql_variant")?,
                 _ => unreachable!(),
             },
             TypeInfo::VarLenSizedPrecision {
@@ -222,7 +223,9 @@ impl BaseMetaDataColumn {
                 VarLenType::Text => ColumnData::String(None),
                 VarLenType::Image => ColumnData::Binary(None),
                 VarLenType::NText => ColumnData::String(None),
-                VarLenType::SSVariant => todo!(),
+                // A null `sql_variant` carries no base type, so surface a
+                // generic null value.
+                VarLenType::SSVariant => ColumnData::String(None),
             },
             TypeInfo::VarLenSizedPrecision { ty, .. } => match ty {
                 VarLenType::Guid => ColumnData::Guid(None),
@@ -252,7 +255,9 @@ impl BaseMetaDataColumn {
                 VarLenType::Text => ColumnData::String(None),
                 VarLenType::Image => ColumnData::Binary(None),
                 VarLenType::NText => ColumnData::String(None),
-                VarLenType::SSVariant => todo!(),
+                // A null `sql_variant` carries no base type, so surface a
+                // generic null value.
+                VarLenType::SSVariant => ColumnData::String(None),
             },
             TypeInfo::Xml { .. } => ColumnData::Xml(None),
             TypeInfo::Udt(_) => ColumnData::Binary(None),
