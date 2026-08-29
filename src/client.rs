@@ -71,6 +71,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// options required to connect to the database using an established
     /// tcp connection
     ///
+    /// Note: `tcp_stream` is a connected stream, so some parts of the `Config`
+    /// (such as multi-subnet failover, which selects between resolved
+    /// addresses) must be handled while establishing that stream, outside of
+    /// this constructor.
+    ///
     /// [`Config`]: struct.Config.html
     pub async fn connect(config: Config, tcp_stream: S) -> crate::Result<Client<S>> {
         Ok(Client {
