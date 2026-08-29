@@ -48,6 +48,11 @@ uint_enum! {
         /// The SSPI token returned during the login process.
         Sspi = 0xED,
 
+        /// Used to inform the client about the current session state so the
+        /// session can be transparently recovered after a broken connection
+        /// (connection resiliency). Sent only when session recovery is enabled.
+        SessionState = 0xE4,
+
         /// A notification of an environment change (such as database and
         /// language).
         EnvChange = 0xE3,

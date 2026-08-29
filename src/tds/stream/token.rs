@@ -3,7 +3,7 @@ use crate::{
     client::Connection,
     tds::codec::{
         TokenColMetaData, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck, TokenInfo,
-        TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
+        TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow, TokenSessionState,
     },
     Error, SqlReadBytes, TokenType,
 };
@@ -30,6 +30,7 @@ pub enum ReceivedToken {
     LoginAck(TokenLoginAck),
     Sspi(TokenSspi),
     FeatureExtAck(TokenFeatureExtAck),
+    SessionState(TokenSessionState),
     Error(TokenError),
 }
 
@@ -211,6 +212,18 @@ where
         Ok(ReceivedToken::FeatureExtAck(ack))
     }
 
+    async fn get_session_state(&mut self) -> crate::Result<ReceivedToken> {
+        let state = TokenSessionState::decode(self.conn).await?;
+        event!(
+            Level::TRACE,
+            "SessionState seq_no={} recoverable={} states={}",
+            state.seq_no,
+            state.is_recoverable(),
+            state.states.len()
+        );
+        Ok(ReceivedToken::SessionState(state))
+    }
+
     async fn get_sspi(&mut self) -> crate::Result<ReceivedToken> {
         let sspi = TokenSspi::decode_async(self.conn).await?;
         event!(Level::TRACE, "SSPI response");
@@ -246,6 +259,7 @@ where
                 TokenType::Info => this.get_info().await?,
                 TokenType::LoginAck => this.get_login_ack().await?,
                 TokenType::Sspi => this.get_sspi().await?,
+                TokenType::SessionState => this.get_session_state().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
                 _ => {
                     return Err(Error::Protocol(
