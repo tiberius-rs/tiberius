@@ -7,6 +7,9 @@ use futures_util::io::{AsyncRead, AsyncWrite};
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
+// Used by the native-tls and rustls backends to advertise TDS 8.0 strict; the
+// opentls (vendored-openssl) backend cannot set ALPN, so this is unused there.
+#[allow(dead_code)]
 pub(crate) const TDS_ALPN_PROTOCOL_NAME: &str = "tds/8.0";
 
 #[cfg(feature = "native-tls")]
