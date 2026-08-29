@@ -2,8 +2,8 @@ use crate::tds::codec::TokenSspi;
 use crate::{
     client::Connection,
     tds::codec::{
-        TokenColMetaData, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck, TokenInfo,
-        TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow, TokenSessionState,
+        TokenColInfo, TokenColMetaData, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck,
+        TokenInfo, TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
     },
     Error, SqlReadBytes, TokenType,
 };
@@ -25,6 +25,7 @@ pub enum ReceivedToken {
     ReturnStatus(u32),
     ReturnValue(TokenReturnValue),
     Order(TokenOrder),
+    ColInfo(TokenColInfo),
     EnvChange(TokenEnvChange),
     Info(TokenInfo),
     LoginAck(TokenLoginAck),
@@ -149,6 +150,12 @@ where
         Ok(ReceivedToken::Order(order))
     }
 
+    async fn get_col_info(&mut self) -> crate::Result<ReceivedToken> {
+        let col_info = TokenColInfo::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?col_info);
+        Ok(ReceivedToken::ColInfo(col_info))
+    }
+
     async fn get_done_value(&mut self) -> crate::Result<ReceivedToken> {
         let done = TokenDone::decode(self.conn).await?;
         event!(Level::TRACE, "{}", done);
@@ -255,17 +262,13 @@ where
                 TokenType::ReturnValue => this.get_return_value().await?,
                 TokenType::Error => this.get_error().await?,
                 TokenType::Order => this.get_order().await?,
+                TokenType::ColInfo => this.get_col_info().await?,
                 TokenType::EnvChange => this.get_env_change().await?,
                 TokenType::Info => this.get_info().await?,
                 TokenType::LoginAck => this.get_login_ack().await?,
                 TokenType::Sspi => this.get_sspi().await?,
                 TokenType::SessionState => this.get_session_state().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
-                _ => {
-                    return Err(Error::Protocol(
-                        format!("Token {:?} unimplemented!", ty).into(),
-                    ))
-                }
             };
 
             Ok(Some((token, this)))
