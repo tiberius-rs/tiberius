@@ -420,7 +420,7 @@ impl Row {
 
     /// Retrieve a column's data for a given column index.
     #[track_caller]
-    pub fn get_column_data<'a, I>(&'a self, idx: I) -> crate::Result<&'a ColumnData<'static>>
+    pub fn get_column_data<I>(&self, idx: I) -> crate::Result<&ColumnData<'static>>
     where
         I: QueryIdx,
     {
