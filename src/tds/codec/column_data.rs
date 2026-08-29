@@ -27,7 +27,7 @@ use super::{Encode, FixedLenType, TypeInfo, VarLenType};
 use crate::tds::time::{Date, DateTime2, DateTimeOffset, Time};
 use crate::{
     tds::{time::DateTime, time::SmallDateTime, xml::XmlData, Numeric},
-    SqlReadBytes,
+    FromSql, FromSqlOwned, IntoSql, SqlReadBytes, ToSql,
 };
 use bytes::BufMut;
 pub(crate) use bytes_mut_with_type_info::BytesMutWithTypeInfo;
@@ -793,6 +793,36 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
     }
 }
 
+/// Reads a [`ColumnData`] straight out of a row without any conversion,
+/// borrowing from the row's owned data.
+impl<'a> FromSql<'a> for ColumnData<'a> {
+    fn from_sql(value: &'a ColumnData<'static>) -> crate::Result<Option<Self>> {
+        Ok(Some(value.clone()))
+    }
+}
+
+/// Reads a [`ColumnData`] straight out of a row without any conversion, taking
+/// ownership of the value.
+impl<'a> FromSqlOwned for ColumnData<'a> {
+    fn from_sql_owned(value: ColumnData<'static>) -> crate::Result<Option<Self>> {
+        Ok(Some(value))
+    }
+}
+
+/// Binds a [`ColumnData`] directly as a query parameter, by reference.
+impl<'a> ToSql for ColumnData<'a> {
+    fn to_sql(&self) -> ColumnData<'_> {
+        self.clone()
+    }
+}
+
+/// Binds a [`ColumnData`] directly as a query parameter, by value.
+impl<'a> IntoSql<'a> for ColumnData<'a> {
+    fn into_sql(self) -> ColumnData<'a> {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1517,5 +1547,33 @@ mod tests {
             ColumnData::F64(Some(3.5)),
         )
         .await;
+    }
+
+    #[test]
+    fn column_data_from_sql_clones_by_reference() {
+        let value: ColumnData<'static> = ColumnData::I32(Some(42));
+        let out = ColumnData::from_sql(&value).unwrap();
+        assert_eq!(out, Some(ColumnData::I32(Some(42))));
+    }
+
+    #[test]
+    fn column_data_from_sql_owned_passes_through() {
+        let value: ColumnData<'static> = ColumnData::String(Some(Cow::Borrowed("hello")));
+        let out = ColumnData::from_sql_owned(value).unwrap();
+        assert_eq!(out, Some(ColumnData::String(Some(Cow::Borrowed("hello")))));
+    }
+
+    #[test]
+    fn column_data_to_sql_clones_by_reference() {
+        let value = ColumnData::Bit(Some(true));
+        assert_eq!(value.to_sql(), ColumnData::Bit(Some(true)));
+        // Original is untouched.
+        assert_eq!(value, ColumnData::Bit(Some(true)));
+    }
+
+    #[test]
+    fn column_data_into_sql_passes_through() {
+        let value = ColumnData::F64(Some(1.5));
+        assert_eq!(value.into_sql(), ColumnData::F64(Some(1.5)));
     }
 }
