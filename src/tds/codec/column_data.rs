@@ -872,6 +872,9 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 dst.extend_from_slice(headers);
                 num.encode(&mut *dst)?;
             }
+            (data, Some(TypeInfo::VarLenSized(vlc))) if vlc.r#type() == VarLenType::SSVariant => {
+                sql_variant::encode(&mut *dst, data)?;
+            }
             (_, None) => {
                 // None/null
                 dst.put_u8(FixedLenType::Null as u8);
