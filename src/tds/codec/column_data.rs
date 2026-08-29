@@ -36,6 +36,46 @@ use uuid::Uuid;
 
 const MAX_NVARCHAR_SIZE: usize = 1 << 30;
 
+/// Number of days between `0001-01-01` (the `DateTime2`/`Date` epoch) and
+/// `1900-01-01` (the `datetime`/`Datetimen` epoch).
+#[cfg(feature = "tds73")]
+const DAYS_YEAR_1_TO_1900: u32 = 693_595;
+
+/// Converts a [`DateTime2`] value into the legacy `datetime` ([`DateTime`])
+/// wire representation.
+///
+/// This is used when bulk-inserting a `DateTime2`/`Date` value into a column
+/// whose server-side type is `datetime` (`Datetimen`). The `datetime` type
+/// counts days from `1900-01-01` and stores the time of day as 1/300-second
+/// fragments, so the sub-second precision of the source value is degraded to
+/// match. Returns a [`Conversion`] error if the date is earlier than
+/// `1900-01-01`, which `datetime` cannot represent.
+///
+/// [`Conversion`]: crate::Error::Conversion
+#[cfg(feature = "tds73")]
+fn datetime2_to_datetime(dt2: &DateTime2) -> crate::Result<DateTime> {
+    let dt2_days = dt2.date().days();
+
+    let days = dt2_days.checked_sub(DAYS_YEAR_1_TO_1900).ok_or_else(|| {
+        crate::Error::Conversion(
+            format!(
+                "invalid datetime, expecting a date not earlier than 1900-01-01 but got {} days after year 1",
+                dt2_days
+            )
+            .into(),
+        )
+    })? as i32;
+
+    // `increments` are counted in 10^-scale seconds; convert to nanoseconds and
+    // then to the 1/300-second fragments used by `datetime`, degrading the
+    // sub-second precision in the process.
+    let time = dt2.time();
+    let nanos = time.increments() as u128 * 10u128.pow(9 - time.scale() as u32);
+    let seconds_fragments = (nanos * 300 / 1_000_000_000) as u32;
+
+    Ok(DateTime::new(days, seconds_fragments))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 /// A container of a value that can be represented as a TDS value.
 pub enum ColumnData<'a> {
@@ -664,6 +704,18 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
             (ColumnData::Time(Some(time)), None) => {
                 dst.extend_from_slice(&[VarLenType::Timen as u8, time.scale(), time.len()?]);
                 time.encode(&mut *dst)?;
+            }
+            #[cfg(feature = "tds73")]
+            (ColumnData::DateTime2(opt), Some(TypeInfo::VarLenSized(vlc)))
+                if vlc.r#type() == VarLenType::Datetimen =>
+            {
+                if let Some(dt2) = opt {
+                    let dt = datetime2_to_datetime(&dt2)?;
+                    dst.put_u8(8);
+                    dt.encode(dst)?;
+                } else {
+                    dst.put_u8(0);
+                }
             }
             #[cfg(feature = "tds73")]
             (ColumnData::DateTime2(opt), Some(TypeInfo::VarLenSized(vlc)))
@@ -1534,5 +1586,30 @@ mod tests {
     fn column_data_into_sql_passes_through() {
         let value = ColumnData::F64(Some(1.5));
         assert_eq!(value.into_sql(), ColumnData::F64(Some(1.5)));
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn datetime2_to_datetime_conversion() {
+        use crate::tds::time::{Date, DateTime2, Time};
+
+        // 2020-01-01 00:00:00 with scale 7 (100ns increments).
+        // Days from year 1 to 2020-01-01 is 737_425.
+        let dt2 = DateTime2::new(Date::new(737_425), Time::new(0, 7));
+        let dt = datetime2_to_datetime(&dt2).expect("conversion must succeed");
+
+        assert_eq!(dt.days(), (737_425 - DAYS_YEAR_1_TO_1900) as i32);
+        assert_eq!(dt.seconds_fragments(), 0);
+
+        // 12:00:00 exactly => half a day of 1/300s fragments.
+        let noon_increments = 12u64 * 3600 * 10u64.pow(7);
+        let dt2 = DateTime2::new(Date::new(737_425), Time::new(noon_increments, 7));
+        let dt = datetime2_to_datetime(&dt2).expect("conversion must succeed");
+
+        assert_eq!(dt.seconds_fragments(), 12 * 3600 * 300);
+
+        // Dates earlier than 1900-01-01 cannot be represented by `datetime`.
+        let dt2 = DateTime2::new(Date::new(0), Time::new(0, 7));
+        assert!(datetime2_to_datetime(&dt2).is_err());
     }
 }
