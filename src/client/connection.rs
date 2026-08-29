@@ -73,6 +73,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Debug for Connection<S> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// Creates a new connection
+    ///
+    /// Note: `tcp_stream` is a connected stream, so some parts of the
+    /// [`Config`] need to be handled outside of this method.
     pub(crate) async fn connect(config: Config, tcp_stream: S) -> crate::Result<Connection<S>> {
         let context = {
             let mut context = Context::new();
