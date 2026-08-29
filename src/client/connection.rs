@@ -120,7 +120,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let fed_auth_required = matches!(config.auth, AuthMethod::AADToken(_));
 
         let prelogin = connection
-            .prelogin(config.encryption, fed_auth_required)
+            .prelogin(
+                config.encryption,
+                fed_auth_required,
+                config.instance_name.clone(),
+            )
             .await?;
 
         let encryption = prelogin.negotiated_encryption(config.encryption)?;
@@ -325,10 +329,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         &mut self,
         encryption: EncryptionLevel,
         fed_auth_required: bool,
+        instance_name: Option<String>,
     ) -> crate::Result<PreloginMessage> {
         let mut msg = PreloginMessage::new();
         msg.encryption = encryption;
         msg.fed_auth_required = fed_auth_required;
+        msg.instance_name = instance_name.clone();
 
         let id = self.context.next_packet_id();
         self.send(PacketHeader::pre_login(id), msg).await?;
@@ -336,6 +342,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let response: PreloginMessage = codec::collect_from(self).await?;
         // threadid (should be empty when sent from server to client)
         debug_assert_eq!(response.thread_id, 0);
+        // ensure the server accepted the instance we asked it to validate
+        response.validate_instance(instance_name.as_deref())?;
         Ok(response)
     }
 
