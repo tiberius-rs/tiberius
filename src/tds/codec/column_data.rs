@@ -77,6 +77,7 @@ fn datetime2_to_datetime(dt2: &DateTime2) -> crate::Result<DateTime> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 /// A container of a value that can be represented as a TDS value.
 pub enum ColumnData<'a> {
     /// 8-bit integer, unsigned.
@@ -902,6 +903,15 @@ mod tests {
             .read_u8()
             .await
             .expect_err("decode must consume entire buffer");
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_json_round_trip() {
+        let value = ColumnData::I32(Some(1234));
+        let json = serde_json::to_string(&value).expect("serialize");
+        let back: ColumnData<'static> = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(value, back);
     }
 
     #[tokio::test]
