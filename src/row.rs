@@ -7,6 +7,7 @@ use std::{fmt::Display, sync::Arc};
 
 /// A column of data from a query.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Column {
     pub(crate) name: String,
     pub(crate) column_type: ColumnType,
@@ -30,6 +31,7 @@ impl Column {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 /// The type of the column.
 pub enum ColumnType {
     /// The column doesn't have a specified type.
@@ -246,6 +248,7 @@ impl From<&TypeInfo> for ColumnType {
 /// [`try_get`]: #method.try_get
 /// [`IntoIterator`]: #impl-IntoIterator
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Row {
     pub(crate) columns: Arc<Vec<Column>>,
     pub(crate) data: TokenRow<'static>,
