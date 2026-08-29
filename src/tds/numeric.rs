@@ -3,12 +3,12 @@
 use super::codec::Encode;
 use crate::{sql_read_bytes::SqlReadBytes, Error};
 #[cfg(feature = "bigdecimal")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "bigdecimal")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "bigdecimal")))]
 pub use bigdecimal::{num_bigint::BigInt, BigDecimal};
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{BufMut, BytesMut};
 #[cfg(feature = "rust_decimal")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "rust_decimal")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "rust_decimal")))]
 pub use rust_decimal::Decimal;
 use std::cmp::{Ordering, PartialEq};
 use std::fmt::{self, Debug, Display, Formatter};
