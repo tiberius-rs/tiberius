@@ -8,10 +8,49 @@ use opentls::Certificate;
 use std::fs;
 use tracing::{event, Level};
 
+/// The Application-Layer Protocol Negotiation (ALPN) protocol identifier used
+/// by SQL Server to negotiate TDS 8.0 ("strict" encryption), as defined in
+/// [MS-TDS] 2.2.6.5 "Prelogin" / the TDS 8.0 addendum. A client that wishes to
+/// speak TDS 8.0 advertises this protocol in the TLS `ClientHello`.
+pub(crate) const TDS80_ALPN_PROTOCOL: &str = "tds/8.0";
+
+/// Whether the `opentls` (vendored OpenSSL) TLS backend is able to advertise
+/// ALPN protocols during the TLS handshake.
+///
+/// The `opentls` crate (v0.2.x) does not expose any way to set the ALPN
+/// protocol list on its `TlsConnector` (there is no equivalent of
+/// `openssl::ssl::SslConnectorBuilder::set_alpn_protos`, and the wrapped
+/// `SslConnector` is a private field with no accessor). As a result this
+/// backend cannot advertise the [`TDS80_ALPN_PROTOCOL`] identifier and cannot
+/// participate in TDS 8.0 strict-encryption ALPN negotiation.
+///
+/// The `native-tls` and `rustls` backends do not currently advertise ALPN
+/// either, but — unlike `opentls` — their underlying libraries expose the
+/// necessary API, so this constant is deliberately scoped to the `opentls`
+/// backend to document its specific limitation.
+pub(crate) const fn supports_alpn() -> bool {
+    false
+}
+
 pub(crate) async fn create_tls_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
     config: &Config,
     stream: S,
 ) -> crate::Result<TlsStream<S>> {
+    if !supports_alpn() {
+        // The `opentls` backend has no API to set the ALPN protocol list, so we
+        // cannot advertise `tds/8.0`. TDS 8.0 strict encryption relies on ALPN
+        // to select the protocol before the TDS PRELOGIN is exchanged; without
+        // it the connection silently falls back to the classic (pre-8.0) TLS
+        // negotiation. Surface this clearly instead of failing opaquely later.
+        event!(
+            Level::WARN,
+            "The `vendored-openssl` (opentls) TLS backend cannot advertise the \
+             `{TDS80_ALPN_PROTOCOL}` ALPN protocol; TDS 8.0 strict-encryption \
+             negotiation is unavailable. Use the `native-tls` or `rustls` \
+             backend if TDS 8.0 ALPN negotiation is required."
+        );
+    }
+
     let mut builder = TlsConnector::new();
 
     if matches!(config.encryption, crate::EncryptionLevel::Strict) {
@@ -66,4 +105,25 @@ pub(crate) async fn create_tls_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
     Ok(builder
         .connect(config.get_hostname_in_certificate(), stream)
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{supports_alpn, TDS80_ALPN_PROTOCOL};
+
+    #[test]
+    fn tds80_alpn_identifier_is_stable() {
+        // The identifier is fixed by the TDS 8.0 specification and must not
+        // drift; SQL Server matches it byte-for-byte during ALPN negotiation.
+        assert_eq!(TDS80_ALPN_PROTOCOL, "tds/8.0");
+    }
+
+    #[test]
+    fn opentls_backend_cannot_advertise_alpn() {
+        // Documents (and guards against silent regressions of) the fact that
+        // the opentls backend has no ALPN API. If a future opentls release adds
+        // one and this backend is updated to use it, this assertion should be
+        // flipped together with the `supports_alpn` implementation.
+        assert!(!supports_alpn());
+    }
 }
