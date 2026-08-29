@@ -15,6 +15,7 @@ mod image;
 mod int;
 mod money;
 mod plp;
+mod sql_variant;
 mod string;
 mod text;
 #[cfg(feature = "tds73")]
