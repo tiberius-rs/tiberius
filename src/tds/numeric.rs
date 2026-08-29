@@ -264,6 +264,23 @@ mod decimal {
                 Numeric::new_with_scale(value, self_.scale() as u8)
             });
     );
+
+    #[cfg(feature = "tds73")]
+    into_sql!(self_,
+            Decimal: (ColumnData::Numeric, {
+                let unpacked = self_.unpack();
+
+                let mut value = (((unpacked.hi as u128) << 64)
+                                 + ((unpacked.mid as u128) << 32)
+                                 + unpacked.lo as u128) as i128;
+
+                if self_.is_sign_negative() {
+                    value = -value;
+                }
+
+                Numeric::new_with_scale(value, self_.scale() as u8)
+            });
+    );
 }
 
 #[cfg(feature = "bigdecimal")]
