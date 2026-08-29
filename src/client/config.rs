@@ -33,6 +33,8 @@ pub struct Config {
     pub(crate) auth: AuthMethod,
     pub(crate) readonly: bool,
     pub(crate) packet_size: Option<u32>,
+    pub(crate) hostname_in_certificate: Option<String>,
+    pub(crate) client_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +69,8 @@ impl Default for Config {
             auth: AuthMethod::None,
             readonly: false,
             packet_size: None,
+            hostname_in_certificate: None,
+            client_name: None,
         }
     }
 }
@@ -175,6 +179,28 @@ impl Config {
         }
     }
 
+    /// Sets the hostname that the server certificate is validated against,
+    /// instead of the value given to [`host`].
+    ///
+    /// This is useful when connecting through an IP address, a tunnel, or a
+    /// load balancer whose certificate carries a different subject/SAN than the
+    /// address used to reach it (see issue #340).
+    ///
+    /// - Defaults to the value of [`host`].
+    ///
+    /// [`host`]: Config::host
+    pub fn hostname_in_certificate(&mut self, hostname: impl ToString) {
+        self.hostname_in_certificate = Some(hostname.to_string());
+    }
+
+    /// Sets the client / workstation name reported to the server in the login
+    /// record (queryable with `HOST_NAME()`).
+    ///
+    /// - Defaults to the local workstation id (the machine hostname).
+    pub fn client_name(&mut self, name: impl ToString) {
+        self.client_name = Some(name.to_string());
+    }
+
     /// Sets the authentication method.
     ///
     /// - Defaults to `None`.
@@ -194,6 +220,17 @@ impl Config {
             .as_deref()
             .filter(|v| v != &".")
             .unwrap_or("localhost")
+    }
+
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    pub(crate) fn get_hostname_in_certificate(&self) -> &str {
+        self.hostname_in_certificate
+            .as_deref()
+            .unwrap_or_else(|| self.get_host())
     }
 
     pub(crate) fn get_port(&self) -> u16 {
@@ -228,8 +265,10 @@ impl Config {
     /// |`database`|`<string>`|The name of the database.|
     /// |`TrustServerCertificate`|`true`,`false`,`yes`,`no`|Specifies whether the driver trusts the server certificate when connecting using TLS. Cannot be used toghether with `TrustServerCertificateCA`|
     /// |`TrustServerCertificateCA`|`<path>`|Path to a `pem`, `crt` or `der` certificate file. Cannot be used together with `TrustServerCertificate`|
-    /// |`encrypt`|`true`,`false`,`yes`,`no`,`DANGER_PLAINTEXT`|Specifies whether the driver uses TLS to encrypt communication.|
+    /// |`encrypt`|`strict`,`true`,`false`,`yes`,`no`,`DANGER_PLAINTEXT`|Specifies whether the driver uses TLS to encrypt communication. `strict` (TDS 8.0) requires the `tds80` feature.|
     /// |`Application Name`, `ApplicationName`|`<string>`|Sets the application name for the connection.|
+    /// |`HostNameInCertificate`, `HostName In Certificate`|`<string>`|The hostname the server certificate is validated against. Defaults to `server`.|
+    /// |`WorkstationID`, `Workstation ID`|`<string>`|The client / workstation name reported to the server.|
     ///
     /// [ADO.NET connection string]: https://docs.microsoft.com/en-us/dotnet/framework/data/adonet/connection-strings
     pub fn from_ado_string(s: &str) -> crate::Result<Self> {
@@ -283,9 +322,17 @@ impl Config {
             builder.trust_cert_ca(ca);
         }
 
+        if let Some(hostname_in_cert) = s.hostname_in_certificate() {
+            builder.hostname_in_certificate(hostname_in_cert);
+        }
+
         builder.encryption(s.encrypt()?);
 
         builder.readonly(s.readonly());
+
+        if let Some(client_name) = s.client_name() {
+            builder.client_name(client_name);
+        }
 
         Ok(builder)
     }
@@ -364,6 +411,20 @@ pub(crate) trait ConfigString {
             .map(|ca| ca.to_string())
     }
 
+    fn hostname_in_certificate(&self) -> Option<String> {
+        self.dict()
+            .get("hostnameincertificate")
+            .or_else(|| self.dict().get("hostname in certificate"))
+            .map(|host| host.to_string())
+    }
+
+    fn client_name(&self) -> Option<String> {
+        self.dict()
+            .get("workstationid")
+            .or_else(|| self.dict().get("workstation id"))
+            .map(|name| name.to_string())
+    }
+
     #[cfg(any(
         feature = "rustls",
         feature = "native-tls",
@@ -376,6 +437,9 @@ pub(crate) trait ConfigString {
                 Ok(true) => Ok(EncryptionLevel::Required),
                 Ok(false) => Ok(EncryptionLevel::Off),
                 Err(_) if val == "DANGER_PLAINTEXT" => Ok(EncryptionLevel::NotSupported),
+                Err(_) if val.eq_ignore_ascii_case("strict") && cfg!(feature = "tds80") => {
+                    Ok(EncryptionLevel::Strict)
+                }
                 Err(e) => Err(e),
             })
             .unwrap_or(Ok(EncryptionLevel::Off))

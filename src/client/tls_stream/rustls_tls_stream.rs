@@ -87,7 +87,10 @@ impl ServerCertVerifier for NoCertVerifier {
 }
 
 fn get_server_name(config: &Config) -> crate::Result<ServerName<'static>> {
-    match (ServerName::try_from(config.get_host()), &config.trust) {
+    match (
+        ServerName::try_from(config.get_hostname_in_certificate()),
+        &config.trust,
+    ) {
         (Ok(sn), _) => Ok(sn.to_owned()),
         (Err(_), TrustConfig::TrustAll) => {
             Ok(ServerName::try_from("placeholder.domain.com").unwrap())
@@ -105,7 +108,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
             .with_safe_default_protocol_versions()
             .map_err(|e| crate::Error::Tls(e.to_string()))?;
 
-        let client_config = match &config.trust {
+        let mut client_config = match &config.trust {
             TrustConfig::CaCertificateLocation(path) => {
                 if let Ok(buf) = fs::read(path) {
                     let cert = match path.extension() {
@@ -172,6 +175,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                 builder.with_native_roots().with_no_client_auth()
             }
         };
+
+        // TDS 8.0 "strict" mode advertises the `tds/8.0` ALPN protocol so the
+        // server knows to speak TDS directly over the TLS stream.
+        if matches!(config.encryption, crate::EncryptionLevel::Strict) {
+            client_config
+                .alpn_protocols
+                .push(super::TDS_ALPN_PROTOCOL_NAME.as_bytes().to_vec());
+        }
 
         let connector = TlsConnector::from(Arc::new(client_config));
 

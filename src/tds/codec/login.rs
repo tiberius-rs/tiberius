@@ -179,8 +179,60 @@ impl<'a> LoginMessage<'a> {
             option_flags_2: OptionFlag2::InitLangFatal | OptionFlag2::OdbcDriver,
             option_flags_3: BitFlags::from_flag(OptionFlag3::UnknownCollationHandling),
             app_name: "tiberius".into(),
+            hostname: Self::get_hostname(),
             ..Default::default()
         }
+    }
+
+    /// Best-effort local workstation id (machine hostname), used as the default
+    /// login `hostname`. Returns an empty string if it cannot be determined.
+    fn get_hostname() -> Cow<'static, str> {
+        #[cfg(windows)]
+        fn get_computer_name() -> io::Result<String> {
+            extern "system" {
+                // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getcomputernamew
+                fn GetComputerNameW(lpBuffer: *mut u16, nSize: *mut u32) -> i32;
+            }
+
+            // MAX_COMPUTERNAME_LENGTH is 15, plus 1 for the null terminator.
+            let mut buffer = [0u16; 15 + 1];
+            let mut size = buffer.len() as u32;
+            let result = unsafe { GetComputerNameW(buffer.as_mut_ptr(), &mut size) };
+            if result == 0 {
+                let lerr = io::Error::last_os_error();
+                tracing::error!("GetComputerNameW failed: {lerr}");
+                Err(lerr)
+            } else {
+                Ok(String::from_utf16_lossy(&buffer[..size as usize]))
+            }
+        }
+
+        #[cfg(target_family = "unix")]
+        fn get_computer_name() -> io::Result<String> {
+            // POSIX gethostname() may or may not null-terminate on truncation,
+            // so we split on the first NUL (falling back to the whole buffer).
+            let mut buffer = [0u8; 255 + 1];
+            let result = unsafe {
+                libc::gethostname(buffer.as_mut_ptr() as *mut _, buffer.len() as libc::size_t)
+            };
+            if result != 0 {
+                let lerr = io::Error::last_os_error();
+                tracing::error!("gethostname failed: {lerr}");
+                Err(lerr)
+            } else {
+                match buffer.split(|b| *b == 0).next() {
+                    Some(hostname) => Ok(String::from_utf8_lossy(hostname).into_owned()),
+                    None => Ok(String::from_utf8_lossy(&buffer).into_owned()),
+                }
+            }
+        }
+
+        #[cfg(not(any(windows, target_family = "unix")))]
+        fn get_computer_name() -> io::Result<String> {
+            Ok(String::new())
+        }
+
+        get_computer_name().map(Cow::Owned).unwrap_or_default()
     }
 
     #[cfg(any(all(unix, feature = "integrated-auth-gssapi"), windows))]
@@ -204,6 +256,11 @@ impl<'a> LoginMessage<'a> {
 
     pub fn server_name(&mut self, server_name: impl Into<Cow<'a, str>>) {
         self.server_name = server_name.into();
+    }
+
+    /// Sets the client / workstation name reported to the server.
+    pub fn hostname(&mut self, hostname: impl Into<Cow<'a, str>>) {
+        self.hostname = hostname.into();
     }
 
     pub fn user_name(&mut self, user_name: impl Into<Cow<'a, str>>) {

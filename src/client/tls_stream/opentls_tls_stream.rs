@@ -14,6 +14,13 @@ pub(crate) async fn create_tls_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
 ) -> crate::Result<TlsStream<S>> {
     let mut builder = TlsConnector::new();
 
+    if matches!(config.encryption, crate::EncryptionLevel::Strict) {
+        event!(
+            Level::WARN,
+            "OpenTLS does not support ALPN, so the TDS 8.0 ALPN protocol will not be requested. SQL Server will assume TDS 8.0."
+        );
+    }
+
     match &config.trust {
         TrustConfig::CaCertificateLocation(path) => {
             if let Ok(buf) = fs::read(path) {
@@ -56,5 +63,7 @@ pub(crate) async fn create_tls_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
         }
     }
 
-    Ok(builder.connect(config.get_host(), stream).await?)
+    Ok(builder
+        .connect(config.get_hostname_in_certificate(), stream)
+        .await?)
 }

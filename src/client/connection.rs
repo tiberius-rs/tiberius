@@ -80,6 +80,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             context
         };
 
+        // In TDS 8.0 "strict" mode the TLS handshake happens *before* the
+        // prelogin, so we wrap the stream in TLS up front. In every other mode
+        // the connection starts in the clear and TLS (if any) is negotiated
+        // during the prelogin.
+        #[cfg(any(
+            feature = "rustls",
+            feature = "native-tls",
+            feature = "vendored-openssl"
+        ))]
+        let transport = match config.encryption {
+            EncryptionLevel::Strict => {
+                event!(Level::DEBUG, "Performing a TLS handshake (TDS 8.0 strict)");
+                let mut pre_login_stream = TlsPreloginWrapper::new(tcp_stream);
+                // No prelogin framing is used for the strict handshake; pass the
+                // raw TLS bytes straight through.
+                pre_login_stream.handshake_complete();
+                let stream = create_tls_stream(&config, pre_login_stream).await?;
+                event!(Level::DEBUG, "TLS handshake successful");
+                Framed::new(MaybeTlsStream::Tls(stream), PacketCodec)
+            }
+            _ => Framed::new(MaybeTlsStream::Raw(tcp_stream), PacketCodec),
+        };
+
+        #[cfg(not(any(
+            feature = "rustls",
+            feature = "native-tls",
+            feature = "vendored-openssl"
+        )))]
         let transport = Framed::new(MaybeTlsStream::Raw(tcp_stream), PacketCodec);
 
         let mut connection = Self {
@@ -106,6 +134,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 config.database,
                 config.host,
                 config.application_name,
+                config.client_name,
                 config.readonly,
                 config.packet_size,
                 prelogin,
@@ -320,6 +349,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         db: Option<String>,
         server_name: Option<String>,
         application_name: Option<String>,
+        client_name: Option<String>,
         readonly: bool,
         packet_size: Option<u32>,
         prelogin: PreloginMessage,
@@ -336,6 +366,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
 
         if let Some(app_name) = application_name {
             login_message.app_name(app_name);
+        }
+
+        if let Some(client_name) = client_name {
+            login_message.hostname(client_name);
         }
 
         login_message.readonly(readonly);
@@ -482,37 +516,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         config: &Config,
         encryption: EncryptionLevel,
     ) -> crate::Result<Self> {
-        if encryption != EncryptionLevel::NotSupported {
-            event!(Level::DEBUG, "Performing a TLS handshake");
+        match encryption {
+            EncryptionLevel::NotSupported => {
+                event!(
+                    Level::WARN,
+                    "TLS encryption is not enabled. All traffic including the login credentials are not encrypted."
+                );
 
-            let Self {
-                transport, context, ..
-            } = self;
-            let mut stream = match transport.into_inner() {
-                MaybeTlsStream::Raw(tcp) => {
-                    create_tls_stream(config, TlsPreloginWrapper::new(tcp)).await?
-                }
-                _ => unreachable!(),
-            };
+                Ok(self)
+            }
+            // In strict mode the handshake already happened before the prelogin,
+            // so the transport is already a TLS stream. Nothing to do here.
+            EncryptionLevel::Strict => {
+                event!(
+                    Level::TRACE,
+                    "Already in a TLS stream (TDS 8.0 strict), skipping handshake."
+                );
 
-            stream.get_mut().handshake_complete();
-            event!(Level::DEBUG, "TLS handshake successful");
+                Ok(self)
+            }
+            EncryptionLevel::Off | EncryptionLevel::On | EncryptionLevel::Required => {
+                event!(Level::DEBUG, "Performing a TLS handshake");
 
-            let transport = Framed::new(MaybeTlsStream::Tls(stream), PacketCodec);
+                let Self {
+                    transport, context, ..
+                } = self;
+                let mut stream = match transport.into_inner() {
+                    MaybeTlsStream::Raw(tcp) => {
+                        create_tls_stream(config, TlsPreloginWrapper::new(tcp)).await?
+                    }
+                    _ => unreachable!(),
+                };
 
-            Ok(Self {
-                transport,
-                context,
-                flushed: false,
-                buf: BytesMut::new(),
-            })
-        } else {
-            event!(
-                Level::WARN,
-                "TLS encryption is not enabled. All traffic including the login credentials are not encrypted."
-            );
+                stream.get_mut().handshake_complete();
+                event!(Level::DEBUG, "TLS handshake successful");
 
-            Ok(self)
+                let transport = Framed::new(MaybeTlsStream::Tls(stream), PacketCodec);
+
+                Ok(Self {
+                    transport,
+                    context,
+                    flushed: false,
+                    buf: BytesMut::new(),
+                })
+            }
         }
     }
 
@@ -547,7 +594,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     feature = "vendored-openssl"
 )))]
 fn check_tls_backend_available(encryption: EncryptionLevel) -> crate::Result<()> {
-    if let EncryptionLevel::On | EncryptionLevel::Required = encryption {
+    if let EncryptionLevel::On | EncryptionLevel::Required | EncryptionLevel::Strict = encryption {
         return Err(crate::Error::Tls(
             "TLS encryption was requested but the crate was compiled without a TLS backend. \
              Enable one of the `native-tls`, `rustls` or `vendored-openssl` features."
