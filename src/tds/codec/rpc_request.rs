@@ -1,3 +1,4 @@
+use super::TypeInfoTvp;
 use super::{AllHeaderTy, Encode, ALL_HEADERS_LEN_TX};
 use crate::{tds::codec::ColumnData, BytesMutWithTypeInfo, Result};
 use bytes::{BufMut, BytesMut};
@@ -46,11 +47,22 @@ impl<'a> TokenRpcRequest<'a> {
     }
 }
 
+/// The value carried by an [`RpcParam`]. A scalar column value, or a
+/// table-valued parameter (TVP).
+#[derive(Debug)]
+pub enum RpcValue<'a> {
+    /// An ordinary scalar parameter value.
+    Scalar(ColumnData<'a>),
+    /// A table-valued parameter. As per the TDS grammar, `TYPE_INFO_TVP`
+    /// carries both the type metadata and the data rows.
+    Table(TypeInfoTvp<'a>),
+}
+
 #[derive(Debug)]
 pub struct RpcParam<'a> {
     pub name: Cow<'a, str>,
     pub flags: BitFlags<RpcStatus>,
-    pub value: ColumnData<'a>,
+    pub value: RpcValue<'a>,
 }
 
 /// 2.2.6.6 RPC Request
@@ -103,10 +115,21 @@ impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
                 let val = (0xffff_u32) | ((*id as u16) as u32) << 16;
                 dst.put_u32_le(val);
             }
-            RpcProcIdValue::Name(ref _name) => {
-                //let (left_bytes, _) = try!(write_varchar::<u16>(&mut cursor, name, 0));
-                //assert_eq!(left_bytes, 0);
-                todo!()
+            RpcProcIdValue::Name(ref name) => {
+                // ProcName is a US_VARCHAR: a u16 little-endian character count
+                // followed by that many UTF-16 code units.
+                let len_pos = dst.len();
+                dst.put_u16_le(0u16);
+                let mut length = 0_u16;
+
+                for chr in name.encode_utf16() {
+                    dst.put_u16_le(chr);
+                    length += 1;
+                }
+
+                let dst: &mut [u8] = dst.borrow_mut();
+                let mut dst = &mut dst[len_pos..];
+                dst.put_u16_le(length);
             }
         }
 
@@ -134,12 +157,107 @@ impl<'a> Encode<BytesMut> for RpcParam<'a> {
 
         dst.put_u8(self.flags.bits());
 
-        let mut dst_fi = BytesMutWithTypeInfo::new(dst);
-        self.value.encode(&mut dst_fi)?;
+        match self.value {
+            RpcValue::Scalar(value) => {
+                let mut dst_ti = BytesMutWithTypeInfo::new(dst);
+                value.encode(&mut dst_ti)?;
+            }
+            RpcValue::Table(value) => value.encode(dst)?,
+        }
 
         let dst: &mut [u8] = dst.borrow_mut();
         dst[len_pos] = length;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::codec::ColumnData;
+
+    fn scalar(value: ColumnData<'static>) -> RpcValue<'static> {
+        RpcValue::Scalar(value)
+    }
+
+    #[test]
+    fn encodes_named_proc_header() {
+        let req = TokenRpcRequest::new(
+            "dbo.usp_MyProc",
+            vec![RpcParam {
+                name: Cow::Borrowed("@id"),
+                flags: BitFlags::empty(),
+                value: scalar(ColumnData::I32(Some(1))),
+            }],
+            [0u8; 8],
+        );
+
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf).unwrap();
+
+        // Skip the ALL_HEADERS block, positioned right at the ProcName.
+        let name_pos = ALL_HEADERS_LEN_TX;
+        let len = u16::from_le_bytes([buf[name_pos], buf[name_pos + 1]]);
+        assert_eq!(len as usize, "dbo.usp_MyProc".encode_utf16().count());
+
+        // Verify the UTF-16 payload matches the proc name.
+        let mut chars = Vec::new();
+        let mut off = name_pos + 2;
+        for _ in 0..len {
+            chars.push(u16::from_le_bytes([buf[off], buf[off + 1]]));
+            off += 2;
+        }
+        assert_eq!(String::from_utf16(&chars).unwrap(), "dbo.usp_MyProc");
+
+        // Option flags (u16) follow the name.
+        let flags = u16::from_le_bytes([buf[off], buf[off + 1]]);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn named_and_by_id_differ_only_in_proc_slot() {
+        let by_id = {
+            let req = TokenRpcRequest::new(RpcProcId::ExecuteSQL, vec![], [0u8; 8]);
+            let mut buf = BytesMut::new();
+            req.encode(&mut buf).unwrap();
+            buf
+        };
+
+        // By-id encodes 0xFFFF followed by the proc id in the high word.
+        let val = u32::from_le_bytes([
+            by_id[ALL_HEADERS_LEN_TX],
+            by_id[ALL_HEADERS_LEN_TX + 1],
+            by_id[ALL_HEADERS_LEN_TX + 2],
+            by_id[ALL_HEADERS_LEN_TX + 3],
+        ]);
+        assert_eq!(val & 0xffff, 0xffff);
+        assert_eq!((val >> 16) as u16, RpcProcId::ExecuteSQL as u16);
+    }
+
+    #[test]
+    fn encodes_param_name_and_by_ref_flag() {
+        let param = RpcParam {
+            name: Cow::Borrowed("@out"),
+            flags: BitFlags::from_flag(RpcStatus::ByRefValue),
+            value: scalar(ColumnData::I32(Some(7))),
+        };
+
+        let mut buf = BytesMut::new();
+        param.encode(&mut buf).unwrap();
+
+        // First byte is the param-name length (in UTF-16 code units).
+        assert_eq!(buf[0] as usize, "@out".encode_utf16().count());
+
+        let mut chars = Vec::new();
+        let mut off = 1usize;
+        for _ in 0..buf[0] {
+            chars.push(u16::from_le_bytes([buf[off], buf[off + 1]]));
+            off += 2;
+        }
+        assert_eq!(String::from_utf16(&chars).unwrap(), "@out");
+
+        // Status flags byte carries the ByRefValue bit.
+        assert_eq!(buf[off], RpcStatus::ByRefValue as u8);
     }
 }
