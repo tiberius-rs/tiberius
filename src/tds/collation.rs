@@ -11,6 +11,8 @@ use std::fmt;
 
 use crate::error::Error;
 
+/// The collation of a character column, describing its locale (LCID), sort
+/// order and code page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Collation {
     /// LCID ColFlags Version
@@ -20,6 +22,7 @@ pub struct Collation {
 }
 
 impl Collation {
+    /// Create a new collation from a raw LCID/flags/version word and sort id.
     pub fn new(info: u32, sort_id: u8) -> Self {
         Self { info, sort_id }
     }
@@ -29,10 +32,12 @@ impl Collation {
         (self.info & 0xffff) as u16
     }
 
+    /// The sort id of the collation.
     pub fn sort_id(&self) -> u8 {
         self.sort_id
     }
 
+    /// The raw LCID/flags/version word of the collation.
     pub fn info(&self) -> u32 {
         self.info
     }

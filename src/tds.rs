@@ -1,5 +1,5 @@
 pub mod codec;
-mod collation;
+pub(crate) mod collation;
 mod context;
 pub mod numeric;
 pub mod stream;

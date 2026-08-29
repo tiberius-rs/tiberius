@@ -21,7 +21,7 @@ use crate::{
         codec::{self, IteratorJoin},
         stream::{QueryStream, TokenStream},
     },
-    BulkLoadRequest, ColumnFlag, SqlReadBytes, ToSql,
+    BulkLoadRequest, ColumnFlag, MetaDataColumn, SqlReadBytes, ToSql,
 };
 use codec::{BatchRequest, ColumnData, PacketHeader, RpcParam, RpcProcId, TokenRpcRequest};
 use enumflags2::BitFlags;
@@ -357,15 +357,68 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         table: &'a str,
         columns: &'a [&'a str],
     ) -> crate::Result<BulkLoadRequest<'a, S>> {
-        // Start the bulk request
+        // Retrieve column metadata from the server, keeping only the updateable
+        // columns as bulk targets (identity/computed columns are skipped).
+        let columns: Vec<_> = self
+            .column_metadata(table, columns)
+            .await?
+            .into_iter()
+            .filter(|column| column.base.flags.contains(ColumnFlag::Updateable))
+            .collect();
+
+        // now start bulk upload
+        self.connection.flush_stream().await?;
+        let col_data = columns.iter().map(|c| format!("{}", c)).join(", ");
+        let query = format!("INSERT BULK {} ({})", table, col_data);
+
+        let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
+        let id = self.connection.context_mut().next_packet_id();
+
+        self.connection.send(PacketHeader::batch(id), req).await?;
+
+        let ts = TokenStream::new(&mut self.connection);
+        ts.flush_done().await?;
+
+        BulkLoadRequest::new(&mut self.connection, columns)
+    }
+
+    /// Retrieve the column metadata for a set of columns of a table, including
+    /// the column names, types (with their size, precision and scale) and flags
+    /// such as nullability and whether a column is an identity column.
+    ///
+    /// Pass `&["*"]` as `columns` to return the metadata for every column of the
+    /// table.
+    ///
+    /// ```no_run
+    /// # use tiberius::Config;
+    /// # use tokio_util::compat::TokioAsyncWriteCompatExt;
+    /// # use std::env;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let c_str = env::var("TIBERIUS_TEST_CONNECTION_STRING").unwrap_or(
+    /// #     "server=tcp:localhost,1433;integratedSecurity=true;TrustServerCertificate=true".to_owned(),
+    /// # );
+    /// # let config = Config::from_ado_string(&c_str)?;
+    /// # let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+    /// # tcp.set_nodelay(true)?;
+    /// # let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+    /// let meta = client.column_metadata("some_table", &["*"]).await?;
+    /// assert!(meta[0].base().is_identity());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn column_metadata(
+        &mut self,
+        table: &str,
+        columns: &[&str],
+    ) -> crate::Result<Vec<MetaDataColumn<'static>>> {
         self.connection.flush_stream().await?;
 
-        // retrieve column metadata from server
+        // Ask the server for the column layout without returning any rows.
         let columns = columns.join(", ");
         let query = format!("SELECT TOP 0 {columns} FROM {table}");
 
         let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
-
         let id = self.connection.context_mut().next_packet_id();
         self.connection.send(PacketHeader::batch(id), req).await?;
 
@@ -381,28 +434,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             })
             .await?;
 
-        // now start bulk upload
-        let columns: Vec<_> = columns
-            .ok_or_else(|| {
-                crate::Error::Protocol("expecting column metadata from query but not found".into())
-            })?
+        let columns = columns.ok_or_else(|| {
+            crate::Error::Protocol("expecting column metadata from query but not found".into())
+        })?;
+
+        // Own the column names so the returned metadata is not tied to the
+        // lifetime of the token stream.
+        Ok(columns
             .into_iter()
-            .filter(|column| column.base.flags.contains(ColumnFlag::Updateable))
-            .collect();
-
-        self.connection.flush_stream().await?;
-        let col_data = columns.iter().map(|c| format!("{}", c)).join(", ");
-        let query = format!("INSERT BULK {} ({})", table, col_data);
-
-        let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
-        let id = self.connection.context_mut().next_packet_id();
-
-        self.connection.send(PacketHeader::batch(id), req).await?;
-
-        let ts = TokenStream::new(&mut self.connection);
-        ts.flush_done().await?;
-
-        BulkLoadRequest::new(&mut self.connection, columns)
+            .map(|c| MetaDataColumn {
+                base: c.base,
+                col_name: std::borrow::Cow::Owned(c.col_name.into_owned()),
+            })
+            .collect())
     }
 
     /// Closes this database connection explicitly.
