@@ -8,8 +8,21 @@ authors = [
 description = "A TDS (MSSQL) driver"
 documentation = "https://docs.rs/tiberius/"
 edition = "2021"
-keywords = ["tds", "mssql", "sql"]
-license = "MIT/Apache-2.0"
+keywords = ["tds", "mssql", "sql", "sqlserver", "database"]
+categories = ["database"]
+license = "MIT OR Apache-2.0"
+name = "tiberius-ng"
+readme = "README.md"
+repository = "https://github.com/MattJackson/tiberius-ng"
+homepage = "https://github.com/MattJackson/tiberius-ng"
+rust-version = "1.88"
+version = "0.13.0"
+
+# The published package is `tiberius-ng` (the crates.io name `tiberius` is owned
+# by the original, now-unmaintained project). The library name stays `tiberius`
+# so downstream code keeps `use tiberius::...` — only the Cargo.toml dependency
+# line changes:  tiberius = { package = "tiberius-ng", version = "0.13" }
+[lib]
 name = "tiberius"
 readme = "README.md"
 repository = "https://github.com/prisma/tiberius"

@@ -38,7 +38,51 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --check
 
-  cargo-test-linux:
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # Keep this in sync with `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install dependencies
+        run: sudo apt-get install -y openssl libkrb5-dev
+      - name: Check on MSRV
+        run: cargo check --features all
+
+  semver:
+    name: semver-checks (advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # Advisory during 0.x: reports API-breaking changes vs the target branch
+    # without blocking (breaking changes are allowed pre-1.0, but should be
+    # visible in review).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install dependencies
+        run: sudo apt-get install -y openssl libkrb5-dev
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@cargo-semver-checks
+      - name: Check for semver-breaking changes
+        run: cargo semver-checks --baseline-rev "origin/${{ github.base_ref }}"
+
+  smoke:
+    name: integration smoke (SQL 2022)
+    # Fast real-server signal on the dev lane; the full matrix runs on qa.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')
     runs-on: ubuntu-latest
 
     strategy:

@@ -4,7 +4,6 @@ use std::{
 };
 
 use crate::{
-    error::Error,
     tds::codec::{Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
     Column, ColumnData, ColumnType, SqlReadBytes,
 };
@@ -461,8 +460,11 @@ impl BaseMetaDataColumn {
 
         let _user_ty = src.read_u32_le().await?;
 
-        let flags = BitFlags::from_bits(src.read_u16_le().await?)
-            .map_err(|_| Error::Protocol("column metadata: invalid flags".into()))?;
+        // The COLMETADATA `Flags` field (MS-TDS §2.2.7.4) is a 16-bit field that
+        // includes reserved / ODBC bits the server may set and which future
+        // protocol revisions may extend. Truncate to the flags we model rather
+        // than rejecting the whole token on an unrecognized bit.
+        let flags = BitFlags::from_bits_truncate(src.read_u16_le().await?);
 
         let ty = TypeInfo::decode(src).await?;
 
