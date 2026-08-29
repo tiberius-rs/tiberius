@@ -235,7 +235,10 @@ impl<'a> LoginMessage<'a> {
         get_computer_name().map(Cow::Owned).unwrap_or_default()
     }
 
-    #[cfg(any(all(unix, feature = "integrated-auth-gssapi"), windows))]
+    #[cfg(any(
+        all(unix, any(feature = "integrated-auth-gssapi", feature = "sspi-rs")),
+        windows
+    ))]
     pub fn integrated_security(&mut self, bytes: Option<Vec<u8>>) {
         if bytes.is_some() {
             self.option_flags_2.insert(OptionFlag2::IntegratedSecurity);
