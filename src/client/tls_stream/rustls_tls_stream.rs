@@ -1,5 +1,8 @@
 use crate::{
-    client::{config::Config, TrustConfig},
+    client::{
+        config::{ClientCertSource, ClientCertificate, Config},
+        TrustConfig,
+    },
     error::IoErrorKind,
     Error,
 };
@@ -17,7 +20,7 @@ use tokio_rustls::{
             WantsClientCert,
         },
         crypto::aws_lc_rs,
-        pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime},
+        pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime},
         ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore,
         SignatureScheme, WantsVerifier,
     },
@@ -108,7 +111,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
             .with_safe_default_protocol_versions()
             .map_err(|e| crate::Error::Tls(e.to_string()))?;
 
-        let mut client_config = match &config.trust {
+        // First select the server-certificate verification strategy, yielding a
+        // builder that still awaits the client-authentication decision.
+        let cc_builder: ConfigBuilder<ClientConfig, WantsClientCert> = match &config.trust {
             TrustConfig::CaCertificateLocation(path) => {
                 if let Ok(buf) = fs::read(path) {
                     let cert = match path.extension() {
@@ -150,9 +155,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                     };
                     let mut cert_store = RootCertStore::empty();
                     cert_store.add(cert)?;
-                    builder
-                        .with_root_certificates(cert_store)
-                        .with_no_client_auth()
+                    builder.with_root_certificates(cert_store)
                 } else {
                     return Err(Error::Io {
                         kind: IoErrorKind::InvalidData,
@@ -168,12 +171,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                 builder
                     .dangerous()
                     .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
-                    .with_no_client_auth()
             }
             TrustConfig::Default => {
                 event!(Level::DEBUG, "Using default trust configuration.");
-                builder.with_native_roots().with_no_client_auth()
+                builder.with_native_roots()
             }
+        };
+
+        // Present a client certificate (mutual TLS / TDS 8.0
+        // `ENCRYPT_CLIENT_CERT`) if one was configured, otherwise finalize
+        // without client authentication.
+        let mut client_config = match config.get_client_certificate() {
+            Some(cert) => {
+                event!(
+                    Level::DEBUG,
+                    "Presenting a client certificate for mutual TLS."
+                );
+                let (chain, key) = load_client_auth(cert)?;
+                cc_builder
+                    .with_client_auth_cert(chain, key)
+                    .map_err(|e| crate::Error::Tls(e.to_string()))?
+            }
+            None => cc_builder.with_no_client_auth(),
         };
 
         // TDS 8.0 "strict" mode advertises the `tds/8.0` ALPN protocol so the
@@ -227,6 +246,95 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let inner = Pin::get_mut(self);
         Pin::new(&mut inner.0).poll_close(cx)
+    }
+}
+
+/// Loads a client certificate chain and private key from the configured source
+/// for use with rustls' `with_client_auth_cert`.
+fn load_client_auth(
+    cert: &ClientCertificate,
+) -> crate::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    match &cert.source {
+        ClientCertSource::CertAndKey { cert, key } => {
+            let cert_buf = fs::read(cert).map_err(|e| crate::Error::Io {
+                kind: IoErrorKind::InvalidData,
+                message: format!(
+                    "Could not read client certificate {}: {e}",
+                    cert.to_string_lossy()
+                ),
+            })?;
+
+            // Certificate: PEM (possibly a chain) or a single DER cert.
+            let chain: Vec<CertificateDer<'static>> = match cert.extension() {
+                Some(ext) if ext.eq_ignore_ascii_case("pem") || ext.eq_ignore_ascii_case("crt") => {
+                    CertificateDer::pem_slice_iter(&cert_buf)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| crate::Error::Io {
+                            kind: IoErrorKind::InvalidData,
+                            message: format!("Failed to parse PEM client certificate: {e}"),
+                        })?
+                }
+                Some(ext) if ext.eq_ignore_ascii_case("der") => {
+                    vec![CertificateDer::from(cert_buf)]
+                }
+                Some(_) | None => {
+                    return Err(crate::Error::Io {
+                        kind: IoErrorKind::InvalidInput,
+                        message: "Client certificate has an unsupported file-extension! Supported types are pem, crt and der.".to_string(),
+                    })
+                }
+            };
+
+            if chain.is_empty() {
+                return Err(crate::Error::Io {
+                    kind: IoErrorKind::InvalidInput,
+                    message: format!(
+                        "Client certificate file {} contains no certificates",
+                        cert.to_string_lossy()
+                    ),
+                });
+            }
+
+            // Private key: PEM (any of PKCS#8, PKCS#1 or SEC1) or DER (PKCS#8).
+            let key_buf = fs::read(key).map_err(|e| crate::Error::Io {
+                kind: IoErrorKind::InvalidData,
+                message: format!(
+                    "Could not read client private key {}: {e}",
+                    key.to_string_lossy()
+                ),
+            })?;
+
+            let key: PrivateKeyDer<'static> = match key.extension() {
+                Some(ext)
+                    if ext.eq_ignore_ascii_case("pem") || ext.eq_ignore_ascii_case("key") =>
+                {
+                    PrivateKeyDer::from_pem_slice(&key_buf).map_err(|e| crate::Error::Io {
+                        kind: IoErrorKind::InvalidData,
+                        message: format!("Failed to parse PEM private key: {e}"),
+                    })?
+                }
+                Some(ext) if ext.eq_ignore_ascii_case("der") => PrivateKeyDer::try_from(key_buf)
+                    .map_err(|e| crate::Error::Io {
+                        kind: IoErrorKind::InvalidData,
+                        message: format!("Failed to parse DER private key: {e}"),
+                    })?,
+                Some(_) | None => {
+                    return Err(crate::Error::Io {
+                        kind: IoErrorKind::InvalidInput,
+                        message: "Client private key has an unsupported file-extension! Supported types are pem, key and der.".to_string(),
+                    })
+                }
+            };
+
+            Ok((chain, key))
+        }
+        #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
+        ClientCertSource::Pkcs12 { .. } => Err(crate::Error::Tls(
+            "The rustls backend does not support PKCS#12 client certificates; \
+             supply separate PEM/DER certificate and key files via \
+             `Config::client_certificate` instead."
+                .to_string(),
+        )),
     }
 }
 
