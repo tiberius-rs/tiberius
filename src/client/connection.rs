@@ -452,14 +452,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             }
             #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
             AuthMethod::Integrated => {
-                let mut s = OidSet::new()?;
-                s.add(&GSS_MECH_KRB5)?;
+                let mut s = OidSet::new();
+                s.add(GSS_MECH_KRB5)?;
 
                 let client_cred = Cred::acquire(None, None, CredUsage::Initiate, Some(&s))?;
 
                 let mut ctx = ClientCtx::new(
                     Some(client_cred),
-                    Name::new(self.context.spn().as_bytes(), Some(&GSS_NT_KRB5_PRINCIPAL))?,
+                    Name::new(self.context.spn().as_bytes(), Some(GSS_NT_KRB5_PRINCIPAL))?,
                     CtxFlags::GSS_C_MUTUAL_FLAG | CtxFlags::GSS_C_SEQUENCE_FLAG,
                     None,
                 );
