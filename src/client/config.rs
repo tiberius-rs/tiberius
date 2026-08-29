@@ -18,10 +18,17 @@ use jdbc::*;
 /// When using an [ADO.NET connection string], it can be
 /// constructed using the [`from_ado_string`] function.
 ///
+/// Alternatively, a [`ConfigBuilder`] can be used for an ergonomic,
+/// chainable construction. Create one via [`builder`], call its
+/// setter methods and finalize it with [`build`].
+///
 /// [`Client`]: struct.Client.html
 /// [ADO.NET connection string]: https://docs.microsoft.com/en-us/dotnet/framework/data/adonet/connection-strings
 /// [`from_ado_string`]: struct.Config.html#method.from_ado_string
 /// [`get_addr`]: struct.Config.html#method.get_addr
+/// [`ConfigBuilder`]: struct.ConfigBuilder.html
+/// [`builder`]: struct.Config.html#method.builder
+/// [`build`]: struct.ConfigBuilder.html#method.build
 pub struct Config {
     pub(crate) host: Option<String>,
     pub(crate) port: Option<u16>,
@@ -79,6 +86,33 @@ impl Config {
     /// Create a new `Config` with the default settings.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a new [`ConfigBuilder`] initialized with the default settings.
+    ///
+    /// This provides an ergonomic, chainable alternative to constructing a
+    /// [`Config`] via its individual setter methods.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tiberius::{Config, AuthMethod};
+    /// let config = Config::builder()
+    ///     .host("localhost")
+    ///     .port(1433)
+    ///     .database("master")
+    ///     .authentication(AuthMethod::sql_server("SA", "<password>"))
+    ///     .build();
+    ///
+    /// assert_eq!("localhost:1433", config.get_addr());
+    /// ```
+    ///
+    /// [`ConfigBuilder`]: struct.ConfigBuilder.html
+    /// [`Config`]: struct.Config.html
+    pub fn builder() -> ConfigBuilder {
+        ConfigBuilder {
+            inner: Self::default(),
+        }
     }
 
     /// A host or ip address to connect to.
@@ -338,6 +372,161 @@ impl Config {
     }
 }
 
+/// A builder for [`Config`], providing an ergonomic, chainable way to
+/// construct a connection configuration.
+///
+/// Create a builder with [`Config::builder`], set the desired options by
+/// calling its methods (each returns the builder to allow chaining) and
+/// finalize it with [`build`].
+///
+/// # Example
+///
+/// ```
+/// # use tiberius::{Config, AuthMethod, EncryptionLevel};
+/// let config = Config::builder()
+///     .host("localhost")
+///     .port(1433)
+///     .database("master")
+///     .encryption(EncryptionLevel::NotSupported)
+///     .authentication(AuthMethod::sql_server("SA", "<password>"))
+///     .build();
+/// ```
+///
+/// [`Config`]: struct.Config.html
+/// [`Config::builder`]: struct.Config.html#method.builder
+/// [`build`]: struct.ConfigBuilder.html#method.build
+#[derive(Clone, Debug)]
+pub struct ConfigBuilder {
+    inner: Config,
+}
+
+impl ConfigBuilder {
+    /// A host or ip address to connect to.
+    ///
+    /// - Defaults to `localhost`.
+    pub fn host(mut self, host: impl ToString) -> Self {
+        self.inner.host = Some(host.to_string());
+        self
+    }
+
+    /// The server port.
+    ///
+    /// - Defaults to `1433`.
+    pub fn port(mut self, port: u16) -> Self {
+        self.inner.port = Some(port);
+        self
+    }
+
+    /// The database to connect to.
+    ///
+    /// - Defaults to `master`.
+    pub fn database(mut self, database: impl ToString) -> Self {
+        self.inner.database = Some(database.to_string());
+        self
+    }
+
+    /// The instance name as defined in the SQL Browser. Only available on
+    /// Windows platforms.
+    ///
+    /// If specified, the port is replaced with the value returned from the
+    /// browser.
+    ///
+    /// - Defaults to no name specified.
+    pub fn instance_name(mut self, name: impl ToString) -> Self {
+        self.inner.instance_name = Some(name.to_string());
+        self
+    }
+
+    /// Sets the application name to the connection, queryable with the
+    /// `APP_NAME()` command.
+    ///
+    /// - Defaults to no name specified.
+    pub fn application_name(mut self, name: impl ToString) -> Self {
+        self.inner.application_name = Some(name.to_string());
+        self
+    }
+
+    /// Set the preferred encryption level.
+    ///
+    /// - With `tls` feature, defaults to `Required`.
+    /// - Without `tls` feature, defaults to `NotSupported`.
+    pub fn encryption(mut self, encryption: EncryptionLevel) -> Self {
+        self.inner.encryption = encryption;
+        self
+    }
+
+    /// If set, the server certificate will not be validated and it is accepted
+    /// as-is.
+    ///
+    /// On production setting, the certificate should be added to the local key
+    /// storage (or use `trust_cert_ca` instead), using this setting is potentially dangerous.
+    ///
+    /// # Panics
+    /// Will panic in case `trust_cert_ca` was called before.
+    ///
+    /// - Defaults to `default`, meaning server certificate is validated against system-truststore.
+    pub fn trust_cert(mut self) -> Self {
+        if let TrustConfig::CaCertificateLocation(_) = &self.inner.trust {
+            panic!("'trust_cert' and 'trust_cert_ca' are mutual exclusive! Only use one.")
+        }
+        self.inner.trust = TrustConfig::TrustAll;
+        self
+    }
+
+    /// If set, the server certificate will be validated against the given CA certificate in
+    /// in addition to the system-truststore.
+    /// Useful when using self-signed certificates on the server without having to disable the
+    /// trust-chain.
+    ///
+    /// # Panics
+    /// Will panic in case `trust_cert` was called before.
+    ///
+    /// - Defaults to validating the server certificate is validated against system's certificate storage.
+    pub fn trust_cert_ca(mut self, path: impl ToString) -> Self {
+        if let TrustConfig::TrustAll = &self.inner.trust {
+            panic!("'trust_cert' and 'trust_cert_ca' are mutual exclusive! Only use one.")
+        } else {
+            self.inner.trust = TrustConfig::CaCertificateLocation(PathBuf::from(path.to_string()))
+        }
+        self
+    }
+
+    /// Sets the authentication method.
+    ///
+    /// - Defaults to `None`.
+    pub fn authentication(mut self, auth: AuthMethod) -> Self {
+        self.inner.auth = auth;
+        self
+    }
+
+    /// Sets ApplicationIntent readonly.
+    ///
+    /// - Defaults to `false`.
+    pub fn readonly(mut self, readonly: bool) -> Self {
+        self.inner.readonly = readonly;
+        self
+    }
+
+    /// Produces the finalized [`Config`] from this builder.
+    ///
+    /// [`Config`]: struct.Config.html
+    pub fn build(self) -> Config {
+        self.inner
+    }
+}
+
+impl From<Config> for ConfigBuilder {
+    fn from(config: Config) -> Self {
+        ConfigBuilder { inner: config }
+    }
+}
+
+impl From<ConfigBuilder> for Config {
+    fn from(builder: ConfigBuilder) -> Self {
+        builder.inner
+    }
+}
+
 pub(crate) struct ServerDefinition {
     host: Option<String>,
     port: Option<u16>,
@@ -469,5 +658,41 @@ pub(crate) trait ConfigString {
             .get("applicationintent")
             .filter(|val| val.trim().eq_ignore_ascii_case("ReadOnly"))
             .is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_builder_constructs_config() {
+        let config = Config::builder()
+            .host("db.example.com")
+            .port(4433)
+            .database("northwind")
+            .application_name("my-app")
+            .authentication(AuthMethod::sql_server("SA", "secret"))
+            .readonly(true)
+            .build();
+
+        assert_eq!("db.example.com", config.get_host());
+        assert_eq!(4433, config.get_port());
+        assert_eq!("db.example.com:4433", config.get_addr());
+        assert_eq!(Some("northwind"), config.database.as_deref());
+        assert_eq!(Some("my-app"), config.application_name.as_deref());
+        assert!(config.readonly);
+        assert!(matches!(config.auth, AuthMethod::SqlServer(_)));
+        assert!(matches!(config.trust, TrustConfig::Default));
+    }
+
+    #[test]
+    fn config_builder_roundtrips_via_from() {
+        let config = Config::builder().host("localhost").port(1433).build();
+        let builder: ConfigBuilder = config.into();
+        let config = builder.database("master").build();
+
+        assert_eq!("localhost:1433", config.get_addr());
+        assert_eq!(Some("master"), config.database.as_deref());
     }
 }
