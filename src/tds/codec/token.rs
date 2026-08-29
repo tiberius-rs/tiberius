@@ -12,6 +12,7 @@ mod token_return_value;
 mod token_row;
 mod token_session_state;
 mod token_sspi;
+mod token_tab_name;
 mod token_type;
 
 pub use token_col_info::*;
@@ -28,4 +29,5 @@ pub use token_return_value::*;
 pub use token_row::*;
 pub use token_session_state::*;
 pub use token_sspi::*;
+pub use token_tab_name::*;
 pub use token_type::*;
