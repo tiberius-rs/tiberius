@@ -376,15 +376,27 @@ mod tests {
         assert_eq!(Numeric::new_with_scale(123, 2).to_string(), "1.23");
         assert_eq!(Numeric::new_with_scale(123, 3).to_string(), "0.123");
         assert_eq!(Numeric::new_with_scale(123, 4).to_string(), "0.0123");
-        assert_eq!(Numeric::new_with_scale(123, 36).to_string(), "0.000000000000000000000000000000000123");
-        assert_eq!(Numeric::new_with_scale(123, 37).to_string(), "0.0000000000000000000000000000000000123");
+        assert_eq!(
+            Numeric::new_with_scale(123, 36).to_string(),
+            "0.000000000000000000000000000000000123"
+        );
+        assert_eq!(
+            Numeric::new_with_scale(123, 37).to_string(),
+            "0.0000000000000000000000000000000000123"
+        );
         assert_eq!(Numeric::new_with_scale(-123, 0).to_string(), "-123.0");
         assert_eq!(Numeric::new_with_scale(-123, 1).to_string(), "-12.3");
         assert_eq!(Numeric::new_with_scale(-123, 2).to_string(), "-1.23");
         assert_eq!(Numeric::new_with_scale(-123, 3).to_string(), "-0.123");
         assert_eq!(Numeric::new_with_scale(-123, 4).to_string(), "-0.0123");
-        assert_eq!(Numeric::new_with_scale(-123, 36).to_string(), "-0.000000000000000000000000000000000123");
-        assert_eq!(Numeric::new_with_scale(-123, 37).to_string(), "-0.0000000000000000000000000000000000123");
+        assert_eq!(
+            Numeric::new_with_scale(-123, 36).to_string(),
+            "-0.000000000000000000000000000000000123"
+        );
+        assert_eq!(
+            Numeric::new_with_scale(-123, 37).to_string(),
+            "-0.0000000000000000000000000000000000123"
+        );
     }
 
     #[test]
