@@ -1,4 +1,5 @@
 use super::codec::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Context, that might be required to make sure we understand and are understood by the server
@@ -9,6 +10,9 @@ pub(crate) struct Context {
     packet_id: u8,
     transaction_desc: [u8; 8],
     last_meta: Option<Arc<TokenColMetaData<'static>>>,
+    /// Metadata for COMPUTE (BY) result sets (`ALTMETADATA`), keyed by the
+    /// COMPUTE clause id that the matching `ALTROW` rows refer back to.
+    alt_metas: HashMap<u16, Arc<TokenAltMetaData<'static>>>,
     spn: Option<String>,
 }
 
@@ -20,6 +24,7 @@ impl Context {
             packet_id: 0,
             transaction_desc: [0; 8],
             last_meta: None,
+            alt_metas: HashMap::new(),
             spn: None,
         }
     }
@@ -36,6 +41,17 @@ impl Context {
 
     pub fn last_meta(&self) -> Option<Arc<TokenColMetaData<'static>>> {
         self.last_meta.clone()
+    }
+
+    /// Stores the metadata for a COMPUTE (BY) result set, keyed by its id, so
+    /// that a following `ALTROW` token can be decoded.
+    pub fn set_alt_meta(&mut self, meta: Arc<TokenAltMetaData<'static>>) {
+        self.alt_metas.insert(meta.id, meta);
+    }
+
+    /// Retrieves previously seen COMPUTE (BY) metadata by its id.
+    pub fn alt_meta(&self, id: u16) -> Option<Arc<TokenAltMetaData<'static>>> {
+        self.alt_metas.get(&id).cloned()
     }
 
     pub fn packet_size(&self) -> u32 {
