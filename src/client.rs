@@ -23,7 +23,10 @@ use crate::{
     },
     BulkLoadRequest, ColumnFlag, MetaDataColumn, SqlReadBytes, ToSql,
 };
-use codec::{BatchRequest, ColumnData, PacketHeader, RpcParam, RpcProcId, TokenRpcRequest};
+use codec::{
+    BatchRequest, ColumnData, IsolationLevel, PacketHeader, RpcParam, RpcProcId, TokenRpcRequest,
+    TransactionManagerRequest,
+};
 use enumflags2::BitFlags;
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::TryStreamExt;
@@ -482,6 +485,111 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// Closes this database connection explicitly.
     pub async fn close(self) -> crate::Result<()> {
         self.connection.close().await
+    }
+
+    /// Begins a new transaction using a Transaction Manager request
+    /// (`TM_BEGIN_XACT`, MS-TDS 2.2.6.8) instead of a `BEGIN TRAN` T-SQL
+    /// batch.
+    ///
+    /// On success the server replies with a `BeginTransaction` environment
+    /// change token whose descriptor is stored in the connection context and
+    /// automatically attached to subsequent requests, scoping them to the
+    /// transaction. Commit the work with [`commit_transaction`] or discard it
+    /// with [`rollback_transaction`].
+    ///
+    /// The transaction uses the server's default isolation level. Use
+    /// [`begin_transaction_with_isolation`] to request a specific one.
+    ///
+    /// [`commit_transaction`]: #method.commit_transaction
+    /// [`rollback_transaction`]: #method.rollback_transaction
+    /// [`begin_transaction_with_isolation`]: #method.begin_transaction_with_isolation
+    pub async fn begin_transaction(&mut self) -> crate::Result<()> {
+        self.begin_transaction_with_isolation(IsolationLevel::Unspecified)
+            .await
+    }
+
+    /// Begins a new transaction with an explicit isolation level using a
+    /// Transaction Manager request (`TM_BEGIN_XACT`, MS-TDS 2.2.6.8).
+    ///
+    /// See [`begin_transaction`] for details on transaction scoping.
+    ///
+    /// [`begin_transaction`]: #method.begin_transaction
+    pub async fn begin_transaction_with_isolation(
+        &mut self,
+        isolation_level: IsolationLevel,
+    ) -> crate::Result<()> {
+        let req = TransactionManagerRequest::begin(
+            self.connection.context().transaction_descriptor(),
+            isolation_level,
+            "",
+        );
+
+        self.send_transaction_manager_request(req).await
+    }
+
+    /// Commits the active transaction using a Transaction Manager request
+    /// (`TM_COMMIT_XACT`, MS-TDS 2.2.6.8).
+    ///
+    /// After a successful commit the connection is no longer scoped to a
+    /// transaction.
+    pub async fn commit_transaction(&mut self) -> crate::Result<()> {
+        let req = TransactionManagerRequest::commit(
+            self.connection.context().transaction_descriptor(),
+            "",
+        );
+
+        self.send_transaction_manager_request(req).await
+    }
+
+    /// Rolls back the active transaction using a Transaction Manager request
+    /// (`TM_ROLLBACK_XACT`, MS-TDS 2.2.6.8).
+    ///
+    /// After a successful rollback the connection is no longer scoped to a
+    /// transaction.
+    pub async fn rollback_transaction(&mut self) -> crate::Result<()> {
+        let req = TransactionManagerRequest::rollback(
+            self.connection.context().transaction_descriptor(),
+            "",
+        );
+
+        self.send_transaction_manager_request(req).await
+    }
+
+    /// Creates a named savepoint in the active transaction using a Transaction
+    /// Manager request (`TM_SAVE_XACT`, MS-TDS 2.2.6.8).
+    ///
+    /// The savepoint can later be targeted by a T-SQL `ROLLBACK TRANSACTION
+    /// <name>` to undo work performed after it while keeping the surrounding
+    /// transaction open.
+    pub async fn save_transaction<'a>(
+        &mut self,
+        name: impl Into<Cow<'a, str>>,
+    ) -> crate::Result<()> {
+        let req = TransactionManagerRequest::save(
+            self.connection.context().transaction_descriptor(),
+            name,
+        );
+
+        self.send_transaction_manager_request(req).await
+    }
+
+    async fn send_transaction_manager_request(
+        &mut self,
+        req: TransactionManagerRequest<'_>,
+    ) -> crate::Result<()> {
+        self.connection.flush_stream().await?;
+
+        let id = self.connection.context_mut().next_packet_id();
+        self.connection
+            .send(PacketHeader::transaction_manager(id), req)
+            .await?;
+
+        // The server responds with a DONE token (plus an ENVCHANGE token that
+        // the token stream applies to the connection context, updating the
+        // active transaction descriptor).
+        TokenStream::new(&mut self.connection).flush_done().await?;
+
+        Ok(())
     }
 
     pub(crate) fn rpc_params<'a>(query: impl Into<Cow<'a, str>>) -> Vec<RpcParam<'a>> {

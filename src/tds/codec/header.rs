@@ -118,13 +118,9 @@ impl PacketHeader {
         }
     }
 
-    /// A client-to-server Attention Signal packet (packet type `0x06`,
-    /// MS-TDS section 2.2.1.6). The message carries no payload, so it is
-    /// always a single, end-of-message packet used to request cancellation
-    /// of the request currently in flight on the connection.
-    pub fn attention(id: u8) -> Self {
+    pub fn transaction_manager(id: u8) -> Self {
         Self {
-            ty: PacketType::AttentionSignal,
+            ty: PacketType::TransactionManagerReq,
             status: PacketStatus::EndOfMessage,
             ..Self::new(0, id)
         }
