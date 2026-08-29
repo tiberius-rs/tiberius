@@ -250,6 +250,16 @@
 #![doc(test(attr(deny(rust_2018_idioms, warnings))))]
 #![doc(test(attr(allow(unused_extern_crates, unused_variables))))]
 
+#[cfg(all(
+    feature = "tds80",
+    not(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))
+))]
+compile_error!("The `tds80` feature requires one of the TLS features to be enabled.");
+
 #[cfg(feature = "bigdecimal")]
 pub(crate) extern crate bigdecimal_ as bigdecimal;
 

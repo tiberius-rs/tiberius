@@ -58,9 +58,10 @@ winauth = { version = "0.0.4", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libgssapi = { version = "0.8.1", optional = true, default-features = false }
+libc = "0.2"
 
 [dependencies.async-native-tls]
-version = "0.4"
+version = "0.5"
 features = ["runtime-async-std"]
 optional = true
 
@@ -184,6 +185,7 @@ all = [
     "chrono",
     "time",
     "tds73",
+    "tds80",
     "sql-browser-async-std",
     "sql-browser-tokio",
     "sql-browser-smol",
@@ -192,8 +194,11 @@ all = [
     "bigdecimal",
     "native-tls",
 ]
-default = ["tds73", "winauth", "native-tls"]
+default = ["tds80", "winauth", "native-tls"]
 tds73 = []
+# Enables TDS 8.0 support, including the `Strict` encryption level (TLS before
+# the TDS prelogin, TDS 8.0 "strict" mode). Requires a TLS backend.
+tds80 = ["tds73"]
 docs = []
 sql-browser-async-std = ["async-std"]
 sql-browser-tokio = ["tokio", "tokio-util"]

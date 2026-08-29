@@ -74,6 +74,9 @@ impl PreloginMessage {
                     "Server does not allow the requested encryption level.".into(),
                 ))
             }
+            // In TDS 8.0 "strict" mode encryption is established before the
+            // prelogin, so there is nothing to negotiate here.
+            (EncryptionLevel::Strict, _) => EncryptionLevel::Strict,
             (_, _) => EncryptionLevel::On,
         };
 
@@ -114,7 +117,7 @@ impl Encode<BytesMut> for PreloginMessage {
 
         // encryption
         fields.push((PRELOGIN_ENCRYPTION, 0x01)); // encryption
-        data_cursor.write_u8(self.encryption as u8)?;
+        data_cursor.write_u8(self.encryption.as_wire_value())?;
 
         // threadid
         fields.push((PRELOGIN_THREADID, 0x04)); // thread id
