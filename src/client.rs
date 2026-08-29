@@ -437,7 +437,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         &'a mut self,
         proc_id: RpcProcId,
         mut rpc_params: Vec<RpcParam<'b>>,
-        params: impl Iterator<Item=ColumnData<'b>>,
+        params: impl Iterator<Item = ColumnData<'b>>,
     ) -> crate::Result<()>
     where
         'a: 'b,
