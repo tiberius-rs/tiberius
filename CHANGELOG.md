@@ -1,4 +1,169 @@
-# Changes
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+This is a maintained community fork of [`tiberius`](https://github.com/prisma/tiberius),
+published on crates.io under the package name
+[`tiberius-ng`](https://crates.io/crates/tiberius-ng). The library name remains
+`tiberius`, so `use tiberius::…` code is unaffected. Entries up to and including
+version 0.12.3 reflect the history of the upstream project prior to the fork.
+
+## [Unreleased]
+
+We are working through the backlog of open pull requests and issues from
+upstream. Additional fixes and features are being integrated and will appear
+here as they land.
+
+### Added
+
+- (Backlog) Further community PRs and issue fixes are being triaged and
+  integrated; see the [issue tracker](https://github.com/MattJackson/tiberius-ng/issues).
+
+### Fixed
+
+- (Backlog) Outstanding bug reports carried over from upstream are being
+  reviewed and resolved.
+
+### Changed
+
+- (Backlog) Ongoing dependency maintenance to keep the crate free of security
+  advisories.
+
+## [0.13.0] - 2026-08-29
+
+First release of the actively-maintained community fork, by
+[@MattJackson](https://github.com/MattJackson). Published on crates.io as
+[`tiberius-ng`](https://crates.io/crates/tiberius-ng); the importable library
+name is still `tiberius`, so downstream `use tiberius::…` code is unaffected —
+only the dependency line changes:
+
+```toml
+tiberius = { package = "tiberius-ng", version = "0.13" }
+```
+
+This release clears the security advisories that were blocking adoption, works
+through a large backlog of community pull requests (attributed below), fixes
+long-standing bug reports, and substantially extends TDS protocol coverage
+(TDS 7.1 through 8.0). See [`docs/TDS_COMPATIBILITY.md`](docs/TDS_COMPATIBILITY.md).
+
+### Security
+
+- Upgraded the TLS stack (`tokio-rustls` 0.24 → 0.26, `rustls` 0.21 → 0.23),
+  clearing **RUSTSEC-2026-0098/-0099/-0104** and unblocking `cargo audit` /
+  `cargo deny`. From upstream #419 by [@jakewimmer](https://github.com/jakewimmer).
+  Fixes #417, #428.
+- Zeroize SQL authentication password buffers before/after the login exchange.
+  From #411 by [@lstkz](https://github.com/lstkz).
+- Added a `cargo-deny` supply-chain gate (`deny.toml` + Security-audit workflow)
+  and a Codecov coverage workflow; enforced in CI on every push/PR.
+
+### Added — connectivity & protocol
+
+- **TDS 8.0 "strict" encryption** (`EncryptionLevel::Strict`, TLS-before-prelogin
+  with the `tds/8.0` ALPN), plus `Config::hostname_in_certificate()` and
+  `Config::client_name()`. Adapted from #413 by [@olback](https://github.com/olback).
+  Fixes #412, #340, #414, #224.
+- **SQL_VARIANT** reading (previously panicked, `todo!()`) and writing — full
+  `sql_variant` parameter support, symmetric with the decoder.
+- **CLR UDT**, **COLINFO**, **TABNAME**, **FEDAUTHINFO**, **SESSIONSTATE**, and
+  **ALTMETADATA/ALTROW** (`COMPUTE BY`) token support.
+- **Transaction Manager requests** (begin/commit/rollback) and the **Attention**
+  signal for query cancellation.
+- **`Client::column_metadata()`** exposing column type/size/precision/scale,
+  nullability and identity flags. From #398 by [@etylermoss](https://github.com/etylermoss).
+  Fixes #397, #217, #403.
+- Emit PRELOGIN INSTOPT/TRACEID options.
+
+### Added — API & types
+
+- Optional **`serde`** feature: `Serialize`/`Deserialize` for the result types.
+  From #416 by [@MukundaKatta](https://github.com/MukundaKatta). Fixes #115.
+- **`ConfigBuilder`** for ergonomic `Config` construction. From #366 by
+  [@LonerDan](https://github.com/LonerDan).
+- **IN-list / 2100-parameter helpers.** From #429 by
+  [@joelparkerhenderson](https://github.com/joelparkerhenderson). Fixes #157.
+- `bulk_insert_columns()` to bulk-insert into a specified column list. From #359
+  by [@NTmatter](https://github.com/NTmatter). Fixes #311.
+- `packet_size` configuration for the LOGIN7 message. From #400 by
+  [@johndauphine](https://github.com/johndauphine).
+- `IntoSql` for `rust_decimal::Decimal` (#376 by [@esheppa](https://github.com/esheppa),
+  fixes #401); more `ColumnData` conversion traits (#314) and `Row`→`ColumnData`
+  / `TokenRow` accessors (#304, #331) by [@LazyDope](https://github.com/LazyDope)
+  and [@lpj145](https://github.com/lpj145).
+- `docker/test-server.sh` helper and a named-pipes connection example (#430, #132).
+
+### Fixed
+
+- Return an `Error` instead of **panicking** on unexpected server input across
+  the TDS decoder, and when the server declines the requested encryption level.
+  Fixes #424, #425.
+- Bounds-check column indexing so out-of-range `try_get` returns `Err`, not a
+  panic (#211); match raw-identifier column names like `r#type` (#382).
+- Fix a multiply-overflow panic decoding dates before 1900 (#316).
+- Error at connect time when encryption is required but no TLS backend is
+  compiled in (#305).
+- Correct the swapped old/new values in `EnvChange` `Display` (#418); lower
+  chatty per-connection/token logs from `info!` to `debug!` (#281).
+- Convert SQL `smallint`/`Intn` into `i32` via `FromSql` (#263); coerce
+  `DateTime2` → `datetime` for bulk insert under `tds73` (#298, from
+  [@Geo-W](https://github.com/Geo-W); fixes #307, #373); coerce numerics into
+  Money/SmallMoney and strings into NText/Text during bulk insert (#358, #352).
+- Send the ReadOnly intent flag in LOGIN7 when `ApplicationIntent=ReadOnly` (#348).
+- Fix the sign/padding of negative `Numeric` string formatting. From #390 by
+  [@zuckschwerdt](https://github.com/zuckschwerdt). Fixes #368.
+- Rescale `numeric`/`decimal` parameters to the target column scale (overflow-
+  checked scale-up, round-half-away-from-zero scale-down) instead of panicking
+  on a scale mismatch.
+- Allow querying columns whose names are keywords such as `End` (#388, from
+  [@cjordan](https://github.com/cjordan)).
+- Improve `QueryStream::into_results` handling of empty results (#385, fixes #380);
+  fix a header type for the SSPI response message (#351, from
+  [@staticlibs](https://github.com/staticlibs)); correct an `occured` typo in an
+  I/O error message (#423, from [@DucMinhNe](https://github.com/DucMinhNe)).
+
+### Changed — tooling & housekeeping
+
+- Rebranded to the maintained fork (`tiberius-ng` 0.13.0); repository, docs.rs,
+  badges and metadata now point at
+  [MattJackson/tiberius-ng](https://github.com/MattJackson/tiberius-ng).
+- Modernized the GitHub Actions workflows (SHA-pinned actions); replaced the
+  broken upstream security workflow; added Dependabot, issue/PR templates,
+  `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, and `SECURITY.md`.
+- Restructured CI around the `dev → qa → main` lifecycle: a fast lane on
+  PRs/`dev` (lint, unit tests, one integration smoke) and the full UAT matrix on
+  `qa` — SQL Server 2017/2019/2022/**2025** and Azure SQL Edge across every
+  feature combination, plus Windows and macOS. Added a tag-triggered release
+  workflow (verify → publish to crates.io → GitHub release) and Codecov coverage.
+- Fixed the docs.rs build (use the `docsrs` cfg instead of a nightly-only `docs`
+  feature) and cleared all `clippy -D warnings`.
+- Modernized dependencies and added ~90 unit tests, roughly doubling coverage.
+- Declared an MSRV of Rust 1.88 (`rust-version`) with a dedicated CI job, and
+  added an advisory `cargo-semver-checks` job plus a `cargo-deny` license gate.
+
+### Removed
+
+- **Dropped async-std support.** The discontinued `async-std` runtime
+  (RUSTSEC-2025-0052) is no longer a supported runtime: the
+  `sql-browser-async-std` feature, its SQL Browser implementation, and the
+  async-std example/tests are removed, eliminating `async-std` from the
+  dependency graph entirely. Tiberius remains runtime-independent — use **tokio**
+  or **smol** (or any `AsyncRead + AsyncWrite` transport). The internal
+  dual-runtime test harness now exercises every integration test on tokio **and**
+  smol. *Breaking* for downstreams using the `sql-browser-async-std` feature;
+  switch to `sql-browser-tokio` or `sql-browser-smol`.
+
+### Notes
+
+- `0.13.0-alpha.1` was published to crates.io to claim the `tiberius-ng`
+  package name ahead of this release.
+- Deferred to a follow-up: client-certificate (mutual-TLS) authentication
+  (upstream #413's client-cert portion), which needs a rebase onto the new TLS
+  stack and live-server validation.
+
+## [0.12.3]
 
 ## Version 0.12.3
 - feat: improve column type accuracy (#347)

@@ -40,11 +40,6 @@ path = "tests/command.rs"
 name = "command"
 
 [[test]]
-path = "tests/named-instance-async.rs"
-name = "named-instance-async"
-required-features = ["sql-browser-async-std"]
-
-[[test]]
 path = "tests/named-instance-tokio.rs"
 name = "named-instance-tokio"
 required-features = ["sql-browser-tokio"]
@@ -95,11 +90,6 @@ features = ["net", "time"]
 version = "0.7"
 features = ["compat"]
 optional = true
-
-[dependencies.async-std]
-version = "1"
-optional = true
-features = ["attributes"]
 
 [dependencies.chrono]
 version = "0.4"
@@ -184,9 +174,8 @@ features = [
 ]
 version = "1.0"
 
-[dev-dependencies.async-std]
-features = ["attributes"]
-version = "1"
+[dev-dependencies.smol]
+version = "2"
 
 [dev-dependencies.runtimes-macro]
 path = "./runtimes-macro"
@@ -223,7 +212,6 @@ all = [
     "time",
     "tds73",
     "tds80",
-    "sql-browser-async-std",
     "sql-browser-tokio",
     "sql-browser-smol",
     "integrated-auth-gssapi",
@@ -238,7 +226,6 @@ tds73 = []
 # Enables TDS 8.0 support, including the `Strict` encryption level (TLS before
 # the TDS prelogin, TDS 8.0 "strict" mode). Requires a TLS backend.
 tds80 = ["tds73"]
-sql-browser-async-std = ["async-std"]
 sql-browser-tokio = ["tokio", "tokio-util"]
 sql-browser-smol = ["async-io", "async-net", "futures-lite"]
 integrated-auth-gssapi = ["libgssapi"]
