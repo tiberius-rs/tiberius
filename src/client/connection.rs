@@ -281,6 +281,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         self.transport.flush().await
     }
 
+    /// Sends a TDS Attention signal (packet type `0x06`, MS-TDS section
+    /// 2.2.1.6) to request cancellation of the request currently in flight on
+    /// this connection, then drains the token stream until the acknowledging
+    /// DONE token (with the `DONE_ATTN` status bit set) is received.
+    ///
+    /// The Attention message carries no payload, so it is written to the wire
+    /// as a single end-of-message packet. Draining the acknowledgement leaves
+    /// the connection clean and ready to be reused for further queries.
+    pub(crate) async fn cancel_request(&mut self) -> crate::Result<TokenDone> {
+        let id = self.context.next_packet_id();
+        let header = PacketHeader::attention(id);
+
+        // Attention has an empty payload; send just the 8-byte header.
+        self.write_to_wire(header, BytesMut::new()).await?;
+        self.flush_sink().await?;
+
+        TokenStream::new(self).flush_done_attention().await
+    }
+
     /// Cleans the packet stream from previous use. It is important to use the
     /// whole stream before using the connection again. Flushing the stream
     /// makes sure we don't have any old data causing undefined behaviour after

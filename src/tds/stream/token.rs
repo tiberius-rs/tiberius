@@ -77,6 +77,33 @@ where
         }
     }
 
+    /// Drain the token stream after a client Attention signal has been sent,
+    /// discarding every remaining token of the cancelled request until the
+    /// acknowledging DONE token (with the `DONE_ATTN` status bit set) is
+    /// received, per MS-TDS section 2.2.1.6. Returns that DONE token so the
+    /// connection is left clean and ready for reuse.
+    pub(crate) async fn flush_done_attention(self) -> crate::Result<TokenDone> {
+        let mut stream = self.try_unfold();
+
+        loop {
+            match stream.try_next().await? {
+                Some(ReceivedToken::Done(token))
+                | Some(ReceivedToken::DoneProc(token))
+                | Some(ReceivedToken::DoneInProc(token))
+                    if token.is_attention() =>
+                {
+                    return Ok(token);
+                }
+                Some(_) => (),
+                None => {
+                    return Err(crate::Error::Protocol(
+                        "Never got a DONE token acknowledging the Attention signal.".into(),
+                    ))
+                }
+            }
+        }
+    }
+
     #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
     pub(crate) async fn flush_sspi(self) -> crate::Result<TokenSspi> {
         let mut stream = self.try_unfold();

@@ -495,6 +495,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .collect())
     }
 
+    /// Sends a TDS Attention signal to the server (packet type `0x06`,
+    /// MS-TDS section 2.2.1.6) to cancel the request that is currently in
+    /// flight on this connection, and drains the acknowledging token stream so
+    /// the connection can be reused for further queries.
+    ///
+    /// The server responds to the Attention signal by aborting the running
+    /// batch or RPC and returning a `DONE` token with the `DONE_ATTN` status
+    /// bit set. This method waits for that acknowledgement before returning,
+    /// discarding any remaining rows or tokens from the cancelled request.
+    ///
+    /// # Query cancellation and futures
+    ///
+    /// Dropping a [`query`], [`execute`] or [`simple_query`] future (for
+    /// example when a `tokio::time::timeout` elapses or a `select!` branch is
+    /// cancelled) stops the client from polling the stream, but it does *not*
+    /// tell the server to stop working on the request. To actually cancel the
+    /// in-flight work on the server, keep the [`Client`] and call
+    /// `cancel_query` on it. Because `cancel_query` borrows the client
+    /// mutably, it can only be issued once the borrowing result stream has
+    /// been dropped — typically from a separate task holding the client, or
+    /// after a cancelled/timed-out future has released its borrow.
+    ///
+    /// [`query`]: #method.query
+    /// [`execute`]: #method.execute
+    /// [`simple_query`]: #method.simple_query
+    pub async fn cancel_query(&mut self) -> crate::Result<()> {
+        self.connection.cancel_request().await?;
+        Ok(())
+    }
+
     /// Closes this database connection explicitly.
     pub async fn close(self) -> crate::Result<()> {
         self.connection.close().await
