@@ -1,70 +1,87 @@
+//! Internal test-only proc-macro for tiberius-ng.
+//!
+//! `#[test_on_runtimes]` takes an `async fn(client) -> Result<()>` and generates
+//! one integration test per supported async runtime, so every test proves the
+//! (runtime-independent) driver works on each of them. Currently: **tokio** and
+//! **smol**.
 extern crate proc_macro;
-use darling::FromMeta;
 
-#[derive(Debug, FromMeta)]
-struct MacroArgs {
-    #[darling(default)]
-    connection_string: Option<String>,
+use proc_macro::TokenStream;
+use quote::{format_ident, quote};
+use syn::{parse_macro_input, ItemFn, LitStr};
+
+/// Optional `connection_string = "IDENT"` attribute argument naming the `&str`
+/// constant to connect with. Defaults to `CONN_STR`.
+struct Args {
+    conn_str: String,
+}
+
+impl syn::parse::Parse for Args {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let mut conn_str = String::from("CONN_STR");
+
+        if !input.is_empty() {
+            let ident: syn::Ident = input.parse()?;
+            if ident != "connection_string" {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    "expected `connection_string = \"...\"`",
+                ));
+            }
+            input.parse::<syn::Token![=]>()?;
+            let lit: LitStr = input.parse()?;
+            conn_str = lit.value();
+        }
+
+        Ok(Args { conn_str })
+    }
 }
 
 #[proc_macro_attribute]
-pub fn test_on_runtimes(
-    args: proc_macro::TokenStream,
-    input: proc_macro::TokenStream,
-) -> proc_macro::TokenStream {
-    let attr_args = syn::parse_macro_input!(args as syn::AttributeArgs);
+pub fn test_on_runtimes(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as Args);
+    let func = parse_macro_input!(input as ItemFn);
 
-    let args = match MacroArgs::from_list(&attr_args) {
-        Ok(v) => v,
-        Err(e) => {
-            return proc_macro::TokenStream::from(e.write_errors());
-        }
-    };
-
-    let func = syn::parse_macro_input!(input as syn::ItemFn);
-
-    let conn_str_ident_str = args.connection_string.unwrap_or_else(|| "CONN_STR".into());
-
-    let conn_str_ident =
-        proc_macro2::Ident::new(&conn_str_ident_str, proc_macro2::Span::call_site());
-
+    let conn_str_ident = format_ident!("{}", args.conn_str);
     let func_name = func.sig.ident.clone();
-    let async_std_test = quote::format_ident!("{}_{}", func_name, "async_std");
-    let tokio_test = quote::format_ident!("{}_{}", func_name, "tokio");
+    let tokio_test = format_ident!("{}_tokio", func_name);
+    let smol_test = format_ident!("{}_smol", func_name);
 
-    let tokens = quote::quote! {
+    let tokens = quote! {
         #func
 
         #[test]
-        fn #async_std_test()-> Result<()> {
+        fn #tokio_test() -> Result<()> {
             LOGGER_SETUP.call_once(|| {
-                env_logger::init();
+                let _ = env_logger::builder().is_test(true).try_init();
             });
-            async_std::task::block_on(async {
-                let config = tiberius::Config::from_ado_string(&#conn_str_ident)?;
-                let tcp = async_std::net::TcpStream::connect(config.get_addr()).await?;
-                tcp.set_nodelay(true)?;
-                let mut client = tiberius::Client::connect(config, tcp).await?;
 
-                #func_name(client).await?;
-                Ok(())
-            })
-        }
-
-        #[test]
-        fn #tokio_test()-> Result<()> {
-            LOGGER_SETUP.call_once(|| {
-                env_logger::init();
-            });
             use tokio_util::compat::TokioAsyncWriteCompatExt;
 
-            let mut rt = tokio::runtime::Runtime::new()?;
+            let rt = tokio::runtime::Runtime::new()?;
 
             rt.block_on(async {
                 let config = tiberius::Config::from_ado_string(&#conn_str_ident)?;
                 let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
                 tcp.set_nodelay(true)?;
-                let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+                let client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+
+                #func_name(client).await?;
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn #smol_test() -> Result<()> {
+            LOGGER_SETUP.call_once(|| {
+                let _ = env_logger::builder().is_test(true).try_init();
+            });
+
+            smol::block_on(async {
+                let config = tiberius::Config::from_ado_string(&#conn_str_ident)?;
+                let tcp = smol::net::TcpStream::connect(config.get_addr()).await?;
+                tcp.set_nodelay(true)?;
+                let client = tiberius::Client::connect(config, tcp).await?;
 
                 #func_name(client).await?;
                 Ok(())
@@ -72,5 +89,5 @@ pub fn test_on_runtimes(
         }
     };
 
-    proc_macro::TokenStream::from(tokens)
+    TokenStream::from(tokens)
 }

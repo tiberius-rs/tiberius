@@ -6,11 +6,6 @@
 [advisories]
 yanked = "deny"
 ignore = [
-    # async-std is discontinued upstream. In tiberius it is reachable ONLY through
-    # the opt-in `sql-browser-async-std` feature (and dev-deps); it is not part of
-    # the default build. Tracked for migration to smol/tokio.
-    { id = "RUSTSEC-2025-0052", reason = "async-std: opt-in `sql-browser-async-std` feature + dev-deps only; not in the default shipped graph" },
-
     # The following are ALL dev-dependency-only (test harness + the aad-auth
     # example) and are never compiled into the published library.
     { id = "RUSTSEC-2024-0375", reason = "atty: dev-dependency only (via `names` -> clap 3); not shipped" },
