@@ -243,7 +243,7 @@
 //! [`time`]: time/index.html
 //! [ways of authentication]: enum.AuthMethod.html
 //! [ADO.NET connection string]: https://docs.microsoft.com/en-us/dotnet/framework/data/adonet/connection-strings
-#![cfg_attr(feature = "docs", feature(doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![recursion_limit = "512"]
 #![warn(missing_docs)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]

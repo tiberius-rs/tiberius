@@ -68,19 +68,19 @@ pub enum ColumnData<'a> {
     /// A small DateTime value.
     SmallDateTime(Option<SmallDateTime>),
     #[cfg(feature = "tds73")]
-    #[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
     /// Time value.
     Time(Option<Time>),
     #[cfg(feature = "tds73")]
-    #[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
     /// Date value.
     Date(Option<Date>),
     #[cfg(feature = "tds73")]
-    #[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
     /// DateTime2 value.
     DateTime2(Option<DateTime2>),
     #[cfg(feature = "tds73")]
-    #[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
     /// DateTime2 value with an offset.
     DateTimeOffset(Option<DateTimeOffset>),
 }

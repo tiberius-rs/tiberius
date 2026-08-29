@@ -22,11 +22,11 @@
 //! [`OffsetDateTime`]: time/struct.OffsetDateTime.html
 
 #[cfg(feature = "chrono")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "chrono")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "chrono")))]
 pub mod chrono;
 
 #[cfg(feature = "time")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "time")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "time")))]
 // Submodule intentionally shares the name of the `time` feature/crate it wraps.
 #[allow(clippy::module_inception)]
 pub mod time;
@@ -155,11 +155,11 @@ impl Encode<BytesMut> for SmallDateTime {
 /// `date`, use the `time` feature of this crate and its `Date` type.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 pub struct Date(u32);
 
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 impl Date {
     #[inline]
     /// Construct a new `Date`
@@ -188,7 +188,7 @@ impl Date {
 }
 
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 impl Encode<BytesMut> for Date {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
         let mut tmp = [0u8; 4];
@@ -208,14 +208,14 @@ impl Encode<BytesMut> for Date {
 /// `time`, use the `time` feature of this crate and its `Time` type.
 #[derive(Copy, Clone, Debug)]
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 pub struct Time {
     increments: u64,
     scale: u8,
 }
 
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 impl PartialEq for Time {
     fn eq(&self, t: &Time) -> bool {
         self.increments as f64 / 10f64.powi(self.scale as i32)
@@ -224,7 +224,7 @@ impl PartialEq for Time {
 }
 
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 impl Time {
     /// Construct a new `Time`
     pub fn new(increments: u64, scale: u8) -> Self {
@@ -294,7 +294,7 @@ impl Time {
 }
 
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 impl Encode<BytesMut> for Time {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
         match self.len()? {
@@ -321,7 +321,7 @@ impl Encode<BytesMut> for Time {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 /// A presentation of `datetime2` type in the server.
 ///
 /// # Warning
@@ -335,7 +335,7 @@ pub struct DateTime2 {
 }
 
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 impl DateTime2 {
     /// Construct a new `DateTime2` from the date and time components.
     pub fn new(date: Date, time: Time) -> Self {
@@ -367,7 +367,7 @@ impl DateTime2 {
 }
 
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 impl Encode<BytesMut> for DateTime2 {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
         self.time.encode(dst)?;
@@ -383,7 +383,7 @@ impl Encode<BytesMut> for DateTime2 {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 /// A presentation of `datetimeoffset` type in the server.
 ///
 /// # Warning
@@ -397,7 +397,7 @@ pub struct DateTimeOffset {
 }
 
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 impl DateTimeOffset {
     /// Construct a new `DateTimeOffset` from a `datetime2`, offset marking
     /// number of minutes from UTC.
@@ -427,7 +427,7 @@ impl DateTimeOffset {
 }
 
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 impl Encode<BytesMut> for DateTimeOffset {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
         self.datetime2.encode(dst)?;
