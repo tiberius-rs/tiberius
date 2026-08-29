@@ -19,6 +19,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 /// A recommended way of dealing with numeric values is by enabling the
 /// `rust_decimal` feature and using its `Decimal` type instead.
 #[derive(Copy, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Numeric {
     value: i128,
     scale: u8,

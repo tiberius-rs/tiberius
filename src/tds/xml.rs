@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 /// Provides information of the location for the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct XmlSchema {
     db_name: String,
     owner: String,
@@ -45,6 +46,7 @@ impl XmlSchema {
 /// A representation of XML data in TDS. Holds the data as a UTF-8 string and
 /// and optional information about the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct XmlData {
     data: String,
     schema: Option<Arc<XmlSchema>>,

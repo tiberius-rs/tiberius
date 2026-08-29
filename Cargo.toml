@@ -37,6 +37,11 @@ path = "tests/named-instance-smol.rs"
 name = "named-instance-smol"
 required-features = ["sql-browser-smol"]
 
+[[test]]
+path = "tests/serde.rs"
+name = "serde"
+required-features = ["serde"]
+
 [dependencies]
 enumflags2 = "0.7"
 byteorder = "1.0"
@@ -107,6 +112,11 @@ version = "0.3"
 optional = true
 package = "bigdecimal"
 
+[dependencies.serde]
+version = "1.0"
+optional = true
+features = ["derive", "rc"]
+
 [dependencies.async-io]
 version = "1.8"
 optional = true
@@ -176,6 +186,7 @@ paste = "1.0"
 indicatif = "0.18"
 chrono = "0.4.38"
 indoc = "1.0.7"
+serde_json = "1.0"
 
 [package.metadata.docs.rs]
 features = ["all"]
@@ -199,6 +210,7 @@ all = [
     "rust_decimal",
     "bigdecimal",
     "native-tls",
+    "serde",
 ]
 default = ["tds80", "winauth", "native-tls"]
 tds73 = []
@@ -213,3 +225,6 @@ bigdecimal = ["bigdecimal_"]
 rustls = ["tokio-rustls", "tokio-util", "rustls-native-certs", "rustls-webpki"]
 native-tls = ["async-native-tls"]
 vendored-openssl = ["opentls"]
+# Optional serde Serialize/Deserialize impls for query result types
+# (Row, Column, ColumnData, Numeric, ColumnType and time/xml types).
+serde = ["dep:serde", "uuid/serde"]
