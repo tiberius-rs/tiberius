@@ -280,7 +280,7 @@ mod tds;
 
 mod sql_browser;
 
-pub use client::{AuthMethod, Client, Config};
+pub use client::{AuthMethod, Client, Config, ConfigBuilder};
 pub use command::{Command, SqlTableData, SqlTableDataRow, TableValue, TableValueRow};
 pub(crate) use error::Error;
 pub use from_sql::{FromSql, FromSqlOwned};
