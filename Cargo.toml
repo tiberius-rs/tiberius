@@ -23,6 +23,10 @@ path = "tests/query.rs"
 name = "query"
 
 [[test]]
+path = "tests/command.rs"
+name = "command"
+
+[[test]]
 path = "tests/named-instance-tokio.rs"
 name = "named-instance-tokio"
 required-features = ["sql-browser-tokio"]
@@ -31,6 +35,11 @@ required-features = ["sql-browser-tokio"]
 path = "tests/named-instance-smol.rs"
 name = "named-instance-smol"
 required-features = ["sql-browser-smol"]
+
+[[test]]
+path = "tests/serde.rs"
+name = "serde"
+required-features = ["serde"]
 
 [[example]]
 name = "named-pipes"
