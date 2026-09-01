@@ -2,8 +2,9 @@ use crate::tds::codec::TokenSspi;
 use crate::{
     client::Connection,
     tds::codec::{
-        TokenAltMetaData, TokenAltRow, TokenColMetaData, TokenDone, TokenEnvChange, TokenError,
-        TokenFeatureExtAck, TokenInfo, TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
+        TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenDone, TokenEnvChange,
+        TokenError, TokenFeatureExtAck, TokenFedAuthInfo, TokenInfo, TokenLoginAck, TokenOrder,
+        TokenReturnValue, TokenRow, TokenSessionState, TokenTabName,
     },
     Error, SqlReadBytes, TokenType,
 };
@@ -27,12 +28,14 @@ pub enum ReceivedToken {
     ReturnStatus(u32),
     ReturnValue(TokenReturnValue),
     Order(TokenOrder),
+    ColInfo(TokenColInfo),
     TabName(TokenTabName),
     EnvChange(TokenEnvChange),
     Info(TokenInfo),
     LoginAck(TokenLoginAck),
     Sspi(TokenSspi),
     FeatureExtAck(TokenFeatureExtAck),
+    SessionState(TokenSessionState),
     FedAuthInfo(TokenFedAuthInfo),
     Error(TokenError),
 }
@@ -203,6 +206,12 @@ where
         Ok(ReceivedToken::Order(order))
     }
 
+    async fn get_col_info(&mut self) -> crate::Result<ReceivedToken> {
+        let col_info = TokenColInfo::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?col_info);
+        Ok(ReceivedToken::ColInfo(col_info))
+    }
+
     async fn get_tab_name(&mut self) -> crate::Result<ReceivedToken> {
         let tab_name = TokenTabName::decode(self.conn).await?;
         event!(Level::TRACE, message = ?tab_name);
@@ -232,6 +241,16 @@ where
 
         match change {
             TokenEnvChange::PacketSize(new_size, _) => {
+                // MS-TDS: a negotiated packet size must be within 512..=32767.
+                // Reject an out-of-range value from the server: the subsequent
+                // `packet_size - HEADER_BYTES` in the send paths would otherwise
+                // underflow (debug panic) or, for a value of exactly 8, produce
+                // a zero chunk size and spin `split_to(0)` forever.
+                if !(512..=32767).contains(&new_size) {
+                    return Err(crate::Error::Protocol(
+                        format!("server requested an invalid packet size of {new_size}").into(),
+                    ));
+                }
                 self.conn.context_mut().set_packet_size(new_size);
             }
             TokenEnvChange::BeginTransaction(desc) => {
@@ -270,6 +289,18 @@ where
             ack.features.len()
         );
         Ok(ReceivedToken::FeatureExtAck(ack))
+    }
+
+    async fn get_session_state(&mut self) -> crate::Result<ReceivedToken> {
+        let state = TokenSessionState::decode(self.conn).await?;
+        event!(
+            Level::TRACE,
+            "SessionState seq_no={} recoverable={} states={}",
+            state.seq_no,
+            state.is_recoverable(),
+            state.states.len()
+        );
+        Ok(ReceivedToken::SessionState(state))
     }
 
     async fn get_fed_auth_info(&mut self) -> crate::Result<ReceivedToken> {
@@ -311,11 +342,13 @@ where
                 TokenType::ReturnValue => this.get_return_value().await?,
                 TokenType::Error => this.get_error().await?,
                 TokenType::Order => this.get_order().await?,
+                TokenType::ColInfo => this.get_col_info().await?,
                 TokenType::TabName => this.get_tab_name().await?,
                 TokenType::EnvChange => this.get_env_change().await?,
                 TokenType::Info => this.get_info().await?,
                 TokenType::LoginAck => this.get_login_ack().await?,
                 TokenType::Sspi => this.get_sspi().await?,
+                TokenType::SessionState => this.get_session_state().await?,
                 TokenType::FedAuthInfo => this.get_fed_auth_info().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
                 // Defensive fallback for any token type without a dedicated

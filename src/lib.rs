@@ -236,13 +236,15 @@ pub(crate) use error::Error;
 pub use from_sql::{FromSql, FromSqlOwned};
 pub use query::Query;
 pub use result::*;
-pub use row::{Column, ColumnType, Row};
+pub use row::{Column, ColumnType, QueryIdx, Row};
 pub use sql_browser::SqlBrowser;
 pub use tds::{
     codec::{
-        AltMetaDataColumn, BulkLoadRequest, ColumnData, ColumnFlag, IntoRow, TokenAltMetaData,
-        TokenAltRow, TokenRow, TypeLength,
+        AltMetaDataColumn, BaseMetaDataColumn, BulkLoadRequest, ColumnData, ColumnFlag,
+        FixedLenType, IntoRow, IsolationLevel, MetaDataColumn, TokenAltMetaData, TokenAltRow,
+        TokenRow, TypeInfo, TypeLength, VarLenContext, VarLenType,
     },
+    collation::Collation,
     numeric,
     stream::{CommandReturnValue, CommandStream, QueryStream},
     time, xml, EncryptionLevel,
@@ -257,11 +259,65 @@ use tds::codec::*;
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) fn get_driver_version() -> u64 {
-    env!("CARGO_PKG_VERSION")
+    encode_driver_version(env!("CARGO_PKG_VERSION"))
+}
+
+/// Packs a dotted version string into the little-endian byte layout the TDS
+/// login record expects: the first component in the low byte, the next in bits
+/// 8..16, and so on (up to six components). Non-numeric components contribute
+/// zero.
+fn encode_driver_version(version: &str) -> u64 {
+    version
         .splitn(6, '.')
         .enumerate()
         .fold(0u64, |acc, part| match part.1.parse::<u64>() {
             Ok(num) => acc | num << (part.0 * 8),
-            _ => acc | 0 << (part.0 * 8),
+            // A non-numeric component contributes nothing.
+            _ => acc,
         })
+}
+
+#[cfg(test)]
+mod driver_version_tests {
+    use super::encode_driver_version;
+
+    #[test]
+    fn packs_each_component_into_its_own_byte() {
+        // 1 | 2<<8 | 3<<16 = 0x030201
+        assert_eq!(encode_driver_version("1.2.3"), 0x03_02_01);
+        // Distinct values per position pin the shift amounts.
+        assert_eq!(encode_driver_version("4.5.6.7"), 0x07_06_05_04);
+    }
+
+    #[test]
+    fn shift_moves_components_left_not_right() {
+        // With `>>` instead of `<<`, `17 >> 8 == 0`, so the minor version would
+        // vanish and the result would collapse to just the major (34).
+        assert_eq!(encode_driver_version("34.17"), 34 | (17 << 8));
+        assert_ne!(encode_driver_version("34.17"), 34);
+    }
+
+    #[test]
+    fn components_are_combined_with_or_not_xor() {
+        // 257 (0x101) in byte 0 shares bit 8 with `1 << 8` (0x100). OR keeps the
+        // bit set (0x101); XOR would clear it (0x001), so this pins `|` vs `^`.
+        assert_eq!(encode_driver_version("257.1"), 0x101);
+    }
+
+    #[test]
+    fn non_numeric_components_contribute_zero() {
+        assert_eq!(encode_driver_version("1.beta.3"), 1 | (3 << 16));
+        assert_eq!(encode_driver_version("notaversion"), 0);
+    }
+
+    #[test]
+    fn get_driver_version_encodes_the_crate_version() {
+        // Pins the wrapper to the real version so a body-replacement mutant
+        // (e.g. "-> 0" or "-> 1") is caught.
+        assert_eq!(
+            super::get_driver_version(),
+            encode_driver_version(env!("CARGO_PKG_VERSION"))
+        );
+        assert_ne!(super::get_driver_version(), 0);
+    }
 }

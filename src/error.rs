@@ -245,11 +245,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(invalid_from_utf8)] // intentionally-invalid bytes to exercise the error path
     fn from_utf8_and_utf16_errors() {
         let utf8_err = String::from_utf8(vec![0xff, 0xfe]).unwrap_err();
         assert!(matches!(Error::from(utf8_err), Error::Utf8));
 
-        let str_utf8 = std::str::from_utf8(&[0xff, 0xfe]).unwrap_err();
+        let invalid: &[u8] = &[0xff, 0xfe];
+        let str_utf8 = std::str::from_utf8(invalid).unwrap_err();
         assert!(matches!(Error::from(str_utf8), Error::Utf8));
 
         let utf16_err = String::from_utf16(&[0xd800]).unwrap_err();
@@ -266,5 +268,32 @@ mod tests {
     fn equality_between_errors() {
         assert_eq!(Error::Utf8, Error::Utf8);
         assert_ne!(Error::Utf8, Error::Utf16);
+    }
+
+    #[test]
+    fn from_connection_string_error() {
+        let cs_err = connection_string::Error::new("bad connection string");
+        let err: Error = cs_err.into();
+        match err {
+            Error::Conversion(msg) => assert!(msg.contains("bad connection string")),
+            _ => panic!("expected Conversion"),
+        }
+    }
+
+    #[cfg(all(unix, feature = "sspi-rs"))]
+    #[test]
+    fn from_sspi_error() {
+        let sspi_err = sspi::Error::new(sspi::ErrorKind::InternalError, "sspi boom");
+        assert!(matches!(Error::from(sspi_err), Error::SspiRs(_)));
+    }
+
+    #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
+    #[test]
+    fn from_gssapi_error() {
+        let gss_err = libgssapi::error::Error {
+            major: libgssapi::error::MajorFlags::empty(),
+            minor: 0,
+        };
+        assert!(matches!(Error::from(gss_err), Error::Gssapi(_)));
     }
 }
