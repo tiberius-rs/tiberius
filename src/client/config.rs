@@ -39,6 +39,9 @@ pub struct Config {
     pub(crate) trust: TrustConfig,
     pub(crate) auth: AuthMethod,
     pub(crate) readonly: bool,
+    pub(crate) packet_size: Option<u32>,
+    pub(crate) hostname_in_certificate: Option<String>,
+    pub(crate) client_name: Option<String>,
     pub(crate) multi_subnet_failover: bool,
     #[cfg(any(
         feature = "rustls",
@@ -141,6 +144,9 @@ impl Default for Config {
             trust: TrustConfig::Default,
             auth: AuthMethod::None,
             readonly: false,
+            packet_size: None,
+            hostname_in_certificate: None,
+            client_name: None,
             multi_subnet_failover: false,
             #[cfg(any(
                 feature = "rustls",
@@ -475,6 +481,8 @@ impl Config {
     /// |`TrustServerCertificateCA`|`<path>`|Path to a `pem`, `crt` or `der` certificate file. Cannot be used together with `TrustServerCertificate`|
     /// |`encrypt`|`strict`,`true`,`false`,`yes`,`no`,`DANGER_PLAINTEXT`|Specifies whether the driver uses TLS to encrypt communication. `strict` (TDS 8.0) requires the `tds80` feature.|
     /// |`Application Name`, `ApplicationName`|`<string>`|Sets the application name for the connection.|
+    /// |`HostNameInCertificate`, `HostName In Certificate`|`<string>`|The hostname the server certificate is validated against. Defaults to `server`.|
+    /// |`WorkstationID`, `Workstation ID`|`<string>`|The client / workstation name reported to the server.|
     /// |`MultiSubnetFailover`|`true`,`false`,`yes`,`no`|When enabled, connections are attempted in parallel to all IP addresses the server resolves to, and the first to succeed is used.|
     ///
     /// [ADO.NET connection string]: https://docs.microsoft.com/en-us/dotnet/framework/data/adonet/connection-strings
@@ -537,6 +545,9 @@ impl Config {
 
         builder.readonly(s.readonly());
 
+        if let Some(client_name) = s.client_name() {
+            builder.client_name(client_name);
+        }
         builder.multi_subnet_failover(s.multi_subnet_failover()?);
 
         Ok(builder)

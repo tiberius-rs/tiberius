@@ -210,3 +210,81 @@ impl IntoIterator for CommandResult {
         self.query_results.into_iter()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::codec::ColumnData;
+
+    impl ExecuteResult {
+        fn from_counts(counts: Vec<u64>) -> Self {
+            Self {
+                rows_affected: counts,
+            }
+        }
+    }
+
+    #[test]
+    fn execute_result_rows_affected_preserves_order_and_values() {
+        let res = ExecuteResult::from_counts(vec![3, 0, 7]);
+        assert_eq!(res.rows_affected(), &[3, 0, 7]);
+    }
+
+    #[test]
+    fn execute_result_total_sums_every_count() {
+        assert_eq!(ExecuteResult::from_counts(vec![3, 0, 7]).total(), 10);
+    }
+
+    #[test]
+    fn execute_result_into_iter_yields_each_count() {
+        let counts: Vec<u64> = ExecuteResult::from_counts(vec![5, 9]).into_iter().collect();
+        assert_eq!(counts, vec![5, 9]);
+    }
+
+    fn return_value(name: &str, value: i32) -> CommandReturnValue {
+        CommandReturnValue {
+            name: name.to_string(),
+            ord: 0,
+            data: ColumnData::I32(Some(value)),
+        }
+    }
+
+    fn command_result() -> CommandResult {
+        CommandResult {
+            rows_affected: vec![2, 4],
+            return_code: 7,
+            return_values: vec![return_value("@a", 1), return_value("@b", 42)],
+            // Two (empty) record sets so `to_query_result` has Some values to return.
+            query_results: vec![Vec::new(), Vec::new()],
+        }
+    }
+
+    #[test]
+    fn command_result_scalar_accessors() {
+        let res = command_result();
+        assert_eq!(res.rows_affected(), &[2, 4]);
+        assert_eq!(res.return_code(), 7);
+        assert_eq!(res.return_values_len(), 2);
+    }
+
+    #[test]
+    fn command_result_to_query_result_indexes_record_sets() {
+        let res = command_result();
+        assert!(res.to_query_result(0).is_some());
+        assert!(res.to_query_result(1).is_some());
+        assert!(res.to_query_result(2).is_none());
+    }
+
+    #[test]
+    fn command_result_try_return_value_reads_named_out_param() {
+        let res = command_result();
+        let got: Option<i32> = res.try_return_value("@b").unwrap();
+        assert_eq!(got, Some(42));
+        assert!(res.try_return_value::<i32>("@missing").is_err());
+    }
+
+    #[test]
+    fn command_result_into_iter_yields_each_record_set() {
+        assert_eq!(command_result().into_iter().count(), 2);
+    }
+}

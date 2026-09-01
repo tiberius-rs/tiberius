@@ -533,6 +533,27 @@ mod tests {
     }
 
     #[test]
+    fn application_intent_readonly_parsing() -> crate::Result<()> {
+        // Exact spelling from the ADO.NET connection string.
+        let ado: AdoNetConfig = "ApplicationIntent=ReadOnly".parse()?;
+        assert!(ado.readonly());
+
+        // ADO.NET treats the value case-insensitively.
+        let ado: AdoNetConfig = "applicationintent=readonly".parse()?;
+        assert!(ado.readonly());
+
+        // ReadWrite (the default) must not request read-only intent.
+        let ado: AdoNetConfig = "ApplicationIntent=ReadWrite".parse()?;
+        assert!(!ado.readonly());
+
+        // Absent altogether.
+        let ado: AdoNetConfig = "server=tcp:localhost,1433".parse()?;
+        assert!(!ado.readonly());
+
+        Ok(())
+    }
+
+    #[test]
     fn multi_subnet_failover_parsing() -> crate::Result<()> {
         let test_str = "MultiSubnetFailover=true";
         let ado: AdoNetConfig = test_str.parse()?;

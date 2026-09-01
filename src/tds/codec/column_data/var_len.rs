@@ -1,6 +1,4 @@
-use crate::{
-    sql_read_bytes::SqlReadBytes, tds::codec::VarLenContext, ColumnData, Error, VarLenType,
-};
+use crate::{sql_read_bytes::SqlReadBytes, tds::codec::VarLenContext, ColumnData, VarLenType};
 
 pub(crate) async fn decode<R>(
     src: &mut R,

@@ -26,7 +26,7 @@ static CONN_STR: Lazy<String> = Lazy::new(|| {
 
 thread_local! {
     static NAMES: RefCell<Option<Generator<'static>>> =
-    RefCell::new(None);
+        const { RefCell::new(None) };
 }
 
 async fn random_table() -> String {
