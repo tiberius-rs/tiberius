@@ -217,11 +217,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsPreloginWrapper<
             let header = PacketHeader::decode(&mut BytesMut::from(&inner.header_buf[..]))
                 .map_err(io::Error::other)?;
 
-            // We only get pre-login packets in the handshake process.
-            assert_eq!(header.r#type(), PacketType::PreLogin);
+            // We only get pre-login packets in the handshake process. This runs
+            // before any certificate has been validated, so the bytes are fully
+            // untrusted: reject anything unexpected instead of panicking.
+            if header.r#type() != PacketType::PreLogin {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected a pre-login packet during the TLS handshake",
+                )));
+            }
 
-            // And we know from this point on how much data we should expect
-            inner.read_remaining = header.length() as usize - HEADER_BYTES;
+            // And we know from this point on how much data we should expect.
+            inner.read_remaining = (header.length() as usize)
+                .checked_sub(HEADER_BYTES)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "pre-login packet length shorter than its header",
+                    )
+                })?;
 
             event!(
                 Level::TRACE,

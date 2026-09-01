@@ -231,6 +231,39 @@ mod tests {
     }
 
     #[test]
+    fn server_parsing_too_many_parts_is_error() -> crate::Result<()> {
+        // The Server value must have at most two comma-separated parts
+        // (host[,port]). Three parts is invalid and must error. The guard is
+        // `parts.is_empty() || parts.len() >= 3`; a `&&` mutation would never
+        // trigger (a slice cannot be both empty and have >= 3 parts), so this
+        // three-part value would be wrongly accepted.
+        let ado: AdoNetConfig = "server=tcp:my-server.com,1433,extra".parse()?;
+        assert!(ado.server().is_err());
+
+        let ado: AdoNetConfig = "server=my-server.com,1433,extra".parse()?;
+        assert!(ado.server().is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn server_parsing_missing_key() -> crate::Result<()> {
+        // No `server`/`data source` key at all -> an all-`None` definition.
+        let ado: AdoNetConfig = "database=Foo".parse()?;
+        let server = ado.server()?;
+
+        assert_eq!(None, server.host);
+        assert_eq!(None, server.port);
+        assert_eq!(None, server.instance);
+
+        // And the same path through the public constructor.
+        let config = crate::Config::from_ado_string("database=Foo")?;
+        assert_eq!("localhost", config.get_host());
+
+        Ok(())
+    }
+
+    #[test]
     fn database_parsing() -> crate::Result<()> {
         let test_str = "database=Foo";
         let ado: AdoNetConfig = test_str.parse()?;
@@ -465,7 +498,7 @@ mod tests {
         let test_str = "";
         let ado: AdoNetConfig = test_str.parse()?;
 
-        assert_eq!(EncryptionLevel::Off, ado.encrypt()?);
+        assert_eq!(EncryptionLevel::Required, ado.encrypt()?);
 
         Ok(())
     }

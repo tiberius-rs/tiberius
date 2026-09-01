@@ -314,7 +314,7 @@ mod tests {
         let test_str = "jdbc:sqlserver://my-server.com:4200;";
         let jdbc: JdbcConfig = test_str.parse()?;
 
-        assert_eq!(EncryptionLevel::Off, jdbc.encrypt()?);
+        assert_eq!(EncryptionLevel::Required, jdbc.encrypt()?);
 
         Ok(())
     }
