@@ -299,8 +299,13 @@ impl<'a> Stream for CommandStream<'a> {
                     Poll::Ready(Some(Ok(query_item)))
                 }
                 ReceivedToken::Row(data) => {
-                    let columns = this.columns.as_ref().unwrap().clone();
-                    let result_index = this.result_set_index.unwrap();
+                    let Some(columns) = this.columns.as_ref() else {
+                        return Poll::Ready(Some(Err(crate::Error::Protocol(
+                            "ROW token arrived before any column metadata".into(),
+                        ))));
+                    };
+                    let columns = columns.clone();
+                    let result_index = this.result_set_index.unwrap_or(0);
 
                     let row = Row {
                         columns,

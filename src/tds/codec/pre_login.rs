@@ -236,7 +236,8 @@ impl Decode<BytesMut> for PreloginMessage {
 
             // verify whether the server acts in accordance to what we requested
             // and if we can handle on what we seemingly agreed to
-            // TODO: support parsing more
+            // Unrecognized (e.g. newer) pre-login option tokens are skipped;
+            // this is intentional forward-compatibility, not a bug.
             match token {
                 // version
                 PRELOGIN_VERSION => {
@@ -422,6 +423,146 @@ mod tests {
 
         let decoded = PreloginMessage::decode(&mut with).expect("decode should succeed");
         assert_eq!(decoded.activity_id, prelogin.activity_id);
+    }
+
+    #[test]
+    fn decode_accepts_zero_length_threadid() {
+        // A THREADID option with length 0 must decode to thread_id 0, not error.
+        // Table entry (token, offset=6, length=0) then the terminator.
+        let mut buf = BytesMut::from(
+            &[
+                PRELOGIN_THREADID,
+                0x00,
+                0x06,
+                0x00,
+                0x00,
+                PRELOGIN_TERMINATOR,
+            ][..],
+        );
+        let decoded = PreloginMessage::decode(&mut buf).expect("zero-length threadid must decode");
+        assert_eq!(decoded.thread_id, 0);
+    }
+
+    #[test]
+    fn decode_reads_nonce_option() {
+        // Table entry for NONCEOPT (offset 6, length 32) + terminator + 32 bytes.
+        let mut bytes = vec![
+            PRELOGIN_NONCEOPT,
+            0x00,
+            0x06,
+            0x00,
+            0x20,
+            PRELOGIN_TERMINATOR,
+        ];
+        bytes.extend_from_slice(&[0xAB; 32]);
+        let mut buf = BytesMut::from(&bytes[..]);
+
+        let decoded = PreloginMessage::decode(&mut buf).expect("nonce option must decode");
+        assert_eq!(decoded.nonce, Some([0xAB; 32]));
+    }
+
+    #[test]
+    fn option_payload_returns_none_for_absent_token() {
+        let mut payload = BytesMut::new();
+        PreloginMessage::new()
+            .encode(&mut payload)
+            .expect("encode should succeed");
+
+        // A fresh message emits no TRACEID option.
+        assert_eq!(option_payload(&payload, PRELOGIN_TRACEID), None);
+    }
+
+    #[test]
+    fn decode_rejects_invalid_encryption_value() {
+        // ENCRYPTION option (offset 6, length 1) + terminator + an out-of-range
+        // encryption byte.
+        let mut buf = BytesMut::from(
+            &[
+                PRELOGIN_ENCRYPTION,
+                0x00,
+                0x06,
+                0x00,
+                0x01,
+                PRELOGIN_TERMINATOR,
+                0x63, // 99: not a valid EncryptionLevel
+            ][..],
+        );
+
+        match PreloginMessage::decode(&mut buf) {
+            Err(Error::Protocol(_)) => {}
+            other => panic!("expected protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_invalid_threadid_length() {
+        // THREADID option with an unsupported length (2) must error.
+        let mut buf = BytesMut::from(
+            &[
+                PRELOGIN_THREADID,
+                0x00,
+                0x06,
+                0x00,
+                0x02,
+                PRELOGIN_TERMINATOR,
+                0x00,
+                0x00,
+            ][..],
+        );
+
+        match PreloginMessage::decode(&mut buf) {
+            Err(Error::Protocol(_)) => {}
+            other => panic!("expected protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_token() {
+        // An unknown option token must produce a protocol error.
+        let mut buf = BytesMut::from(
+            &[
+                0x50, // unsupported token
+                0x00,
+                0x06,
+                0x00,
+                0x01,
+                PRELOGIN_TERMINATOR,
+                0x00,
+            ][..],
+        );
+
+        match PreloginMessage::decode(&mut buf) {
+            Err(Error::Protocol(_)) => {}
+            other => panic!("expected protocol error, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    #[test]
+    fn negotiated_encryption_off_and_strict() {
+        let mut prelogin = PreloginMessage::new();
+
+        // Both sides Off -> Off.
+        prelogin.encryption = EncryptionLevel::Off;
+        assert_eq!(
+            prelogin
+                .negotiated_encryption(EncryptionLevel::Off)
+                .unwrap(),
+            EncryptionLevel::Off
+        );
+
+        // Strict is negotiated out-of-band; it stays Strict regardless of the
+        // server's advertised level.
+        assert_eq!(
+            prelogin
+                .negotiated_encryption(EncryptionLevel::Strict)
+                .unwrap(),
+            EncryptionLevel::Strict
+        );
     }
 
     #[test]

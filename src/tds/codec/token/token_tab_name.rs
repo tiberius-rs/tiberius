@@ -176,6 +176,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_non_ascii_name_reads_both_bytes_of_each_unit() {
+        // A code point with a non-zero high byte (U+20AC EURO SIGN => 0xAC 0x20)
+        // only decodes correctly if both bytes of the UTF-16 unit are read; a
+        // one-off in the low/high byte index would corrupt it.
+        let mut data = vec![1u8];
+        data.extend_from_slice(&us_varchar("€uro"));
+
+        let token = TokenTabName::parse(&data).expect("must parse");
+        assert_eq!(token.tables()[0].parts(), &["€uro".to_string()]);
+    }
+
+    #[test]
+    fn parse_zero_length_part_at_buffer_end() {
+        // NumParts = 1 followed by a zero-length part that ends exactly at the
+        // buffer boundary: the `pos + 2 > len` check must accept (not reject) an
+        // exact fit.
+        let data = vec![1u8, 0u8, 0u8];
+        let token = TokenTabName::parse(&data).expect("exact-fit length must parse");
+        assert_eq!(token.tables()[0].parts(), &[String::new()]);
+    }
+
+    #[test]
+    fn parse_rejects_name_length_exceeding_payload() {
+        // NumParts = 1, part claims 4 code units (8 bytes) but only 6 follow.
+        // The `char_count * 2` byte check must reject this; a wrong multiplier
+        // would under-count and read past the buffer.
+        let mut data = vec![1u8];
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&[0xAB; 6]);
+        assert!(TokenTabName::parse(&data).is_err());
+    }
+
+    #[test]
     fn parse_truncated_length_fails() {
         // NumParts says 1 part but no length bytes follow.
         let data = vec![1u8];

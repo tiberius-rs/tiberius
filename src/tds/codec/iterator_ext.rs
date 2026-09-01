@@ -25,3 +25,20 @@ where
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_interleaves_separator_between_elements() {
+        let joined = [1, 2, 3].into_iter().join(", ");
+        assert_eq!(joined, "1, 2, 3");
+    }
+
+    #[test]
+    fn join_single_element_has_no_separator() {
+        let joined = std::iter::once("only").join(", ");
+        assert_eq!(joined, "only");
+    }
+}

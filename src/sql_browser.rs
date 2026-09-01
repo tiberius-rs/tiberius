@@ -34,12 +34,23 @@ fn get_port_from_sql_browser_reply(
 
     buf.truncate(len);
 
-    let err = crate::Error::Conversion(
-        format!("Could not resolve SQL browser instance {}", instance_name).into(),
-    );
+    // Built fresh on each failure path so the descriptive context (which
+    // instance failed to resolve) is preserved rather than being collapsed into
+    // a bare `Error::Utf8`/`Error::ParseInt` by `?`.
+    let err = || {
+        crate::Error::Conversion(
+            format!("Could not resolve SQL browser instance {}", instance_name).into(),
+        )
+    };
 
-    if len == 0 {
-        return Err(err);
+    // The SSRP reply is [SVR_RESP(1 byte)][RESP_SIZE(2 bytes, LE)][data...], so
+    // the instance data starts at offset 3. A reply shorter than that 3-byte
+    // header is malformed — and SSRP is unauthenticated UDP, so a spoofed or
+    // truncated datagram is fully attacker-controlled. Guard it explicitly:
+    // `&buf[3..len]` would otherwise panic ("slice index starts at 3 but ends
+    // at 1") for a 1- or 2-byte reply.
+    if len < 3 {
+        return Err(err());
     }
 
     let rsp = &buf[3..len];
@@ -49,8 +60,9 @@ fn get_port_from_sql_browser_reply(
         .rev()
         .position(|window| window == DELIMITER)
         .and_then(|pos| rsp[(rsp.len() - pos)..].split(|item| *item == b';').next())
-        .ok_or(err)
-        .and_then(|val| Ok(std::str::from_utf8(val)?.parse()?))?;
+        .and_then(|val| std::str::from_utf8(val).ok())
+        .and_then(|val| val.parse().ok())
+        .ok_or_else(err)?;
 
     Ok(port)
 }

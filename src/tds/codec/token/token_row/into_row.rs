@@ -205,3 +205,58 @@ where
         row
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::codec::ColumnData;
+
+    #[test]
+    fn single_value_into_row() {
+        let row = 42i32.into_row();
+        assert_eq!(row.len(), 1);
+        assert_eq!(row.get(0), Some(&ColumnData::I32(Some(42))));
+    }
+
+    #[test]
+    fn tuple_arities_produce_expected_lengths_and_order() {
+        assert_eq!((1i32, 2i32).into_row().len(), 2);
+        assert_eq!((1i32, 2i32, 3i32).into_row().len(), 3);
+        assert_eq!((1i32, 2i32, 3i32, 4i32).into_row().len(), 4);
+        assert_eq!((1i32, 2i32, 3i32, 4i32, 5i32).into_row().len(), 5);
+        assert_eq!((1i32, 2i32, 3i32, 4i32, 5i32, 6i32).into_row().len(), 6);
+        assert_eq!(
+            (1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32).into_row().len(),
+            7
+        );
+        assert_eq!(
+            (1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32, 8i32)
+                .into_row()
+                .len(),
+            8
+        );
+        assert_eq!(
+            (1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32, 8i32, 9i32)
+                .into_row()
+                .len(),
+            9
+        );
+
+        let row = (1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32, 8i32, 9i32, 10i32).into_row();
+        assert_eq!(row.len(), 10);
+
+        // Values are pushed in tuple order.
+        for (i, value) in row.iter().enumerate() {
+            assert_eq!(value, &ColumnData::I32(Some(i as i32 + 1)));
+        }
+    }
+
+    #[test]
+    fn mixed_types_preserve_positions() {
+        let row = (true, 7u8, "hello", 3.5f64).into_row();
+        assert_eq!(row.len(), 4);
+        assert_eq!(row.get(0), Some(&ColumnData::Bit(Some(true))));
+        assert_eq!(row.get(1), Some(&ColumnData::U8(Some(7))));
+        assert_eq!(row.get(3), Some(&ColumnData::F64(Some(3.5))));
+    }
+}

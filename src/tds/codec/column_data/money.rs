@@ -48,6 +48,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+    use bytes::{BufMut, BytesMut};
+
+    // `smallmoney` (len 4) is a single scaled `i32` divided by 1e4. Uses a value
+    // that is not a boundary: kills "delete match arm 4" (would fall through to
+    // the error arm) and "replace `/` with `%`/`*`" (12345/1e4 = 1.2345, whereas
+    // 12345 % 1e4 = 2345.0 and 12345 * 1e4 = 1.2345e8).
+    #[tokio::test]
+    async fn decode_smallmoney_arm() {
+        let mut buf = BytesMut::new();
+        buf.put_i32_le(12345);
+
+        let data = decode(&mut buf.into_sql_read_bytes(), 4).await.unwrap();
+        match data {
+            ColumnData::F64(Some(v)) => assert!((v - 1.2345).abs() < 1e-9, "v={}", v),
+            other => panic!("expected F64, got {:?}", other),
+        }
+    }
+
+    // `money` (len 8) is two 32-bit words: `((high << 32) + low) / 1e4`.
+    // high = 1, low = 30000 gives ((1 << 32) + 30000) / 1e4 = 429499.7296.
+    // Kills: "delete match arm 8" (error fallthrough); "replace `<<` with `>>`"
+    // (1 >> 32 = 0 => 3.0); "replace `+` with `-`/`*`" (subtraction/mult differ);
+    // and "replace outer `/` with `%`/`*`" (4294997296 % 1e4 = 7296.0).
+    #[tokio::test]
+    async fn decode_money_arm() {
+        let mut buf = BytesMut::new();
+        buf.put_i32_le(1); // high word
+        buf.put_u32_le(30000); // low word
+
+        let data = decode(&mut buf.into_sql_read_bytes(), 8).await.unwrap();
+        match data {
+            ColumnData::F64(Some(v)) => assert!((v - 429499.7296).abs() < 1e-6, "v={}", v),
+            other => panic!("expected F64, got {:?}", other),
+        }
+    }
 
     // Reverses the on-wire money representation the same way `decode` does,
     // so we can assert `encode` is the exact inverse without a live server.
@@ -71,6 +107,23 @@ mod tests {
         assert_eq!(buf[0], 4);
         assert_eq!(buf.len(), 5);
         assert_eq!(decode_bytes(&buf), 1234.5678);
+    }
+
+    // A length other than 0/4/8 is an invalid money encoding. Covers 38-42.
+    #[tokio::test]
+    async fn decode_invalid_length_errors() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0);
+        let err = decode(&mut buf.into_sql_read_bytes(), 5).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // The `decode_bytes` test helper panics on an unexpected length prefix.
+    // Covers line 99 (the helper's fallthrough arm).
+    #[test]
+    fn decode_bytes_invalid_length_panics() {
+        let result = std::panic::catch_unwind(|| decode_bytes(&[2u8, 0, 0, 0, 0]));
+        assert!(result.is_err());
     }
 
     #[test]

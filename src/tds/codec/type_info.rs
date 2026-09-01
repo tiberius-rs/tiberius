@@ -115,11 +115,16 @@ impl Encode<BytesMut> for VarLenContext {
 
         // length
         match self.r#type {
+            // DATE (0x28) carries NO scale byte in TYPE_INFO (MS-TDS
+            // §2.2.5.4.2 / §2.2.5.5.1.2), unlike TIME/DATETIME2/DATETIMEOFFSET
+            // which each carry a SCALE byte. The decoder already special-cases
+            // this (`Daten => 3`, reading no byte); emitting a byte here would
+            // desync every field after a `date` column in a TYPE_INFO stream
+            // (bulk-load column metadata / TVP).
             #[cfg(feature = "tds73")]
-            VarLenType::Daten
-            | VarLenType::Timen
-            | VarLenType::DatetimeOffsetn
-            | VarLenType::Datetime2 => {
+            VarLenType::Daten => {}
+            #[cfg(feature = "tds73")]
+            VarLenType::Timen | VarLenType::DatetimeOffsetn | VarLenType::Datetime2 => {
                 dst.put_u8(self.len() as u8);
             }
             VarLenType::Bitn
@@ -144,7 +149,11 @@ impl Encode<BytesMut> for VarLenContext {
                 dst.put_u32_le(self.len() as u32);
             }
             VarLenType::Xml => (),
-            typ => todo!("encoding {:?} is not supported yet", typ),
+            typ => {
+                return Err(Error::Protocol(
+                    format!("encoding a {typ:?} var-len context is not supported").into(),
+                ))
+            }
         }
 
         if let Some(collation) = self.collation() {
@@ -194,12 +203,12 @@ uint_enum! {
         NVarchar = 0xE7,
         NChar = 0xEF,
         Xml = 0xF1,
-        // not supported yet
+        // CLR user-defined type; decoded as raw PLP bytes (see column_data/udt.rs).
         Udt = 0xF0,
         Text = 0x23,
         Image = 0x22,
         NText = 0x63,
-        // not supported yet
+        // sql_variant; fully decoded/encoded (see column_data/sql_variant.rs).
         SSVariant = 0x62, // legacy types (not supported since post-7.2):
                           // Char = 0x2F,
                           // Binary = 0x2D,
@@ -234,12 +243,12 @@ uint_enum! {
         NVarchar = 0xE7,
         NChar = 0xEF,
         Xml = 0xF1,
-        // not supported yet
+        // CLR user-defined type; decoded as raw PLP bytes (see column_data/udt.rs).
         Udt = 0xF0,
         Text = 0x23,
         Image = 0x22,
         NText = 0x63,
-        // not supported yet
+        // sql_variant; fully decoded/encoded (see column_data/sql_variant.rs).
         SSVariant = 0x62, // legacy types (not supported since post-7.2):
                           // Char = 0x2F,
                           // Binary = 0x2D,
@@ -404,7 +413,11 @@ impl TypeInfo {
                     | VarLenType::Text
                     | VarLenType::NText
                     | VarLenType::SSVariant => src.read_u32_le().await? as usize,
-                    _ => todo!("not yet implemented for {:?}", ty),
+                    _ => {
+                        return Err(Error::Protocol(
+                            format!("unsupported column type in COLMETADATA: {:?}", ty).into(),
+                        ))
+                    }
                 };
 
                 let collation = match ty {
@@ -426,6 +439,18 @@ impl TypeInfo {
                     VarLenType::Decimaln | VarLenType::Numericn => {
                         let precision = src.read_u8().await?;
                         let scale = src.read_u8().await?;
+
+                        // MS-TDS: precision is 1..=38 and scale 0..=precision.
+                        // Reject out-of-range server values here so downstream
+                        // (Numeric decode/Display) never sees an impossible scale.
+                        if precision > 38 || scale > precision {
+                            return Err(Error::Protocol(
+                                format!(
+                                    "decimal/numeric: invalid precision {precision} / scale {scale}"
+                                )
+                                .into(),
+                            ));
+                        }
 
                         TypeInfo::VarLenSizedPrecision {
                             size: len,
@@ -493,5 +518,197 @@ mod tests {
 
             assert_eq!(nti, ti)
         }
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn date_typeinfo_round_trips_without_scale_byte() {
+        // DATE (0x28) has no scale byte in TYPE_INFO: encode must emit only the
+        // type token, and it must round-trip through decode.
+        let ti = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Daten, 3, None));
+        let mut buf = BytesMut::new();
+        ti.clone().encode(&mut buf).expect("encode must succeed");
+
+        assert_eq!(buf.as_ref(), &[VarLenType::Daten as u8]);
+
+        let nti = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect("decode must succeed");
+        assert_eq!(nti, ti);
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_out_of_range_precision_scale() {
+        // Decimaln TYPE_INFO: [type][size][precision][scale]. A precision > 38
+        // from an untrusted server must be rejected rather than flowing into
+        // Numeric decoding (which would later panic on an impossible scale).
+        let mut buf = BytesMut::new();
+        buf.put_u8(VarLenType::Decimaln as u8);
+        buf.put_u8(17); // size
+        buf.put_u8(200); // precision (invalid, > 38)
+        buf.put_u8(2); // scale
+
+        let err = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect_err("out-of-range precision must error");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[test]
+    fn var_len_context_is_empty() {
+        assert!(VarLenContext::new(VarLenType::Intn, 0, None).is_empty());
+        assert!(!VarLenContext::new(VarLenType::Intn, 4, None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn decode_intn_reads_one_byte_length() {
+        // Covers the Bitn|Intn|Floatn|... match arm: the length is a single u8.
+        let mut buf = BytesMut::new();
+        buf.put_u8(VarLenType::Intn as u8);
+        buf.put_u8(4); // length in bytes
+
+        let ti = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect("decode must succeed");
+        assert_eq!(
+            ti,
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None))
+        );
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn decode_timen_reads_one_byte_scale() {
+        // Covers the Timen|DatetimeOffsetn|Datetime2 match arm: reads a u8 scale
+        // as the length. Deleting the arm would make this an error.
+        let mut buf = BytesMut::new();
+        buf.put_u8(VarLenType::Timen as u8);
+        buf.put_u8(7); // scale
+
+        let ti = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect("decode must succeed");
+        assert_eq!(
+            ti,
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Timen, 7, None))
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_accepts_precision_38_and_scale_below_precision() {
+        // Boundary: precision == 38 is the maximum valid precision and must be
+        // accepted; scale (10) is below precision.
+        let mut buf = BytesMut::new();
+        buf.put_u8(VarLenType::Decimaln as u8);
+        buf.put_u8(17); // size
+        buf.put_u8(38); // precision (max valid)
+        buf.put_u8(10); // scale
+
+        let ti = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect("precision 38 must be accepted");
+        assert_eq!(
+            ti,
+            TypeInfo::VarLenSizedPrecision {
+                ty: VarLenType::Decimaln,
+                size: 17,
+                precision: 38,
+                scale: 10,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_accepts_scale_equal_to_precision() {
+        // Boundary: scale == precision is valid (scale may equal precision).
+        let mut buf = BytesMut::new();
+        buf.put_u8(VarLenType::Numericn as u8);
+        buf.put_u8(17); // size
+        buf.put_u8(20); // precision
+        buf.put_u8(20); // scale == precision
+
+        let ti = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect("scale == precision must be accepted");
+        assert_eq!(
+            ti,
+            TypeInfo::VarLenSizedPrecision {
+                ty: VarLenType::Numericn,
+                size: 17,
+                precision: 20,
+                scale: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn var_len_context_encode_xml_emits_only_type_byte() {
+        // Xml in a VarLenContext carries no length bytes: encode must emit only
+        // the type token (the `VarLenType::Xml => ()` arm).
+        let mut buf = BytesMut::new();
+        VarLenContext::new(VarLenType::Xml, 0, None)
+            .encode(&mut buf)
+            .expect("encode must succeed");
+        assert_eq!(buf.as_ref(), &[VarLenType::Xml as u8]);
+    }
+
+    #[test]
+    fn var_len_context_encode_unsupported_type_errors() {
+        // Udt is not encodable through VarLenContext (it has its own TypeInfo
+        // arm), so it hits the `typ => Err(..)` fallback.
+        let mut buf = BytesMut::new();
+        let err = VarLenContext::new(VarLenType::Udt, 0, None)
+            .encode(&mut buf)
+            .expect_err("encoding a Udt var-len context must error");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_invalid_type_byte() {
+        // A leading byte that is neither a FixedLenType nor a VarLenType must be
+        // rejected (`Err(())` arm of the VarLenType match).
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x00);
+
+        let err = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect_err("invalid type byte must error");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn decode_udt_info_round_trips() {
+        // Exercises the UDT_INFO decode arm: max_byte_size + three b_varchars +
+        // a us_varchar assembly-qualified name.
+        let ti = TypeInfo::Udt(UdtInfo {
+            max_byte_size: 0xffff,
+            db_name: "db".to_string(),
+            schema_name: "dbo".to_string(),
+            type_name: "geometry".to_string(),
+            assembly_qualified_name: "asm".to_string(),
+        });
+
+        let mut buf = BytesMut::new();
+        ti.clone().encode(&mut buf).expect("encode must succeed");
+
+        let decoded = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect("decode must succeed");
+        assert_eq!(decoded, ti);
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_scale_greater_than_precision() {
+        // scale > precision must be rejected.
+        let mut buf = BytesMut::new();
+        buf.put_u8(VarLenType::Decimaln as u8);
+        buf.put_u8(17); // size
+        buf.put_u8(10); // precision
+        buf.put_u8(20); // scale > precision
+
+        let err = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect_err("scale > precision must error");
+        assert!(matches!(err, Error::Protocol(_)));
     }
 }
