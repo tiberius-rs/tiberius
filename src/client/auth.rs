@@ -30,7 +30,7 @@ impl Debug for SqlServerAuth {
 )]
 pub struct WindowsAuth {
     pub(crate) user: String,
-    pub(crate) password: String,
+    pub(crate) password: Zeroizing<String>,
     pub(crate) domain: Option<String>,
 }
 
@@ -50,7 +50,7 @@ impl Debug for WindowsAuth {
 }
 
 /// Defines the method of authentication to the server.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthMethod {
     /// Authenticate directly with SQL Server.
     SqlServer(SqlServerAuth),
@@ -82,6 +82,26 @@ pub enum AuthMethod {
     None,
 }
 
+// Manual Debug so the AAD bearer token is never printed. The credential-bearing
+// SqlServer/Windows variants delegate to their inner types, which already redact.
+impl Debug for AuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SqlServer(a) => f.debug_tuple("SqlServer").field(a).finish(),
+            #[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"), doc))]
+            Self::Windows(a) => f.debug_tuple("Windows").field(a).finish(),
+            #[cfg(any(
+                all(windows, feature = "winauth"),
+                all(unix, feature = "integrated-auth-gssapi"),
+                doc
+            ))]
+            Self::Integrated => f.write_str("Integrated"),
+            Self::AADToken(_) => f.debug_tuple("AADToken").field(&"<HIDDEN>").finish(),
+            Self::None => f.write_str("None"),
+        }
+    }
+}
+
 impl AuthMethod {
     /// Construct a new SQL Server authentication configuration.
     pub fn sql_server(user: impl ToString, password: impl ToString) -> Self {
@@ -105,7 +125,7 @@ impl AuthMethod {
 
         Self::Windows(WindowsAuth {
             user: user.to_string(),
-            password: password.to_string(),
+            password: Zeroizing::new(password.to_string()),
             domain: domain.map(|s| s.to_string()),
         })
     }
@@ -135,5 +155,47 @@ mod tests {
         password.zeroize();
 
         assert!(password.is_empty());
+    }
+
+    #[test]
+    fn debug_redacts_credentials() {
+        let sql = format!("{:?}", AuthMethod::sql_server("sa", "sql-secret"));
+        assert!(!sql.contains("sql-secret"), "SQL password leaked: {sql}");
+
+        let aad = format!("{:?}", AuthMethod::aad_token("aad-secret-token"));
+        assert!(!aad.contains("aad-secret-token"), "AAD token leaked: {aad}");
+        assert!(aad.contains("HIDDEN"));
+    }
+
+    #[test]
+    fn debug_none_variant() {
+        assert_eq!(format!("{:?}", AuthMethod::None), "None");
+    }
+
+    #[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs")))]
+    #[test]
+    fn windows_auth_parses_domain_and_debug_redacts() {
+        // `DOMAIN\user` form exercises the domain-splitting branch of `windows()`.
+        let auth = AuthMethod::windows("DOMAIN\\user", "win-secret");
+        let dbg = format!("{:?}", auth);
+        assert!(dbg.contains("Windows"), "variant name missing: {dbg}");
+        assert!(dbg.contains("DOMAIN"), "domain not preserved: {dbg}");
+        assert!(dbg.contains("user"), "user not preserved: {dbg}");
+        assert!(!dbg.contains("win-secret"), "password leaked: {dbg}");
+
+        // No backslash exercises the domain-less branch.
+        let plain = AuthMethod::windows("plainuser", "pw");
+        let dbg = format!("{:?}", plain);
+        assert!(dbg.contains("plainuser"), "user not preserved: {dbg}");
+        assert!(dbg.contains("None"), "domain should be None: {dbg}");
+    }
+
+    #[cfg(any(
+        all(windows, feature = "winauth"),
+        all(unix, feature = "integrated-auth-gssapi")
+    ))]
+    #[test]
+    fn integrated_debug() {
+        assert_eq!(format!("{:?}", AuthMethod::Integrated), "Integrated");
     }
 }

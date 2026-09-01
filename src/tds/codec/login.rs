@@ -39,7 +39,7 @@ impl FeatureLevel {
 pub enum OptionFlag1 {
     /// The byte order used by client for numeric and datetime data types.
     /// (default: little-endian)
-    BigEndian = 1 << 0,
+    BigEndian = 1, // bit 0 (literal 1: `1 << 0` is shift-invariant)
     /// The character set used on the client. (default: ASCII)
     CharsetEBDDIC = 1 << 1,
     /// Use VAX floating point representation. (default: IEEE 754)
@@ -68,7 +68,7 @@ pub enum OptionFlag1 {
 pub enum OptionFlag2 {
     /// Set if the change to initial language needs to succeed if the connect is
     /// to succeed.
-    InitLangFatal = 1 << 0,
+    InitLangFatal = 1, // bit 0 (literal 1: `1 << 0` is shift-invariant)
     /// Set if the client is the ODBC driver. This causes the server to set
     /// `ANSI_DEFAULTS=ON`, `CURSOR_CLOSE_ON_COMMIT`, `IMPLICIT_TRANSACTIONS=OFF`,
     /// `TEXTSIZE=0x7FFFFFFF` (2GB) (TDS 7.2 and earlier) `TEXTSIZE` to infinite
@@ -93,7 +93,7 @@ pub enum OptionFlag2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptionFlag3 {
     /// Request to change login's password.
-    RequestChangePassword = 1 << 0,
+    RequestChangePassword = 1, // bit 0 (literal 1: `1 << 0` is shift-invariant)
     /// XML data type instances are returned as binary XML.
     BinaryXML = 1 << 1,
     /// Client is requesting separate process to be spawned as user instance.
@@ -112,7 +112,7 @@ pub enum OptionFlag3 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginTypeFlag {
     /// Use T-SQL syntax.
-    UseTSQL = 1 << 0,
+    UseTSQL = 1, // bit 0 (literal 1: `1 << 0` is shift-invariant)
     /// Set if the client is the OLEDB driver. This causes the server to set
     /// ANSI_DEFAULTS to ON, CURSOR_CLOSE_ON_COMMIT and IMPLICIT_TRANSACTIONS to
     /// OFF, TEXTSIZE to 0x7FFFFFFF (2GB) (TDS 7.2 and earlier), TEXTSIZE to
@@ -130,7 +130,7 @@ pub(crate) const FEA_EXT_TERMINATOR: u8 = 0xFFu8;
 pub(crate) const FED_AUTH_LIBRARYSECURITYTOKEN: u8 = 0x01;
 
 /// https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/773a62b6-ee89-4c02-9e5e-344882630aac
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 struct FedAuthExt<'a> {
     fed_auth_echo: bool,
@@ -138,8 +138,21 @@ struct FedAuthExt<'a> {
     nonce: Option<[u8; 32]>,
 }
 
+// Manual Debug so the AAD bearer token is never printed. `LoginMessage`'s own
+// Debug redacts the SQL password; this keeps the federated-auth token redacted
+// too (its derived Debug would otherwise leak the full token via that field).
+impl std::fmt::Debug for FedAuthExt<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FedAuthExt")
+            .field("fed_auth_echo", &self.fed_auth_echo)
+            .field("fed_auth_token", &"<HIDDEN>")
+            .field("nonce", &self.nonce.map(|_| "<present>"))
+            .finish()
+    }
+}
+
 /// the login packet
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct LoginMessage<'a> {
     /// the highest TDS version the client supports
@@ -169,6 +182,34 @@ pub struct LoginMessage<'a> {
     /// the default database to connect to
     db_name: Cow<'a, str>,
     fed_auth_ext: Option<FedAuthExt<'a>>,
+}
+
+// Manual Debug so the plaintext `password` is never printed (every other
+// credential-bearing type in the crate redacts it the same way).
+impl std::fmt::Debug for LoginMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginMessage")
+            .field("tds_version", &self.tds_version)
+            .field("packet_size", &self.packet_size)
+            .field("client_prog_ver", &self.client_prog_ver)
+            .field("client_pid", &self.client_pid)
+            .field("connection_id", &self.connection_id)
+            .field("option_flags_1", &self.option_flags_1)
+            .field("option_flags_2", &self.option_flags_2)
+            .field("integrated_security", &self.integrated_security)
+            .field("type_flags", &self.type_flags)
+            .field("option_flags_3", &self.option_flags_3)
+            .field("client_timezone", &self.client_timezone)
+            .field("client_lcid", &self.client_lcid)
+            .field("hostname", &self.hostname)
+            .field("username", &self.username)
+            .field("password", &"<HIDDEN>")
+            .field("app_name", &self.app_name)
+            .field("server_name", &self.server_name)
+            .field("db_name", &self.db_name)
+            .field("fed_auth_ext", &self.fed_auth_ext)
+            .finish()
+    }
 }
 
 impl<'a> LoginMessage<'a> {
@@ -412,10 +453,11 @@ impl<'a> LoginMessage<'a> {
                 fea_ext_offset = cursor.position();
             }
 
-            // write the client ID (created from the MAC address)
+            // Client ID field: a fixed placeholder (not derived from the
+            // MAC address). SQL Server does not require a real value here.
             if i == 9 {
-                cursor.write_u32::<LittleEndian>(0)?; //TODO:
-                cursor.write_u16::<LittleEndian>(42)?; //TODO: generate real client id
+                cursor.write_u32::<LittleEndian>(0)?;
+                cursor.write_u16::<LittleEndian>(42)?;
                 continue;
             }
 
@@ -837,5 +879,86 @@ mod tests {
         let decoded = LoginMessage::decode(&mut payload).expect("decode should succeed");
 
         assert_eq!(login, decoded);
+    }
+
+    #[test]
+    fn hostname_and_packet_size_setters_apply() {
+        let mut login = LoginMessage::new();
+        login.hostname("my-workstation");
+        login.packet_size(8192);
+
+        assert_eq!(login.hostname, "my-workstation");
+        assert_eq!(login.packet_size, 8192);
+    }
+
+    #[cfg(any(
+        all(unix, any(feature = "integrated-auth-gssapi", feature = "sspi-rs")),
+        windows
+    ))]
+    #[test]
+    fn integrated_security_setter_toggles_flag() {
+        let mut login = LoginMessage::new();
+
+        login.integrated_security(Some(vec![1, 2, 3, 4]));
+        assert!(login
+            .option_flags_2
+            .contains(OptionFlag2::IntegratedSecurity));
+        assert_eq!(
+            login.integrated_security.as_deref(),
+            Some(&[1, 2, 3, 4][..])
+        );
+
+        login.integrated_security(None);
+        assert!(!login
+            .option_flags_2
+            .contains(OptionFlag2::IntegratedSecurity));
+        assert!(login.integrated_security.is_none());
+    }
+
+    #[test]
+    fn encode_round_trips_integrated_security_bytes() {
+        let mut payload = BytesMut::new();
+        let mut login = LoginMessage::new();
+        // Set the field directly to exercise the ibSSPI encode branch without
+        // depending on the platform-gated setter.
+        login.integrated_security = Some(vec![9, 8, 7, 6, 5]);
+        login
+            .clone()
+            .encode(&mut payload)
+            .expect("encode should succeed");
+
+        let decoded = LoginMessage::decode(&mut payload).expect("decode should succeed");
+        assert_eq!(decoded.integrated_security, Some(vec![9, 8, 7, 6, 5]));
+    }
+
+    #[test]
+    fn fed_auth_without_nonce_round_trips() {
+        let mut payload = BytesMut::new();
+        let mut login = LoginMessage::new();
+        login.aad_token("fake-aad-token", true, None);
+        login
+            .clone()
+            .encode(&mut payload)
+            .expect("encode should succeed");
+
+        let decoded = LoginMessage::decode(&mut payload).expect("decode should succeed");
+        assert_eq!(login, decoded);
+        assert_eq!(
+            decoded.fed_auth_ext.expect("fed auth ext present").nonce,
+            None
+        );
+    }
+
+    #[test]
+    fn debug_redacts_fed_auth_token() {
+        let mut login = LoginMessage::new();
+        login.aad_token("super-secret-aad-token", true, Some([9u8; 32]));
+
+        let dbg = format!("{login:?}");
+        assert!(
+            !dbg.contains("super-secret-aad-token"),
+            "AAD token leaked in Debug output: {dbg}"
+        );
+        assert!(dbg.contains("HIDDEN"));
     }
 }

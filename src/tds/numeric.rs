@@ -110,10 +110,10 @@ impl Numeric {
                 _ => unreachable!(),
             };
 
-            // swap high&low for big endian
-            #[cfg(target_endian = "big")]
-            let (low_part, high_part) = (high_part, low_part);
-
+            // `byteorder::LittleEndian` already yields the correct host-native
+            // integer regardless of target endianness, so `low_part`/`high_part`
+            // need no further swapping (a previous `cfg(target_endian = "big")`
+            // swap here corrupted large decimals on big-endian hosts).
             let high_part = high_part * (u64::MAX as u128 + 1);
             low_part + high_part
         }
@@ -144,7 +144,17 @@ impl Numeric {
                     for item in &mut bytes {
                         *item = src.read_u8().await?;
                     }
-                    decode_d128(&bytes) as i128 * sign
+                    let magnitude = decode_d128(&bytes);
+                    // A legal `decimal(38, s)` magnitude is < 10^38 < i128::MAX,
+                    // so any 16-byte magnitude that does not fit in i128 is
+                    // malformed. Reject it rather than letting `as i128` wrap to
+                    // a negative value (and `i128::MIN * -1` overflow-panic).
+                    if magnitude > i128::MAX as u128 {
+                        return Err(Error::Protocol(
+                            "decimal/numeric: magnitude exceeds the representable range".into(),
+                        ));
+                    }
+                    magnitude as i128 * sign
                 }
                 x => {
                     return Err(Error::Protocol(
@@ -160,7 +170,9 @@ impl Numeric {
 
 impl Encode<BytesMut> for Numeric {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
-        dst.put_u8(self.len());
+        // `len()` recomputes `precision()` via a division loop; compute it once.
+        let len = self.len();
+        dst.put_u8(len);
 
         if self.value < 0 {
             dst.put_u8(0);
@@ -170,7 +182,7 @@ impl Encode<BytesMut> for Numeric {
 
         let value = self.value().abs();
 
-        match self.len() {
+        match len {
             5 => dst.put_u32_le(value as u32),
             9 => dst.put_u64_le(value as u64),
             13 => {
@@ -383,6 +395,94 @@ mod tests {
     }
 
     #[test]
+    fn numeric_eq_normalizes_across_a_scale_gap() {
+        // 1.23 at scale 5 (123000) equals 1.23 at scale 2 (123). A scale gap of
+        // 3 is chosen so the `self.scale - other.scale` exponent (3) differs from
+        // both `+` (7) and `/` (1) — pinning the subtraction — and the
+        // `10^gap * v` multiply differs from `+`/`/`. Both comparison directions
+        // exercise the Greater and Less arms.
+        let wide = Numeric {
+            value: 123_000,
+            scale: 5,
+        };
+        let narrow = Numeric {
+            value: 123,
+            scale: 2,
+        };
+        assert_eq!(wide, narrow); // Greater arm (self.scale > other.scale)
+        assert_eq!(narrow, wide); // Less arm
+        assert!(
+            narrow
+                != Numeric {
+                    value: 124,
+                    scale: 2
+                }
+        );
+    }
+
+    #[test]
+    fn encode_byte_layout_matches_length_bucket() {
+        // The encoder writes 1 length byte + 1 sign byte + (len-1) magnitude
+        // bytes. This pins the per-length arms (deleting the 9- or 13-byte arm
+        // would change the byte count) and the sign byte for zero.
+        for value in [1i128, 10i128.pow(12), 10i128.pow(20), 10i128.pow(30)] {
+            let n = Numeric::new_with_scale(value, 0);
+            let expected = n.len() as usize + 1;
+            let mut buf = BytesMut::new();
+            n.encode(&mut buf).unwrap();
+            assert_eq!(buf.len(), expected, "byte count for {value}");
+        }
+
+        // Zero is encoded as positive (sign byte 1), not negative.
+        let mut zero = BytesMut::new();
+        Numeric::new_with_scale(0, 0).encode(&mut zero).unwrap();
+        assert_eq!(zero[1], 1, "zero must carry the positive sign byte");
+    }
+
+    #[tokio::test]
+    async fn decode_d128_keeps_high_and_low_words() {
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+
+        // A magnitude whose high bytes are all non-zero: if decode_d128 wrongly
+        // short-circuited on "all high bytes non-zero" it would drop the high
+        // word and mis-decode. Positive (high byte 0x01 < i128::MAX high bit).
+        let value = 0x0101_0101_0101_0101_0101_0101_0101_0101i128;
+        let n = Numeric::new_with_scale(value, 0);
+        let mut buf = BytesMut::new();
+        n.encode(&mut buf).unwrap();
+        let decoded = Numeric::decode(&mut buf.into_sql_read_bytes(), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.value(), value);
+    }
+
+    #[tokio::test]
+    async fn decode_accepts_magnitude_at_i128_max_but_rejects_beyond() {
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+
+        // 17-byte form: len, sign(1 = positive), then 16 magnitude bytes.
+        let mut at_max = BytesMut::new();
+        at_max.put_u8(17);
+        at_max.put_u8(1);
+        at_max.put_i128_le(i128::MAX); // magnitude exactly i128::MAX
+        let decoded = Numeric::decode(&mut at_max.into_sql_read_bytes(), 0)
+            .await
+            .expect("i128::MAX magnitude is representable")
+            .unwrap();
+        assert_eq!(decoded.value(), i128::MAX);
+
+        // One past i128::MAX (high bit set) must be rejected, not wrapped.
+        let mut beyond = BytesMut::new();
+        beyond.put_u8(17);
+        beyond.put_u8(1);
+        beyond.put_u128_le((i128::MAX as u128) + 1);
+        assert!(Numeric::decode(&mut beyond.into_sql_read_bytes(), 0)
+            .await
+            .is_err());
+    }
+
+    #[test]
     fn numeric_to_f64() {
         assert_eq!(f64::from(Numeric::new_with_scale(57705, 2)), 577.05);
     }
@@ -458,6 +558,161 @@ mod tests {
     fn calculates_precision_correctly() {
         let n = Numeric::new_with_scale(57705, 2);
         assert_eq!(5, n.precision());
+    }
+
+    #[test]
+    fn new_with_scale_accessors() {
+        let n = Numeric::new_with_scale(12345, 3);
+        assert_eq!(n.value(), 12345);
+        assert_eq!(n.scale(), 3);
+        assert_eq!(n.int_part(), 12);
+        assert_eq!(n.dec_part(), 345);
+    }
+
+    #[test]
+    fn new_with_scale_allows_max_scale() {
+        // decimal(38, 38) is valid in SQL Server, so scale 38 must be accepted.
+        assert_eq!(Numeric::new_with_scale(1, 38).scale(), 38);
+    }
+
+    #[test]
+    #[should_panic]
+    fn new_with_scale_panics_on_too_large_scale() {
+        Numeric::new_with_scale(1, 39);
+    }
+
+    #[test]
+    fn precision_with_zero_int_part() {
+        // int_part == 0 -> precision is 1 + scale.
+        let n = Numeric::new_with_scale(5, 2);
+        assert_eq!(n.int_part(), 0);
+        assert_eq!(n.precision(), 3);
+    }
+
+    #[test]
+    fn precision_scaling_by_length_buckets() {
+        assert_eq!(Numeric::new_with_scale(1, 0).len(), 5);
+        assert_eq!(Numeric::new_with_scale(1_000_000_000, 0).len(), 9);
+        assert_eq!(Numeric::new_with_scale(10i128.pow(19), 0).len(), 13);
+        assert_eq!(Numeric::new_with_scale(10i128.pow(28), 0).len(), 17);
+    }
+
+    #[test]
+    fn display_and_debug() {
+        let n = Numeric::new_with_scale(57705, 2);
+        assert_eq!(format!("{:?}", n), "577.05");
+        assert_eq!(format!("{}", n), "577.05");
+
+        // Negative values format with a single leading sign and an unsigned
+        // fractional part (see #390).
+        let n = Numeric::new_with_scale(-57705, 3);
+        assert_eq!(format!("{}", n), "-57.705");
+
+        // Zero-padded fractional part for small decimals.
+        let n = Numeric::new_with_scale(102, 4);
+        assert_eq!(format!("{}", n), "0.0102");
+    }
+
+    #[test]
+    fn from_numeric_conversions() {
+        let n = Numeric::new_with_scale(57705, 2);
+        assert_eq!(i128::from(n), 577);
+        assert_eq!(u128::from(n), 577);
+        assert!((f64::from(n) - 577.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn eq_across_scales_negative() {
+        assert_eq!(
+            Numeric::new_with_scale(-100501, 2),
+            Numeric::new_with_scale(-1005010, 3),
+        );
+    }
+
+    async fn round_trip(value: i128, scale: u8) {
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+
+        let n = Numeric::new_with_scale(value, scale);
+        let mut buf = BytesMut::new();
+        n.encode(&mut buf).expect("encode must succeed");
+
+        let decoded = Numeric::decode(&mut buf.into_sql_read_bytes(), scale)
+            .await
+            .expect("decode must succeed")
+            .expect("value must be present");
+
+        assert_eq!(decoded, n);
+        assert_eq!(decoded.value(), value);
+    }
+
+    #[tokio::test]
+    async fn encode_decode_round_trip() {
+        round_trip(0, 0).await; // len 5
+        round_trip(42, 0).await; // len 5
+        round_trip(-42, 2).await; // negative, len 5
+        round_trip(10i128.pow(12), 0).await; // len 9
+        round_trip(10i128.pow(20), 0).await; // len 13
+        round_trip(-(10i128.pow(20)), 3).await; // negative, len 13
+        round_trip(10i128.pow(30), 0).await; // len 17
+    }
+
+    #[tokio::test]
+    async fn decode_zero_length_is_none() {
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+
+        let mut buf = BytesMut::new();
+        buf.put_u8(0);
+
+        let decoded = Numeric::decode(&mut buf.into_sql_read_bytes(), 0)
+            .await
+            .expect("decode must succeed");
+
+        assert!(decoded.is_none());
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_len17_magnitude_over_i128_max() {
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+
+        // len = 17, sign = 1 (positive), magnitude = 2^127 (byte[15] = 0x80),
+        // which exceeds i128::MAX. Must return a protocol error rather than
+        // wrapping to a negative value (or panicking on i128::MIN * -1).
+        let mut buf = BytesMut::new();
+        buf.put_u8(17);
+        buf.put_u8(1);
+        let mut mag = [0u8; 16];
+        mag[15] = 0x80;
+        buf.extend_from_slice(&mag);
+
+        let err = Numeric::decode(&mut buf.into_sql_read_bytes(), 0)
+            .await
+            .expect_err("out-of-range magnitude must error");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_invalid_sign_and_length() {
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+
+        // Invalid sign byte (2 is neither 0 nor 1).
+        let mut buf = BytesMut::new();
+        buf.put_u8(5);
+        buf.put_u8(2);
+        buf.put_u32_le(1);
+        let err = Numeric::decode(&mut buf.into_sql_read_bytes(), 0)
+            .await
+            .expect_err("invalid sign must error");
+        assert!(matches!(err, Error::Protocol(_)));
+
+        // Invalid length byte (6 is not one of 0/5/9/13/17).
+        let mut buf = BytesMut::new();
+        buf.put_u8(6);
+        buf.put_u8(1);
+        buf.extend_from_slice(&[0u8; 4]);
+        let err = Numeric::decode(&mut buf.into_sql_read_bytes(), 0)
+            .await
+            .expect_err("invalid length must error");
+        assert!(matches!(err, Error::Protocol(_)));
     }
 
     #[test]

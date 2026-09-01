@@ -24,6 +24,26 @@ mod udt;
 mod var_len;
 mod xml;
 
+/// Upper bound on how many bytes a value decoder will *pre-allocate* from a
+/// server-supplied length field before it has read the corresponding data.
+///
+/// The wire length is untrusted: a malformed or hostile server can claim a
+/// value is up to `u32::MAX`/`u64::MAX` bytes long. Reserving that up front is a
+/// memory-exhaustion vector (and, for `u64` lengths, can even exceed `Vec`'s
+/// `isize::MAX` capacity limit and panic). Decoders therefore cap the initial
+/// reservation to this value and let the buffer grow as bytes actually arrive;
+/// a short/lying length still fails cleanly when the read runs out of input.
+pub(crate) const MAX_PREALLOC: usize = 8192; // 8 KiB
+
+/// Absolute ceiling on the *total* size of a single PLP (partially
+/// length-prefixed) value — `varchar(max)`, `nvarchar(max)`, `varbinary(max)`,
+/// `xml`, and CLR UDTs. SQL Server's own MAX types top out at `2^31 - 1` bytes,
+/// so any value that would grow past this is malformed. Without this bound the
+/// "unknown length" PLP form (which streams an arbitrary number of chunks until
+/// a zero-length terminator) lets a hostile server grow the accumulation buffer
+/// without limit and OOM the client on a single column value.
+pub(crate) const MAX_PLP_SIZE: usize = i32::MAX as usize;
+
 use super::{Encode, FixedLenType, TypeInfo, VarLenType};
 #[cfg(feature = "tds73")]
 use crate::tds::time::{Date, DateTime2, DateTimeOffset, Time};
@@ -853,9 +873,34 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 if ty == &VarLenType::Numericn || ty == &VarLenType::Decimaln =>
             {
                 if let Some(num) = opt {
-                    if scale != &num.scale() {
-                        todo!("this still need some work, if client scale not aligned with server, we need to do conversion but will lose precision")
-                    }
+                    // The value is sent at the column's scale (the scale lives in
+                    // the TYPE_INFO, not the value), so rescale when the client
+                    // value's scale differs from the target column's scale.
+                    let target_scale = *scale;
+                    let num = if target_scale == num.scale() {
+                        num
+                    } else if target_scale > num.scale() {
+                        // Scale up: multiply, checking for i128 overflow.
+                        let factor = 10i128.pow((target_scale - num.scale()) as u32);
+                        let value = num.value().checked_mul(factor).ok_or_else(|| {
+                            crate::Error::Conversion(
+                                "numeric value overflows when scaling to the column's scale".into(),
+                            )
+                        })?;
+                        Numeric::new_with_scale(value, target_scale)
+                    } else {
+                        // Scale down: divide, rounding half away from zero
+                        // (this loses precision beyond the column's scale).
+                        let factor = 10i128.pow((num.scale() - target_scale) as u32);
+                        let half = factor / 2;
+                        let v = num.value();
+                        let value = if v >= 0 {
+                            (v + half) / factor
+                        } else {
+                            (v - half) / factor
+                        };
+                        Numeric::new_with_scale(value, target_scale)
+                    };
                     num.encode(&mut *dst)?;
                 } else {
                     dst.put_u8(0);
@@ -947,6 +992,54 @@ mod tests {
             .read_u8()
             .await
             .expect_err("decode must consume entire buffer");
+    }
+
+    #[test]
+    fn type_name_maps_each_variant() {
+        assert_eq!(ColumnData::U8(Some(1)).type_name(), "tinyint");
+        assert_eq!(ColumnData::I16(Some(1)).type_name(), "smallint");
+        assert_eq!(ColumnData::I32(Some(1)).type_name(), "int");
+        assert_eq!(ColumnData::I64(Some(1)).type_name(), "bigint");
+        assert_eq!(ColumnData::F32(Some(1.0)).type_name(), "float(24)");
+        assert_eq!(ColumnData::F64(Some(1.0)).type_name(), "float(53)");
+        assert_eq!(ColumnData::Bit(Some(true)).type_name(), "bit");
+        assert_eq!(ColumnData::Guid(None).type_name(), "uniqueidentifier");
+        assert_eq!(ColumnData::Numeric(None).type_name(), "numeric");
+        assert_eq!(ColumnData::DateTime(None).type_name(), "datetime");
+        assert_eq!(ColumnData::SmallDateTime(None).type_name(), "smalldatetime");
+    }
+
+    #[test]
+    fn type_name_string_length_thresholds() {
+        // None and anything up to 4000 chars is a sized nvarchar; just past it
+        // becomes nvarchar(max). The `<= 4000` and `<= MAX_NVARCHAR_SIZE` guards
+        // each flip the answer at their boundary.
+        assert_eq!(ColumnData::String(None).type_name(), "nvarchar(4000)");
+        assert_eq!(
+            ColumnData::String(Some("a".repeat(100).into())).type_name(),
+            "nvarchar(4000)"
+        );
+        assert_eq!(
+            ColumnData::String(Some("a".repeat(4000).into())).type_name(),
+            "nvarchar(4000)"
+        );
+        assert_eq!(
+            ColumnData::String(Some("a".repeat(4001).into())).type_name(),
+            "nvarchar(max)"
+        );
+    }
+
+    #[test]
+    fn type_name_binary_length_threshold() {
+        assert_eq!(
+            ColumnData::Binary(Some(vec![0u8; 8000].into())).type_name(),
+            "varbinary(8000)"
+        );
+        assert_eq!(
+            ColumnData::Binary(Some(vec![0u8; 8001].into())).type_name(),
+            "varbinary(max)"
+        );
+        assert_eq!(ColumnData::Binary(None).type_name(), "varbinary(max)");
     }
 
     #[test]
@@ -1706,5 +1799,346 @@ mod tests {
         // Dates earlier than 1900-01-01 cannot be represented by `datetime`.
         let dt2 = DateTime2::new(Date::new(0), Time::new(0, 7));
         assert!(datetime2_to_datetime(&dt2).is_err());
+    }
+
+    // ----- helpers for the coverage tests below -----
+
+    fn encode_with_ti(ti: &TypeInfo, d: ColumnData<'_>) -> crate::Result<BytesMut> {
+        let mut buf = BytesMut::new();
+        {
+            let mut b = BytesMutWithTypeInfo::new(&mut buf).with_type_info(ti);
+            d.encode(&mut b)?;
+        }
+        Ok(buf)
+    }
+
+    fn encode_without_ti(d: ColumnData<'_>) -> crate::Result<BytesMut> {
+        let mut buf = BytesMut::new();
+        {
+            let mut b = BytesMutWithTypeInfo::new(&mut buf);
+            d.encode(&mut b)?;
+        }
+        Ok(buf)
+    }
+
+    fn expect_bulk_input(ti: TypeInfo, d: ColumnData<'_>) {
+        let mut buf = BytesMut::new();
+        let mut b = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+        let err = d.encode(&mut b).expect_err("encode should fail");
+        assert!(matches!(err, Error::BulkInput(_)), "got {:?}", err);
+    }
+
+    // NOTE: the `ntext(max)` catch-all in type_name is only reached by a string
+    // longer than MAX_NVARCHAR_SIZE (>1 GiB); allocating that in a unit test is
+    // impractical (slow / OOM-prone in CI), so that single line is intentionally
+    // left uncovered.
+
+    // ----- decode: line 199 (VarLenSizedPrecision non-numeric -> todo!()) -----
+
+    #[tokio::test]
+    #[should_panic]
+    async fn decode_varlen_sized_precision_unsupported_panics() {
+        let ti = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Money,
+            size: 8,
+            precision: 0,
+            scale: 0,
+        };
+        let buf = BytesMut::new();
+        let reader = &mut buf.into_sql_read_bytes();
+        let _ = ColumnData::decode(reader, &ti).await;
+    }
+
+    // ----- decode: line 202 (Udt) -----
+
+    #[tokio::test]
+    async fn decode_udt_type_info() {
+        use bytes::BufMut;
+
+        let ti = TypeInfo::Udt(crate::tds::codec::type_info::UdtInfo {
+            max_byte_size: 0xffff,
+            db_name: "db".into(),
+            schema_name: "dbo".into(),
+            type_name: "geometry".into(),
+            assembly_qualified_name: String::new(),
+        });
+
+        let mut buf = BytesMut::new();
+        // PLP unknown-length sentinel + one chunk + terminator.
+        buf.put_u64_le(0xfffffffffffffffe);
+        buf.put_u32_le(4);
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+        buf.put_u32_le(0);
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let nd = ColumnData::decode(reader, &ti).await.unwrap();
+        assert_eq!(nd, ColumnData::Binary(Some(vec![1, 2, 3, 4].into())));
+    }
+
+    // ----- F64 with Money (lines 376-383) -----
+
+    #[tokio::test]
+    async fn f64_with_varlen_money() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 8, None)),
+            ColumnData::F64(Some(3.5)),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn none_f64_with_varlen_money() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 8, None)),
+            ColumnData::F64(None),
+        )
+        .await;
+    }
+
+    // ----- BigChar error paths (lines 426, 430-437) -----
+
+    #[tokio::test]
+    async fn bigchar_unrepresentable_character_errors() {
+        let ti = TypeInfo::VarLenSized(VarLenContext::new(
+            VarLenType::BigChar,
+            40,
+            Some(Collation::new(13632521, 52)),
+        ));
+        let mut buf = BytesMut::new();
+        let mut b = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+        // An emoji has no representation in the (single-byte) column collation.
+        let err = ColumnData::String(Some("\u{1F600}".into()))
+            .encode(&mut b)
+            .expect_err("encode should fail");
+        assert!(matches!(err, Error::Encoding(_)), "got {:?}", err);
+    }
+
+    #[tokio::test]
+    async fn bigchar_too_long_errors() {
+        expect_bulk_input(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::BigChar,
+                2,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(Some("aaa".into())),
+        );
+    }
+
+    // ----- NVarchar error paths (lines 481-488 small, 513-520 unknown-size) -----
+
+    #[tokio::test]
+    async fn nvarchar_too_long_small_errors() {
+        expect_bulk_input(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::NVarchar,
+                2,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(Some("aaa".into())),
+        );
+    }
+
+    #[tokio::test]
+    async fn nvarchar_too_long_unknown_size_errors() {
+        // vlc.len() == 0xffff drives the unknown-size path; a string whose UTF-16
+        // byte length exceeds the column limit trips the check at 513-520.
+        expect_bulk_input(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::NVarchar,
+                0xffff,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(Some("a".repeat(40_000).into())),
+        );
+    }
+
+    // ----- Text / NText encode arms (lines 538-587) -----
+
+    #[tokio::test]
+    async fn string_with_varlen_text() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::Text,
+                40,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(Some("hello".into())),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn none_string_with_varlen_text() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::Text,
+                40,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(None),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn string_with_varlen_ntext() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::NText, 40, None)),
+            ColumnData::String(Some("hi".into())),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn none_string_with_varlen_ntext() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::NText, 40, None)),
+            ColumnData::String(None),
+        )
+        .await;
+    }
+
+    // ----- Binary too long (lines 650-657) -----
+
+    #[tokio::test]
+    async fn binary_too_long_errors() {
+        expect_bulk_input(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 2, None)),
+            ColumnData::Binary(Some(b"aaa".as_slice().into())),
+        );
+    }
+
+    // ----- DateTime / SmallDateTime encode without TypeInfo (714-716, 734-736) -----
+
+    #[tokio::test]
+    async fn datetime_encode_without_type_info() {
+        let buf = encode_without_ti(ColumnData::DateTime(Some(DateTime::new(200, 3000)))).unwrap();
+        assert_eq!(buf[0], VarLenType::Datetimen as u8);
+        assert_eq!(buf[1], 8);
+        assert_eq!(buf[2], 8);
+    }
+
+    #[tokio::test]
+    async fn smalldatetime_encode_without_type_info() {
+        let buf = encode_without_ti(ColumnData::SmallDateTime(Some(SmallDateTime::new(
+            200, 3000,
+        ))))
+        .unwrap();
+        assert_eq!(buf[0], VarLenType::Datetimen as u8);
+        assert_eq!(buf[1], 4);
+        assert_eq!(buf[2], 4);
+    }
+
+    // ----- DateTime2 into a `datetime` (Datetimen) column (lines 774-780) -----
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn datetime2_with_varlen_datetimen() {
+        let ti = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Datetimen, 8, None));
+        // 2020-01-01 is representable by `datetime` (>= 1900-01-01).
+        let dt2 = DateTime2::new(Date::new(737_425), Time::new(0, 7));
+        let buf = encode_with_ti(&ti, ColumnData::DateTime2(Some(dt2))).unwrap();
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let nd = ColumnData::decode(reader, &ti).await.unwrap();
+        assert!(matches!(nd, ColumnData::DateTime(Some(_))), "got {:?}", nd);
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn none_datetime2_with_varlen_datetimen() {
+        let ti = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Datetimen, 8, None));
+        let buf = encode_with_ti(&ti, ColumnData::DateTime2(None)).unwrap();
+
+        let reader = &mut buf.into_sql_read_bytes();
+        // Just needs to decode a null cleanly.
+        ColumnData::decode(reader, &ti).await.unwrap();
+    }
+
+    // ----- Numeric into a Money column (lines 840-847) -----
+
+    #[tokio::test]
+    async fn numeric_with_varlen_money() {
+        let ti = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 8, None));
+        // Numeric 3.5 (value 35000, scale 4) -> money.
+        let buf = encode_with_ti(
+            &ti,
+            ColumnData::Numeric(Some(Numeric::new_with_scale(35000, 4))),
+        )
+        .unwrap();
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let nd = ColumnData::decode(reader, &ti).await.unwrap();
+        assert_eq!(nd, ColumnData::F64(Some(3.5)));
+    }
+
+    #[tokio::test]
+    async fn none_numeric_with_varlen_money() {
+        let ti = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 8, None));
+        let buf = encode_with_ti(&ti, ColumnData::Numeric(None)).unwrap();
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let nd = ColumnData::decode(reader, &ti).await.unwrap();
+        assert_eq!(nd, ColumnData::F64(None));
+    }
+
+    // ----- Numeric rescale on encode (lines 859-879) -----
+
+    #[tokio::test]
+    async fn numeric_scaled_up_to_column_scale() {
+        // Column scale 2 > value scale 0: value 23 -> 2300 at scale 2.
+        let ti = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Numericn,
+            size: 17,
+            precision: 18,
+            scale: 2,
+        };
+        let buf = encode_with_ti(
+            &ti,
+            ColumnData::Numeric(Some(Numeric::new_with_scale(23, 0))),
+        )
+        .unwrap();
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let nd = ColumnData::decode(reader, &ti).await.unwrap();
+        assert_eq!(
+            nd,
+            ColumnData::Numeric(Some(Numeric::new_with_scale(2300, 2)))
+        );
+    }
+
+    #[tokio::test]
+    async fn numeric_scaled_down_to_column_scale() {
+        // Column scale 2 < value scale 4: 1.2345 -> 1.23 (rounded half away).
+        let ti = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Numericn,
+            size: 17,
+            precision: 18,
+            scale: 2,
+        };
+        let buf = encode_with_ti(
+            &ti,
+            ColumnData::Numeric(Some(Numeric::new_with_scale(12345, 4))),
+        )
+        .unwrap();
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let nd = ColumnData::decode(reader, &ti).await.unwrap();
+        assert_eq!(
+            nd,
+            ColumnData::Numeric(Some(Numeric::new_with_scale(123, 2)))
+        );
+    }
+
+    // ----- SQL_VARIANT encode (lines 897-898) -----
+
+    #[tokio::test]
+    async fn ssvariant_round_trip_i32() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::SSVariant, 0, None)),
+            ColumnData::I32(Some(42)),
+        )
+        .await;
     }
 }

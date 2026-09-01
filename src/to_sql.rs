@@ -199,3 +199,208 @@ to_sql!(self_,
         XmlData: (ColumnData::Xml, Cow::Borrowed(self_));
         Uuid: (ColumnData::Guid, *self_);
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::Numeric;
+    use crate::{IntoSql, ToSql};
+
+    #[test]
+    fn to_sql_scalars() {
+        assert_eq!(true.to_sql(), ColumnData::Bit(Some(true)));
+        assert_eq!(8u8.to_sql(), ColumnData::U8(Some(8)));
+        assert_eq!(16i16.to_sql(), ColumnData::I16(Some(16)));
+        assert_eq!(32i32.to_sql(), ColumnData::I32(Some(32)));
+        assert_eq!(64i64.to_sql(), ColumnData::I64(Some(64)));
+        assert_eq!(1.5f32.to_sql(), ColumnData::F32(Some(1.5)));
+        assert_eq!(2.5f64.to_sql(), ColumnData::F64(Some(2.5)));
+    }
+
+    #[test]
+    // The `&Some(..)`/`&None` borrows are intentional: they exercise the
+    // `ToSql for &T` impls, not the by-value ones, so the borrow is not needless.
+    #[allow(clippy::needless_borrow)]
+    fn to_sql_option_some_and_none() {
+        assert_eq!(Some(1i32).to_sql(), ColumnData::I32(Some(1)));
+        assert_eq!(None::<i32>.to_sql(), ColumnData::I32(None));
+        assert_eq!((&Some(1i32)).to_sql(), ColumnData::I32(Some(1)));
+        assert_eq!((&None::<i32>).to_sql(), ColumnData::I32(None));
+    }
+
+    #[test]
+    fn to_sql_strings_and_binary() {
+        assert_eq!("abc".to_sql(), ColumnData::String(Some(Cow::from("abc"))));
+        assert_eq!(
+            String::from("abc").to_sql(),
+            ColumnData::String(Some(Cow::from("abc")))
+        );
+        let v = vec![1u8, 2, 3];
+        assert_eq!(
+            v.to_sql(),
+            ColumnData::Binary(Some(Cow::from(vec![1, 2, 3])))
+        );
+        assert_eq!(
+            [1u8, 2, 3].as_slice().to_sql(),
+            ColumnData::Binary(Some(Cow::from(vec![1, 2, 3])))
+        );
+    }
+
+    #[test]
+    fn to_sql_numeric_and_uuid() {
+        let n = Numeric::new_with_scale(5, 1);
+        assert_eq!(n.to_sql(), ColumnData::Numeric(Some(n)));
+
+        let uuid = Uuid::nil();
+        assert_eq!(uuid.to_sql(), ColumnData::Guid(Some(uuid)));
+    }
+
+    #[test]
+    fn into_sql_borrowed_and_owned() {
+        assert_eq!(
+            "abc".into_sql(),
+            ColumnData::String(Some(Cow::Borrowed("abc")))
+        );
+        assert_eq!(
+            Some("abc").into_sql(),
+            ColumnData::String(Some(Cow::Borrowed("abc")))
+        );
+        assert_eq!(None::<&str>.into_sql(), ColumnData::String(None));
+
+        let bytes = vec![9u8, 8, 7];
+        assert_eq!(
+            bytes.as_slice().into_sql(),
+            ColumnData::Binary(Some(Cow::Borrowed(bytes.as_slice())))
+        );
+        assert_eq!(
+            (&bytes).into_sql(),
+            ColumnData::Binary(Some(Cow::from(&bytes)))
+        );
+
+        let uuid = Uuid::nil();
+        assert_eq!((&uuid).into_sql(), ColumnData::Guid(Some(uuid)));
+        assert_eq!(Some(&uuid).into_sql(), ColumnData::Guid(Some(uuid)));
+        assert_eq!(None::<&Uuid>.into_sql(), ColumnData::Guid(None));
+    }
+
+    #[test]
+    fn into_sql_scalars() {
+        assert_eq!(true.into_sql(), ColumnData::Bit(Some(true)));
+        assert_eq!(5i32.into_sql(), ColumnData::I32(Some(5)));
+        assert_eq!(None::<i32>.into_sql(), ColumnData::I32(None));
+        assert_eq!(
+            String::from("x").into_sql(),
+            ColumnData::String(Some(Cow::from("x")))
+        );
+    }
+
+    #[test]
+    fn into_sql_owned_string_and_ref() {
+        let owned = String::from("abc");
+        assert_eq!(
+            (&owned).into_sql(),
+            ColumnData::String(Some(Cow::from("abc")))
+        );
+        assert_eq!(
+            Some(&owned).into_sql(),
+            ColumnData::String(Some(Cow::from("abc")))
+        );
+        assert_eq!(None::<&String>.into_sql(), ColumnData::String(None));
+    }
+
+    #[test]
+    fn into_sql_binary_option_variants() {
+        assert_eq!(None::<&[u8]>.into_sql(), ColumnData::Binary(None));
+
+        let bytes = vec![1u8, 2, 3];
+        assert_eq!(
+            Some(bytes.as_slice()).into_sql(),
+            ColumnData::Binary(Some(Cow::from(bytes.as_slice())))
+        );
+        assert_eq!(None::<&Vec<u8>>.into_sql(), ColumnData::Binary(None));
+        assert_eq!(
+            bytes.into_sql(),
+            ColumnData::Binary(Some(Cow::from(vec![1, 2, 3])))
+        );
+    }
+
+    #[test]
+    fn into_sql_cow_variants() {
+        let cow_str: Cow<'_, str> = Cow::Borrowed("hi");
+        assert_eq!(
+            cow_str.into_sql(),
+            ColumnData::String(Some(Cow::from("hi")))
+        );
+        assert_eq!(
+            Some(Cow::Borrowed("hi")).into_sql(),
+            ColumnData::String(Some(Cow::from("hi")))
+        );
+        assert_eq!(None::<Cow<'_, str>>.into_sql(), ColumnData::String(None));
+
+        let cow_bin: Cow<'_, [u8]> = Cow::Borrowed(&[1u8, 2][..]);
+        assert_eq!(
+            cow_bin.into_sql(),
+            ColumnData::Binary(Some(Cow::from(vec![1u8, 2])))
+        );
+        assert_eq!(
+            Some(Cow::<[u8]>::Borrowed(&[1u8, 2][..])).into_sql(),
+            ColumnData::Binary(Some(Cow::from(vec![1u8, 2])))
+        );
+        assert_eq!(None::<Cow<'_, [u8]>>.into_sql(), ColumnData::Binary(None));
+    }
+
+    #[test]
+    fn into_sql_xml_and_numeric() {
+        let xml = XmlData::new("<a/>".to_string());
+        assert_eq!(
+            (&xml).into_sql(),
+            ColumnData::Xml(Some(Cow::Borrowed(&xml)))
+        );
+        assert_eq!(
+            Some(&xml).into_sql(),
+            ColumnData::Xml(Some(Cow::Borrowed(&xml)))
+        );
+        assert_eq!(None::<&XmlData>.into_sql(), ColumnData::Xml(None));
+
+        let xml_owned = XmlData::new("<b/>".to_string());
+        assert_eq!(
+            xml_owned.clone().into_sql(),
+            ColumnData::Xml(Some(Cow::Owned(xml_owned)))
+        );
+
+        let n = Numeric::new_with_scale(42, 0);
+        assert_eq!(n.into_sql(), ColumnData::Numeric(Some(n)));
+    }
+
+    #[test]
+    // The `&value` borrows are intentional: they exercise the `ToSql for &T`
+    // impls for the base scalar types, so the borrow is not needless.
+    #[allow(clippy::needless_borrow)]
+    fn to_sql_by_reference_scalars() {
+        // The macro-generated impls also cover `&T` for the base scalar types.
+        assert_eq!((&true).to_sql(), ColumnData::Bit(Some(true)));
+        assert_eq!((&8u8).to_sql(), ColumnData::U8(Some(8)));
+        assert_eq!((&16i16).to_sql(), ColumnData::I16(Some(16)));
+        assert_eq!((&64i64).to_sql(), ColumnData::I64(Some(64)));
+        assert_eq!((&1.5f32).to_sql(), ColumnData::F32(Some(1.5)));
+        assert_eq!((&2.5f64).to_sql(), ColumnData::F64(Some(2.5)));
+    }
+
+    #[test]
+    fn to_sql_cow_variants() {
+        let cow_str: Cow<'_, str> = Cow::Borrowed("hi");
+        assert_eq!(cow_str.to_sql(), ColumnData::String(Some(Cow::from("hi"))));
+
+        let cow_bin: Cow<'_, [u8]> = Cow::Borrowed(&[1u8, 2][..]);
+        assert_eq!(
+            cow_bin.to_sql(),
+            ColumnData::Binary(Some(Cow::from(vec![1u8, 2])))
+        );
+    }
+
+    #[test]
+    fn to_sql_xml() {
+        let xml = XmlData::new("<a/>".to_string());
+        assert_eq!(xml.to_sql(), ColumnData::Xml(Some(Cow::Borrowed(&xml))));
+    }
+}
