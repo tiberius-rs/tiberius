@@ -24,7 +24,7 @@ static CONN_STR: Lazy<String> = Lazy::new(|| {
 
 thread_local! {
     static NAMES: RefCell<Option<Generator<'static>>> =
-    RefCell::new(None);
+        const { RefCell::new(None) };
 }
 
 async fn random_table() -> String {
@@ -1779,7 +1779,7 @@ async fn numeric_type_u64_presentation<S>(mut conn: tiberius::Client<S>) -> Resu
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let num = Numeric::new_with_scale(std::i32::MAX as i128 + 10, 1);
+    let num = Numeric::new_with_scale(i32::MAX as i128 + 10, 1);
 
     let row = conn
         .query("SELECT @P1", &[&num])
@@ -1798,7 +1798,7 @@ async fn numeric_type_u96_presentation<S>(mut conn: tiberius::Client<S>) -> Resu
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let num = Numeric::new_with_scale(std::i64::MAX as i128, 19);
+    let num = Numeric::new_with_scale(i64::MAX as i128, 19);
 
     let row = conn
         .query("SELECT @P1", &[&num])
@@ -1817,7 +1817,7 @@ async fn numeric_type_u128_presentation<S>(mut conn: tiberius::Client<S>) -> Res
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let num = Numeric::new_with_scale(std::i64::MAX as i128, 37);
+    let num = Numeric::new_with_scale(i64::MAX as i128, 37);
 
     let row = conn
         .query("SELECT @P1", &[&num])
