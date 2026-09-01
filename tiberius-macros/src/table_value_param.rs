@@ -3,17 +3,21 @@ use syn::punctuated::Punctuated;
 
 use crate::attr::FieldAttr;
 
-pub(crate) fn for_struct(ast: &syn::DeriveInput, fields: &syn::Fields) -> TokenStream {
+pub(crate) fn for_struct(ast: &syn::DeriveInput, fields: &syn::Fields) -> syn::Result<TokenStream> {
     match *fields {
         syn::Fields::Named(ref fields) => table_value_param_impl(ast, Some(&fields.named)),
-        _ => panic!("Only named fields are supported so far"),
+        _ => Err(syn::Error::new_spanned(
+            &ast.ident,
+            "TableValueRow can only be derived for structs with named fields \
+             (tuple and unit structs are not supported)",
+        )),
     }
 }
 
 fn table_value_param_impl(
     ast: &syn::DeriveInput,
     fields: Option<&Punctuated<syn::Field, Token![,]>>,
-) -> TokenStream {
+) -> syn::Result<TokenStream> {
     let name = &ast.ident;
     let (lt_impl, lt_struct) = {
         let mut lifetimes: Vec<&syn::Ident> = Vec::new();
@@ -23,14 +27,17 @@ fn table_value_param_impl(
             }
         }
         if lifetimes.len() > 1 {
-            panic!(
-                "Only one lifetime specifier is supported for the structure. Found multiple: {}",
-                lifetimes
-                    .iter()
-                    .map(|lt| lt.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            return Err(syn::Error::new_spanned(
+                &ast.generics,
+                format!(
+                    "TableValueRow supports at most one lifetime parameter, found: {}",
+                    lifetimes
+                        .iter()
+                        .map(|lt| lt.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
         }
         if lifetimes.is_empty() {
             (sp_quote!(<'query>), sp_quote!())
@@ -41,14 +48,18 @@ fn table_value_param_impl(
         }
     };
     let empty = Default::default();
-    let fields: Vec<_> = fields.unwrap_or(&empty).iter().map(FieldExt::new).collect();
+    let fields: Vec<_> = fields
+        .unwrap_or(&empty)
+        .iter()
+        .map(FieldExt::new)
+        .collect::<syn::Result<_>>()?;
     let col_names: Vec<_> = fields.iter().map(|f| f.get_col_name()).collect();
     // Column names are not needed for stored procedures, but will be required
     // once TVPs are supported for ad-hoc queries.
     let _col_names = sp_quote!( #(#col_names),* );
     let col_binds: Vec<_> = fields.iter().map(|f| f.as_bind()).collect();
     let col_binds = sp_quote!( #(#col_binds);*);
-    sp_quote! {
+    Ok(sp_quote! {
         impl #lt_impl tiberius::TableValueRow #lt_impl for #name #lt_struct {
             fn get_db_type() -> &'static str {
                 stringify!{ #name }
@@ -58,7 +69,7 @@ fn table_value_param_impl(
                 #col_binds;
             }
         }
-    }
+    })
 }
 
 struct FieldExt {
@@ -67,14 +78,16 @@ struct FieldExt {
 }
 
 impl FieldExt {
-    pub fn new(field: &syn::Field) -> FieldExt {
-        if let Some(ident) = field.ident.clone() {
-            FieldExt {
+    pub fn new(field: &syn::Field) -> syn::Result<FieldExt> {
+        match field.ident.clone() {
+            Some(ident) => Ok(FieldExt {
                 attr: FieldAttr::parse(&field.attrs),
                 ident,
-            }
-        } else {
-            panic!("Field ident is required");
+            }),
+            None => Err(syn::Error::new_spanned(
+                field,
+                "TableValueRow fields must be named",
+            )),
         }
     }
     pub(crate) fn get_col_name(&self) -> String {
@@ -112,7 +125,7 @@ mod tests {
         .unwrap();
         let result = match ast.data {
             syn::Data::Enum(_) => panic!("n/a for enums, makes sense for structs only"),
-            syn::Data::Struct(ref s) => for_struct(&ast, &s.fields),
+            syn::Data::Struct(ref s) => for_struct(&ast, &s.fields).unwrap(),
             syn::Data::Union(_) => panic!("doesn't work with unions"),
         };
         let etalon = sp_quote!(
@@ -146,7 +159,7 @@ mod tests {
         .unwrap();
         let result = match ast.data {
             syn::Data::Enum(_) => panic!("n/a for enums, makes sense for structs only"),
-            syn::Data::Struct(ref s) => for_struct(&ast, &s.fields),
+            syn::Data::Struct(ref s) => for_struct(&ast, &s.fields).unwrap(),
             syn::Data::Union(_) => panic!("doesn't work with unions"),
         };
 
