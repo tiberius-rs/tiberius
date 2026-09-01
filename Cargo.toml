@@ -8,21 +8,8 @@ authors = [
 description = "A TDS (MSSQL) driver"
 documentation = "https://docs.rs/tiberius/"
 edition = "2021"
-keywords = ["tds", "mssql", "sql", "sqlserver", "database"]
-categories = ["database"]
-license = "MIT OR Apache-2.0"
-name = "tiberius-ng"
-readme = "README.md"
-repository = "https://github.com/MattJackson/tiberius-ng"
-homepage = "https://github.com/MattJackson/tiberius-ng"
-rust-version = "1.88"
-version = "0.13.0"
-
-# The published package is `tiberius-ng` (the crates.io name `tiberius` is owned
-# by the original, now-unmaintained project). The library name stays `tiberius`
-# so downstream code keeps `use tiberius::...` — only the Cargo.toml dependency
-# line changes:  tiberius = { package = "tiberius-ng", version = "0.13" }
-[lib]
+keywords = ["tds", "mssql", "sql"]
+license = "MIT/Apache-2.0"
 name = "tiberius"
 readme = "README.md"
 repository = "https://github.com/prisma/tiberius"
@@ -49,6 +36,11 @@ path = "tests/named-instance-smol.rs"
 name = "named-instance-smol"
 required-features = ["sql-browser-smol"]
 
+[[test]]
+path = "tests/serde.rs"
+name = "serde"
+required-features = ["serde"]
+
 [[example]]
 name = "named-pipes"
 path = "examples/named-pipes.rs"
@@ -73,7 +65,7 @@ zeroize = "1.8.2"
 winauth = { version = "0.0.5", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libgssapi = { version = "0.8.1", optional = true, default-features = false }
+libgssapi = { version = "0.11", optional = true, default-features = false }
 sspi = { version = "0.18", optional = true }
 libc = "0.2"
 
@@ -182,6 +174,7 @@ path = "./runtimes-macro"
 
 [dependencies.tiberius-macros]
 path = "./tiberius-macros"
+version = "0.1.0"
 
 [dev-dependencies]
 names = "0.14"

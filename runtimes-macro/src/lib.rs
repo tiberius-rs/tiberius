@@ -1,4 +1,4 @@
-//! Internal test-only proc-macro for tiberius-ng.
+//! Internal test-only proc-macro for tiberius.
 //!
 //! `#[test_on_runtimes]` takes an `async fn(client) -> Result<()>` and generates
 //! one integration test per supported async runtime, so every test proves the
