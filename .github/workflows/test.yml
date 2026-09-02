@@ -77,7 +77,16 @@ jobs:
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@cargo-semver-checks
       - name: Check for semver-breaking changes
-        run: cargo semver-checks --baseline-rev "origin/${{ github.base_ref }}"
+        # Scope to one coherent, non-conflicting feature set. Checking all
+        # features at once enables the mutually-exclusive TLS backends
+        # (native-tls + rustls + vendored-openssl) together, whose duplicate
+        # `TlsStream` definitions make rustdoc fail to build (E0428). These are
+        # also the crate's original features, so they exist in every baseline
+        # slice this PR is compared against.
+        run: >-
+          cargo semver-checks --baseline-rev "origin/${{ github.base_ref }}"
+          --no-default-features
+          --features rustls,chrono,time,tds73,rust_decimal,bigdecimal
 
   smoke:
     name: integration smoke (SQL 2022)
