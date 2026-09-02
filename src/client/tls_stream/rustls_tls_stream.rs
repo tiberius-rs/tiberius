@@ -19,7 +19,7 @@ use tokio_rustls::{
             danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
             WantsClientCert,
         },
-        crypto::aws_lc_rs,
+        crypto::{aws_lc_rs, CryptoProvider},
         pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime},
         ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore,
         SignatureScheme, WantsVerifier,
@@ -106,8 +106,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
     pub(super) async fn new(config: &Config, stream: S) -> crate::Result<Self> {
         event!(Level::DEBUG, "Performing a TLS handshake");
 
-        // Negotiate TLS 1.2 or 1.3.
-        let builder = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        // Honor a process-wide CryptoProvider if the application installed one
+        // (via `CryptoProvider::install_default`), otherwise fall back to
+        // aws-lc-rs. This lets callers choose their own backend (e.g. ring or a
+        // FIPS provider) instead of being forced onto aws-lc-rs.
+        let provider = CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(aws_lc_rs::default_provider()));
+
+        // Negotiate the best available protocol version (TLS 1.2 or 1.3), the
+        // same policy as upstream's previous `with_safe_defaults()`.
+        let builder = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| crate::Error::Tls(e.to_string()))?;
 
