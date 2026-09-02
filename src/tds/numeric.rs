@@ -29,11 +29,12 @@ impl Numeric {
     /// Creates a new Numeric value.
     ///
     /// # Panic
-    /// It will panic if the scale exceed 37.
+    /// It will panic if the scale exceeds 38.
     pub fn new_with_scale(value: i128, scale: u8) -> Self {
-        // scale cannot exceed 37 since a
-        // max precision of 38 is possible here.
-        assert!(scale < 38);
+        // SQL Server allows a maximum precision of 38, and scale may equal
+        // precision (e.g. `decimal(38, 38)`), so scale 38 is valid; 10^38 still
+        // fits in i128.
+        assert!(scale <= 38);
 
         Numeric { value, scale }
     }
