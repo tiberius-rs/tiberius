@@ -176,14 +176,19 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get install -y openssl libkrb5-dev
       - name: Wait for SQL Server
+        # Authenticated readiness (not just an open port) — see the smoke job.
         run: |
-          for _ in $(seq 1 45); do
-            if (echo > /dev/tcp/localhost/1433) 2>/dev/null; then
-              echo "SQL Server is accepting connections"; exit 0
+          pw='<YourStrong@Passw0rd>'
+          for _ in $(seq 1 60); do
+            if docker run --rm --network host mcr.microsoft.com/mssql-tools \
+                 /opt/mssql-tools/bin/sqlcmd -S localhost,1433 -U SA -P "$pw" -Q "SELECT 1" >/dev/null 2>&1; then
+              echo "SQL Server ready (authenticated login succeeded)"; exit 0
             fi
-            sleep 2
+            sleep 3
           done
-          echo "SQL Server did not become ready in time" >&2; exit 1
+          echo "SQL Server did not accept an authenticated login in time" >&2
+          docker compose -f docker-compose.yml logs mssql-2025 || true
+          exit 1
       - name: Run tests
         run: cargo test --features=all
 
