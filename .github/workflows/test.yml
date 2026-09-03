@@ -76,6 +76,11 @@ jobs:
         run: sudo apt-get install -y openssl libkrb5-dev
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@cargo-semver-checks
+      - name: Fetch baseline branch
+        # `actions/checkout` leaves the PR base branch without a local ref, so
+        # `--baseline-rev origin/<base>` can't be resolved; fetch it explicitly
+        # and compare against FETCH_HEAD.
+        run: git fetch --no-tags --depth=100 origin "${{ github.base_ref }}"
       - name: Check for semver-breaking changes
         # Scope to one coherent, non-conflicting feature set. Checking all
         # features at once enables the mutually-exclusive TLS backends
@@ -84,8 +89,8 @@ jobs:
         # also the crate's original features, so they exist in every baseline
         # slice this PR is compared against.
         run: >-
-          cargo semver-checks --baseline-rev "origin/${{ github.base_ref }}"
-          --no-default-features
+          cargo semver-checks --baseline-rev FETCH_HEAD
+          --only-explicit-features
           --features rustls,chrono,time,tds73,rust_decimal,bigdecimal
 
   smoke:
