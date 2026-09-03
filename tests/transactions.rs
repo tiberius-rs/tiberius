@@ -1,7 +1,6 @@
 //! Integration tests for the Transaction Manager requests (begin / commit /
 //! rollback, and explicit isolation levels). These exercise the client-side
-//! transaction API against a live SQL Server; they run in CI against the same
-//! `mssql-2022` service the other integration tests use.
+//! transaction API against a live SQL Server.
 
 use futures_util::io::{AsyncRead, AsyncWrite};
 use names::{Generator, Name};
@@ -59,8 +58,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let table = random_table().await;
-    // Create the table outside the transaction so a rollback in a later test
-    // cannot undo its existence.
+    // Create the table before BEGIN so it isn't part of the transaction under test.
     conn.execute(format!("CREATE TABLE ##{} (id int)", table), &[])
         .await?;
 
@@ -85,7 +83,6 @@ where
     let table = random_table().await;
     conn.execute(format!("CREATE TABLE ##{} (id int)", table), &[])
         .await?;
-    // One row committed before the transaction.
     conn.execute(
         format!("INSERT INTO ##{} (id) VALUES (@P1)", table),
         &[&1i32],
@@ -100,7 +97,6 @@ where
     .await?;
     conn.rollback_transaction().await?;
 
-    // Only the pre-transaction row survives.
     assert_eq!(1, row_count(&mut conn, &table).await?);
 
     Ok(())
@@ -156,7 +152,6 @@ where
     .await?;
     conn.rollback_transaction().await?;
 
-    // The connection is reusable for a fresh transaction after a rollback.
     conn.begin_transaction().await?;
     conn.execute(
         format!("INSERT INTO ##{} (id) VALUES (@P1)", table),
