@@ -23,7 +23,7 @@ impl ActivityId {
     /// activity [`Uuid`] and a monotonically increasing sequence number. The
     /// value is emitted in the PRELOGIN packet so a server administrator can
     /// correlate the connection in server-side traces.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(id: Uuid, sequence: u32) -> Self {
         Self { id, sequence }
     }

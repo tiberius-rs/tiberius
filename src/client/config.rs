@@ -481,7 +481,7 @@ impl Config {
     /// |`TrustServerCertificateCA`|`<path>`|Path to a `pem`, `crt` or `der` certificate file. Cannot be used together with `TrustServerCertificate`|
     /// |`encrypt`|`strict`,`true`,`false`,`yes`,`no`,`DANGER_PLAINTEXT`|Specifies whether the driver uses TLS to encrypt communication. `strict` (TDS 8.0) requires the `tds80` feature.|
     /// |`Application Name`, `ApplicationName`|`<string>`|Sets the application name for the connection.|
-    /// |`HostNameInCertificate`, `HostName In Certificate`|`<string>`|The hostname the server certificate is validated against. Defaults to `server`.|
+    /// |`HostNameInCertificate`, `HostName In Certificate`|`<string>`|The hostname the server certificate is validated against. Defaults to the value of the `Server` keyword (host).|
     /// |`WorkstationID`, `Workstation ID`|`<string>`|The client / workstation name reported to the server.|
     /// |`MultiSubnetFailover`|`true`,`false`,`yes`,`no`|When enabled, connections are attempted in parallel to all IP addresses the server resolves to, and the first to succeed is used.|
     ///
