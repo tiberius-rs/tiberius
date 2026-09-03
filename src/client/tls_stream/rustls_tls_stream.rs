@@ -74,10 +74,7 @@ impl ServerCertVerifier for NoCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        // The signature schemes rustls' built-in verifier accepts (RSA PKCS#1 +
-        // PSS, ECDSA P-256/384/521, Ed25519/Ed448). Verification is stubbed to
-        // always succeed under TrustAll, so this only advertises what the peer
-        // may use; keep it in sync with the provider's capabilities.
+        // Advertised only; TrustAll stubs verification to always succeed.
         vec![
             SignatureScheme::RSA_PKCS1_SHA256,
             SignatureScheme::RSA_PKCS1_SHA384,
@@ -221,8 +218,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
 
 /// Resolve the rustls `CryptoProvider`: honour a process-installed default
 /// (`CryptoProvider::install_default`) if present, otherwise fall back to
-/// aws-lc-rs. Taking `installed` as a parameter keeps the branch selection pure
-/// and unit-testable without touching the process-global provider slot.
+/// aws-lc-rs.
 fn resolve_crypto_provider(installed: Option<Arc<CryptoProvider>>) -> Arc<CryptoProvider> {
     match installed {
         Some(provider) => {
@@ -276,11 +272,7 @@ fn read_cert_chain(path: &Path) -> crate::Result<Vec<CertificateDer<'static>>> {
 }
 
 /// Load the OS trust store's certificates into `roots`, returning
-/// `(added, had_load_errors)`. Per-cert parse failures and load errors are
-/// logged, never fatal — the *caller* decides policy: the CA-augment path treats
-/// this as best-effort (an empty/unreadable store still leaves the explicit CA),
-/// while `with_native_roots` (the default-trust path) hard-fails on an empty
-/// result.
+/// `(added, had_load_errors)`.
 fn load_native_roots_into(roots: &mut RootCertStore) -> (usize, bool) {
     let native = rustls_native_certs::load_native_certs();
     let had_load_errors = !native.errors.is_empty();
@@ -406,8 +398,6 @@ impl ConfigBuilderExt for ConfigBuilder<ClientConfig, WantsVerifier> {
     fn with_native_roots(self) -> crate::Result<ConfigBuilder<ClientConfig, WantsClientCert>> {
         // The default trust path relies solely on the OS store, so — unlike the
         // best-effort CA-augment path — an empty result is fatal (fail closed).
-        // Surfacing a catchable error here replaced earlier `.expect()`/`assert!`
-        // panics.
         let mut roots = RootCertStore::empty();
         let (added, had_load_errors) = load_native_roots_into(&mut roots);
         event!(Level::TRACE, "with_native_roots added {added} certs");
@@ -547,12 +537,7 @@ mod tests {
 
         let store = build_ca_trust_store(certs, Path::new("docker/certs/customCA.crt")).unwrap();
 
-        // The custom CA is ADDED to the system roots, not replacing them — the
-        // exact regression (RootCertStore::empty + only the custom CA) this fix
-        // closes. Asserted unconditionally (never skipped): on a host with a
-        // trust store this catches a replace-instead-of-augment regression; when
-        // `native == 0` the two are inherently indistinguishable but the check
-        // still runs and pins the `native + 1` invariant.
+        // Custom CA must augment, not replace, the system roots (native + 1).
         assert_eq!(
             store.len(),
             native + 1,
