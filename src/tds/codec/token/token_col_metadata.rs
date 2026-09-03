@@ -227,8 +227,7 @@ impl BaseMetaDataColumn {
                 VarLenType::Xml => ColumnData::Xml(None),
                 // A null CLR UDT carries no payload; surface it as a null
                 // binary, matching `udt::decode` (which yields
-                // `ColumnData::Binary`). Previously this panicked via `todo!()`,
-                // which a bulk insert of a NULL UDT column could reach.
+                // `ColumnData::Binary`).
                 VarLenType::Udt => ColumnData::Binary(None),
                 VarLenType::Text => ColumnData::String(None),
                 VarLenType::Image => ColumnData::Binary(None),
@@ -263,8 +262,7 @@ impl BaseMetaDataColumn {
                 VarLenType::Xml => ColumnData::Xml(None),
                 // A null CLR UDT carries no payload; surface it as a null
                 // binary, matching `udt::decode` (which yields
-                // `ColumnData::Binary`). Previously this panicked via `todo!()`,
-                // which a bulk insert of a NULL UDT column could reach.
+                // `ColumnData::Binary`).
                 VarLenType::Udt => ColumnData::Binary(None),
                 VarLenType::Text => ColumnData::String(None),
                 VarLenType::Image => ColumnData::Binary(None),
@@ -329,7 +327,7 @@ impl Encode<BytesMut> for BaseMetaDataColumn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnFlag {
     /// The column can be null.
-    Nullable = 1,
+    Nullable = 1 << 0,
     /// Set for string columns with binary collation and always for the XML data
     /// type.
     CaseSensitive = 1 << 1,
