@@ -232,7 +232,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             offset = end;
         }
 
-        (&mut *self.transport).flush().await?;
+        self.transport.flush().await?;
 
         Ok(())
     }

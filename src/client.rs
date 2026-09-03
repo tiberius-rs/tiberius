@@ -255,8 +255,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// rows to a specified table. Note: make sure the input row follows the same
     /// schema as the table, otherwise calling `send()` will return an error.
     ///
-    /// This is equivalent to calling `bulk_insert("table_name", &["*"])` to merge
-    /// all of a tables columns.
+    /// This is equivalent to `bulk_insert_columns(table, &["*"])`, inserting into
+    /// all of a table's columns.
     ///
     /// # Example
     ///
