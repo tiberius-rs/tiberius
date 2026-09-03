@@ -100,8 +100,7 @@ mod tests {
     #[tokio::test]
     async fn decode_reads_full_four_byte_line_number_on_tds72_plus() {
         // The default test context reports SqlServerN (>= TDS 7.2), so the
-        // LineNumber must be read as a 4-byte LONG. A `>` mutation of the `>=`
-        // boundary check would read only 2 bytes. 0x0001_0001 (65537) reads as 1
+        // LineNumber must be read as a 4-byte LONG. 0x0001_0001 (65537) reads as 1
         // when truncated to 2 bytes but as 65537 when read correctly as 4 bytes.
         let mut buf = BytesMut::new();
         buf.put_u16_le(0); // length, ignored

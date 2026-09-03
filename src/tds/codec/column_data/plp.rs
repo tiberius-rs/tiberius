@@ -90,13 +90,8 @@ mod tests {
     use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
     use bytes::{BufMut, BytesMut};
 
-    // The `len` argument selects the wire layout: `len < 0xffff` means a plain
-    // `u16`-prefixed value, otherwise a `u64`-prefixed chunked (PLP) value. At
-    // the boundary `len == 0xffff` the real code takes the chunked branch
-    // (reads a `u64` length). Mutating `<` to `<=` would take the fixed branch
-    // (reads a `u16` length) and produce a different value. We feed a chunked
-    // stream that decodes to [0xAA, 0xBB, 0xCC]; under the `<=` mutant the same
-    // bytes are misread as a `u16` length of 5 followed by five zero bytes.
+    // At the boundary `len == 0xffff` the decoder takes the chunked (PLP) branch,
+    // reading a `u64` length; the chunked stream decodes to [0xAA, 0xBB, 0xCC].
     #[tokio::test]
     async fn decode_boundary_len_uses_chunked_branch() {
         let mut buf = BytesMut::new();
@@ -112,11 +107,8 @@ mod tests {
     }
 
     // A chunk whose running total strictly exceeds `MAX_PLP_SIZE` must be
-    // rejected with the "exceeds the maximum" protocol error *before* any chunk
-    // data is read. Mutating `>` to `==` would let a strictly-greater total slip
-    // past the guard (the `==` only fires at the exact boundary), so instead of
-    // the protocol error the decoder would try to read a ~4 GiB chunk and fail
-    // with an unrelated read error.
+    // rejected with the "exceeds the maximum" protocol error before any chunk
+    // data is read.
     #[tokio::test]
     async fn decode_oversized_chunk_is_rejected() {
         let mut buf = BytesMut::new();

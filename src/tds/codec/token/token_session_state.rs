@@ -213,10 +213,7 @@ mod tests {
     #[test]
     fn parse_rejects_state_len_exceeding_remaining() {
         // StateLen (5) is larger than the bytes actually remaining after the
-        // header (3), so it must be rejected as a protocol error. This exercises
-        // `remaining = total - position`: a `-`->`+` mutation would compute a
-        // much larger "remaining" and wrongly accept the length (then fail later
-        // with an I/O error instead).
+        // header (3), so it must be rejected as a protocol error.
         let mut body = Vec::new();
         body.extend_from_slice(&1u32.to_le_bytes()); // SeqNo
         body.push(0x00); // Status
@@ -234,8 +231,7 @@ mod tests {
         use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
         use bytes::{BufMut, BytesMut};
 
-        // len == 5: exactly SeqNo + Status, no states. The `bytes.len() < 5`
-        // check must NOT reject this boundary (kills `<`->`<=`/`==`).
+        // len == 5: exactly SeqNo + Status, no states. This boundary must decode.
         let mut buf = BytesMut::new();
         buf.put_u32_le(5);
         buf.put_u32_le(1); // SeqNo
@@ -248,8 +244,7 @@ mod tests {
         assert_eq!(token.status, 0x01);
         assert!(token.states.is_empty());
 
-        // len == 8: a full token with one state value. Must decode fine (kills
-        // `<`->`>`, which would reject lengths above 5).
+        // len == 8: a full token with one state value. Must decode fine.
         let mut buf = BytesMut::new();
         buf.put_u32_le(8);
         buf.put_u32_le(2); // SeqNo
@@ -273,8 +268,7 @@ mod tests {
         use bytes::{BufMut, BytesMut};
 
         // len == MAX_TOKEN_BODY + 1: over the cap, so a protocol error is
-        // returned immediately (kills `>`->`<`/`==`, which would not trip here
-        // and would instead fail later with an I/O error).
+        // returned immediately.
         let mut buf = BytesMut::new();
         buf.put_u32_le((super::super::MAX_TOKEN_BODY + 1) as u32);
         buf.put_u32_le(0); // a few bytes so the read gets that far
@@ -285,8 +279,7 @@ mod tests {
         assert!(matches!(err, Error::Protocol(_)));
 
         // len == MAX_TOKEN_BODY exactly: at the boundary the length check must
-        // NOT fire (kills `>`->`>=`). The buffer is truncated, so the real code
-        // proceeds past the check and fails with an I/O error instead.
+        // NOT fire. The buffer is truncated, so decoding fails with an I/O error.
         let mut buf = BytesMut::new();
         buf.put_u32_le(super::super::MAX_TOKEN_BODY as u32);
         buf.put_u32_le(0); // far fewer than MAX bytes follow

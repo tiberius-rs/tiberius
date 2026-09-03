@@ -112,8 +112,7 @@ impl Numeric {
 
             // `byteorder::LittleEndian` already yields the correct host-native
             // integer regardless of target endianness, so `low_part`/`high_part`
-            // need no further swapping (a previous `cfg(target_endian = "big")`
-            // swap here corrupted large decimals on big-endian hosts).
+            // need no further swapping.
             let high_part = high_part * (u64::MAX as u128 + 1);
             low_part + high_part
         }

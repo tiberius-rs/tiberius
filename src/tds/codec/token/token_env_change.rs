@@ -340,7 +340,7 @@ mod tests {
             .unwrap();
 
         match decoded {
-            TokenEnvChange::Database(new, old) => {
+            TokenEnvChange::Database { new, old } => {
                 assert_eq!(new, "newdb");
                 assert_eq!(old, "olddb");
             }
@@ -360,7 +360,7 @@ mod tests {
             .unwrap();
 
         match decoded {
-            TokenEnvChange::PacketSize(new, old) => {
+            TokenEnvChange::PacketSize { new, old } => {
                 assert_eq!(new, 8192);
                 assert_eq!(old, 4096);
             }

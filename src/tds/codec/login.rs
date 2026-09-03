@@ -39,7 +39,7 @@ impl FeatureLevel {
 pub enum OptionFlag1 {
     /// The byte order used by client for numeric and datetime data types.
     /// (default: little-endian)
-    BigEndian = 1, // bit 0 (literal 1: `1 << 0` is shift-invariant)
+    BigEndian = 1 << 0,
     /// The character set used on the client. (default: ASCII)
     CharsetEBDDIC = 1 << 1,
     /// Use VAX floating point representation. (default: IEEE 754)
@@ -68,7 +68,7 @@ pub enum OptionFlag1 {
 pub enum OptionFlag2 {
     /// Set if the change to initial language needs to succeed if the connect is
     /// to succeed.
-    InitLangFatal = 1, // bit 0 (literal 1: `1 << 0` is shift-invariant)
+    InitLangFatal = 1 << 0,
     /// Set if the client is the ODBC driver. This causes the server to set
     /// `ANSI_DEFAULTS=ON`, `CURSOR_CLOSE_ON_COMMIT`, `IMPLICIT_TRANSACTIONS=OFF`,
     /// `TEXTSIZE=0x7FFFFFFF` (2GB) (TDS 7.2 and earlier) `TEXTSIZE` to infinite
@@ -93,7 +93,7 @@ pub enum OptionFlag2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptionFlag3 {
     /// Request to change login's password.
-    RequestChangePassword = 1, // bit 0 (literal 1: `1 << 0` is shift-invariant)
+    RequestChangePassword = 1 << 0,
     /// XML data type instances are returned as binary XML.
     BinaryXML = 1 << 1,
     /// Client is requesting separate process to be spawned as user instance.
@@ -112,7 +112,7 @@ pub enum OptionFlag3 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginTypeFlag {
     /// Use T-SQL syntax.
-    UseTSQL = 1, // bit 0 (literal 1: `1 << 0` is shift-invariant)
+    UseTSQL = 1 << 0,
     /// Set if the client is the OLEDB driver. This causes the server to set
     /// ANSI_DEFAULTS to ON, CURSOR_CLOSE_ON_COMMIT and IMPLICIT_TRANSACTIONS to
     /// OFF, TEXTSIZE to 0x7FFFFFFF (2GB) (TDS 7.2 and earlier), TEXTSIZE to

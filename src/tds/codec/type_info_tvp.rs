@@ -242,6 +242,7 @@ mod tests {
             base: BaseMetaDataColumn {
                 flags: BitFlags::from(ColumnFlag::Nullable),
                 ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                table_name: None,
             },
             col_name: Default::default(),
         }];
@@ -260,6 +261,7 @@ mod tests {
             base: BaseMetaDataColumn {
                 flags: BitFlags::from(ColumnFlag::Nullable),
                 ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+                table_name: None,
             },
             col_name: Default::default(),
         }];

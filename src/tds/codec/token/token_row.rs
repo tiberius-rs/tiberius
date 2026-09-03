@@ -310,9 +310,8 @@ mod tests {
 
     #[test]
     fn row_bitmap_is_null_checks_correct_bit() {
-        // Only bit 3 is set in the single bitmap byte. is_null must consult that
-        // exact bit; a `<<`->`>>` mutation would look at bit -3 (i.e. 0) and
-        // report the wrong columns.
+        // Only bit 3 is set in the single bitmap byte; is_null must consult that
+        // exact bit.
         let bitmap = RowBitmap {
             data: vec![0b0000_1000],
         };
