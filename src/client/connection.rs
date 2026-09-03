@@ -301,7 +301,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let id = self.context.next_packet_id();
         let header = PacketHeader::attention(id);
 
-        // Attention has an empty payload; send just the 8-byte header.
         self.write_to_wire(header, BytesMut::new()).await?;
         self.flush_sink().await?;
 

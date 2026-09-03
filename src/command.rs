@@ -42,7 +42,7 @@ where
 {
     fn into_sql(self) -> SqlTableData<'a> {
         let mut data = Vec::new();
-        for row in self.into_iter() {
+        for row in self {
             let mut data_row = SqlTableDataRow::new();
             row.bind_fields(&mut data_row);
             data.push(data_row);
@@ -258,7 +258,7 @@ impl<'a> Command<'a> {
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let mut rpc_params = Vec::new();
-        for p in cmd_params.into_iter() {
+        for p in cmd_params {
             let rpc_val = match p.data {
                 CommandParamData::Scalar(col) => RpcValue::Scalar(col),
                 CommandParamData::Table(t) => {

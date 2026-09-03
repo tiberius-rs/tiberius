@@ -492,8 +492,7 @@ mod tests {
 
     #[test]
     fn result_index_reflects_the_field() {
-        // A non-zero index pins `result_index()` (a `-> 0` mutant would pass if
-        // every fixture used index 0).
+        // `result_index()` returns the row's stored result index.
         let columns = Arc::new(vec![Column::new("c".to_string(), ColumnType::Int4)]);
         let mut data = TokenRow::new();
         data.push(ColumnData::I32(Some(1)));

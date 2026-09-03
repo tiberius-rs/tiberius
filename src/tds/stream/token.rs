@@ -351,9 +351,7 @@ where
                 TokenType::SessionState => this.get_session_state().await?,
                 TokenType::FedAuthInfo => this.get_fed_auth_info().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
-                // Defensive fallback for any token type without a dedicated
-                // handler. Currently every variant is handled, so this is
-                // unreachable, but it is kept as new token types are added.
+                // Defensive fallback for token types without a dedicated handler.
                 #[allow(unreachable_patterns)]
                 _ => {
                     return Err(Error::Protocol(
