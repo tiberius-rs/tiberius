@@ -1,9 +1,6 @@
 name: Cargo tests
 on:
-  # The integration lanes (macOS/Linux-next/Windows) gate on `workflow_dispatch`
-  # or a push to `qa`; without these triggers declared here they could never
-  # fire. Allow manual dispatch (and qa pushes) so the full integration tier —
-  # now including the colima-backed macOS lane — is actually runnable.
+  # qa + manual dispatch run the integration tier
   push:
     branches:
       - main
@@ -219,28 +216,23 @@ jobs:
     # linux/amd64 SQL Server container inside a colima (Lima) Linux VM. An x86_64
     # runner runs that image natively — no qemu emulation — which keeps the VM
     # fast enough for the full integration suite instead of build + unit only.
-    # (GitHub retired the `macos-13` label; `macos-15-intel` is the current Intel
-    # image. When Intel runners are sunset, move to an arm64 runner + an arm64
-    # SQL image or rosetta-emulated amd64.)
     runs-on: macos-15-intel
-    # A backend flagged soft_fail is allowed to fail without failing the lane.
     continue-on-error: ${{ matrix.soft_fail }}
     strategy:
       fail-fast: false
       matrix:
-        # macOS is now a first-class integration lane, at parity with
-        # Linux/Windows on the qa gate. Exercise every TLS backend:
+        # Exercise every TLS backend:
         include:
-          # rustls — the backend re-enabled for TLS 1.3 in this slice. Required.
+          # rustls (TLS 1.3)
           - features: "--no-default-features --features=rustls,chrono,time,tds73,rust_decimal,bigdecimal"
             soft_fail: false
-          # vendored-openssl (opentls, statically-linked OpenSSL) — cross-platform. Required.
+          # vendored-openssl (opentls, statically-linked OpenSSL) — cross-platform.
           - features: "--no-default-features --features=vendored-openssl,chrono,time,tds73,rust_decimal,bigdecimal"
             soft_fail: false
           # native-tls on macOS resolves to Apple Secure Transport, which cannot
           # complete the SQL Server TLS handshake (it works on Linux=OpenSSL and
           # Windows=SChannel). Run it for visibility but don't red-wall the lane;
-          # tracked as a follow-up. This is the `all` feature set (native-tls).
+          # tracked as a follow-up.
           - features: "--features=all"
             soft_fail: true
     env:
