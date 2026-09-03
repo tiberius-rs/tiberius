@@ -76,18 +76,8 @@ impl<'a> Query<'a> {
         self.params.len()
     }
 
-    /// The largest number of parameters SQL Server accepts in one statement.
-    ///
-    /// A statement carrying more is rejected by the server with
-    /// "The incoming request has too many parameters. The server supports a
-    /// maximum of 2100 parameters." — which arrives only after the whole
-    /// batch has been sent.
-    ///
-    /// This matters most for an `IN` list or a multi-row `INSERT`, where the
-    /// count comes from the length of a collection rather than from the SQL
-    /// text: the limit is reached by data volume, at run time, on a batch
-    /// that may be larger than any that was tested. Split such a batch into
-    /// chunks of at most `MAX_PARAMETERS / parameters_per_row` items.
+    /// The 2100-parameter server-side limit for one statement; split larger
+    /// batches into chunks of at most `MAX_PARAMETERS / parameters_per_row` rows.
     ///
     /// # Example
     ///
@@ -99,17 +89,8 @@ impl<'a> Query<'a> {
     /// ```
     pub const MAX_PARAMETERS: usize = 2100;
 
-    /// Build a `@P1, @P2, …` placeholder list for `count` parameters,
-    /// numbered from `first`.
-    ///
-    /// SQL Server has no array parameter, so an `IN` list must name one
-    /// placeholder per value, and `IN (@P1)` bound to a comma-separated
-    /// string matches nothing rather than failing. Generating the list is
-    /// the only way to write such a query, and this does it without a
-    /// format loop at every call site.
-    ///
-    /// `first` is 1-based, matching the `@P1` numbering
-    /// [`Query::new`] documents.
+    /// Builds `@P1, @P2, …` for `count` placeholders numbered from `first`
+    /// (1-based).
     ///
     /// # Example
     ///
@@ -130,8 +111,6 @@ impl<'a> Query<'a> {
     /// let ids: Vec<i32> = Vec::new();
     /// assert!(Query::placeholders(1, ids.len()).is_empty());
     /// ```
-    ///
-    /// [`Query::new`]: #method.new
     pub fn placeholders(first: usize, count: usize) -> String {
         use std::fmt::Write;
 
@@ -141,7 +120,6 @@ impl<'a> Query<'a> {
             if index > 0 {
                 out.push_str(", ");
             }
-            // Writing into a String cannot fail.
             let _ = write!(out, "@P{}", first + index);
         }
 
@@ -262,15 +240,12 @@ mod tests {
 
     #[test]
     fn placeholders_can_continue_from_an_offset() {
-        // For a query that already binds parameters before the list.
         assert_eq!(Query::placeholders(4, 2), "@P4, @P5");
         assert_eq!(Query::placeholders(10, 1), "@P10");
     }
 
     #[test]
     fn no_placeholders_is_an_empty_string() {
-        // `IN ()` is a syntax error, so a caller with nothing to match on
-        // must skip the query rather than build one.
         assert_eq!(Query::placeholders(1, 0), "");
         assert_eq!(Query::placeholders(7, 0), "");
     }
@@ -303,8 +278,6 @@ mod tests {
 
     #[test]
     fn a_generated_list_matches_the_number_of_bound_parameters() {
-        // The invariant that makes this pair usable: one placeholder per
-        // bound value, or the server rejects the statement.
         let ids = vec![10i32, 20, 30, 40];
         let list = Query::placeholders(1, ids.len());
 
@@ -317,7 +290,6 @@ mod tests {
     #[test]
     fn the_parameter_limit_is_the_documented_tds_maximum() {
         assert_eq!(Query::MAX_PARAMETERS, 2100);
-        // The chunking arithmetic the docs describe.
         assert_eq!(Query::MAX_PARAMETERS / 3, 700);
     }
 }

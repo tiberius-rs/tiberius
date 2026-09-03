@@ -238,9 +238,6 @@ impl<'a> LoginMessage<'a> {
     }
 
     /// Sets the requested TDS packet size.
-    ///
-    /// Valid values are 512 to 32767. The server may negotiate a different size.
-    /// Larger packet sizes can improve bulk insert performance.
     pub fn packet_size(&mut self, size: u32) {
         self.packet_size = size;
     }

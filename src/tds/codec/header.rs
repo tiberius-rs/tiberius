@@ -92,8 +92,7 @@ impl PacketHeader {
         }
     }
 
-    // Only constructed on auth code paths gated behind platform/feature cfgs
-    // (Windows winauth / integrated-auth-gssapi), so it reads as dead on other builds.
+    // Used only on winauth / integrated-auth-gssapi builds.
     #[allow(dead_code)]
     pub fn sspi(id: u8) -> Self {
         Self {
