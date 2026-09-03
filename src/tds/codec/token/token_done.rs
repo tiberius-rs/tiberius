@@ -15,7 +15,7 @@ pub struct TokenDone {
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoneStatus {
-    More = 1, // bit 0 (literal 1: `1 << 0` is shift-invariant)
+    More = 1 << 0,
     Error = 1 << 1,
     Inexact = 1 << 2,
     // reserved
@@ -144,7 +144,7 @@ mod tests {
     #[tokio::test]
     async fn decode_reads_four_byte_rowcount_on_pre_2005_versions() {
         // Pre-2005 servers encode the DONE rowcount in 4 bytes; the decoder must
-        // pick the 4-byte arm from the negotiated version (kills "delete arm 4").
+        // pick the 4-byte arm from the negotiated version.
         use crate::sql_read_bytes::SqlReadBytes;
         use crate::tds::codec::login::FeatureLevel;
 

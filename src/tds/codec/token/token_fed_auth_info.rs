@@ -199,10 +199,7 @@ mod tests {
     #[tokio::test]
     async fn decode_reads_length_prefix_and_parses_body() {
         // Exercises the full `decode` path: reading the 4-byte TokenLength, the
-        // length bound check, reading the body, and parsing it. A mutation that
-        // short-circuits `decode` to `Ok(Default::default())` would drop the
-        // parsed STSURL, and a `<` mutation of the length bound check would
-        // reject this (well-under-maximum) token outright.
+        // length bound check, reading the body, and parsing it into the STSURL.
         use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
         use bytes::{BufMut, BytesMut};
 
@@ -300,10 +297,8 @@ mod tests {
 
     #[tokio::test]
     async fn decode_accepts_token_length_at_maximum() {
-        // The length bound check is `token_length > MAX_TOKEN_BODY`, so a token
-        // whose length is exactly MAX_TOKEN_BODY must be accepted. `>=` or `==`
-        // mutations of the `>` would reject it. The body is a valid, empty
-        // (CountOfInfoIDs == 0) token padded out to the maximum length.
+        // A token whose length is exactly MAX_TOKEN_BODY must be accepted. The
+        // body is a valid, empty (CountOfInfoIDs == 0) token padded to the maximum.
         use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
         use bytes::{BufMut, BytesMut};
 

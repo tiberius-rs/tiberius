@@ -1828,11 +1828,6 @@ mod tests {
         assert!(matches!(err, Error::BulkInput(_)), "got {:?}", err);
     }
 
-    // NOTE: the `ntext(max)` catch-all in type_name is only reached by a string
-    // longer than MAX_NVARCHAR_SIZE (>1 GiB); allocating that in a unit test is
-    // impractical (slow / OOM-prone in CI), so that single line is intentionally
-    // left uncovered.
-
     // ----- decode: line 199 (VarLenSizedPrecision non-numeric -> todo!()) -----
 
     #[tokio::test]

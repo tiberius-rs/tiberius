@@ -236,8 +236,7 @@ impl Decode<BytesMut> for PreloginMessage {
 
             // verify whether the server acts in accordance to what we requested
             // and if we can handle on what we seemingly agreed to
-            // Unrecognized (e.g. newer) pre-login option tokens are skipped;
-            // this is intentional forward-compatibility, not a bug.
+            // Unrecognized pre-login option tokens are rejected as a protocol error.
             match token {
                 // version
                 PRELOGIN_VERSION => {

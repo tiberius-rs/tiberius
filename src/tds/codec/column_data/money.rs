@@ -242,10 +242,7 @@ mod tests {
     use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
     use bytes::{BufMut, BytesMut};
 
-    // `smallmoney` (len 4) is a single scaled `i32` divided by 1e4. Uses a value
-    // that is not a boundary: kills "delete match arm 4" (would fall through to
-    // the error arm) and "replace `/` with `%`/`*`" (12345/1e4 = 1.2345, whereas
-    // 12345 % 1e4 = 2345.0 and 12345 * 1e4 = 1.2345e8).
+    // `smallmoney` (len 4) is a single scaled `i32` divided by 1e4: 12345 -> 1.2345.
     #[tokio::test]
     async fn decode_smallmoney_arm() {
         let mut buf = BytesMut::new();
@@ -260,9 +257,6 @@ mod tests {
 
     // `money` (len 8) is two 32-bit words: `((high << 32) + low) / 1e4`.
     // high = 1, low = 30000 gives ((1 << 32) + 30000) / 1e4 = 429499.7296.
-    // Kills: "delete match arm 8" (error fallthrough); "replace `<<` with `>>`"
-    // (1 >> 32 = 0 => 3.0); "replace `+` with `-`/`*`" (subtraction/mult differ);
-    // and "replace outer `/` with `%`/`*`" (4294997296 % 1e4 = 7296.0).
     #[tokio::test]
     async fn decode_money_arm() {
         let mut buf = BytesMut::new();

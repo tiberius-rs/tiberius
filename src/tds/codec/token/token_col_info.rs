@@ -174,9 +174,7 @@ mod tests {
         assert!(!expr.is_key());
         assert!(!expr.is_hidden());
 
-        // Key-only: is_key true, the others false. (Status 0x08 shares no bits
-        // with STATUS_EXPRESSION 0x04, so `&`->`|`/`^` would wrongly report an
-        // expression here.)
+        // Key-only: is_key true, the others false.
         let key = ColInfo {
             col_num: 1,
             table_num: 0,
@@ -203,9 +201,7 @@ mod tests {
     async fn decode_col_info_advances_consumed_by_name_bytes() {
         // A different-name column (with a multi-character name) followed by a
         // plain column. The `consumed += char_len * 2` update must be exact for
-        // the loop to read *both* columns: `+=`->`*=` would overshoot and stop
-        // after the first column, `*`->`+` would undershoot and run off the end
-        // of the buffer.
+        // the loop to read both columns.
         let mut body = BytesMut::new();
 
         // Column 1: expression + different name "abc" (3 chars => 6 bytes).

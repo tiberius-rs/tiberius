@@ -532,11 +532,8 @@ mod poll_branch_tests {
     fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
         let waker = std::task::Waker::noop();
         let mut cx = TaskContext::from_waker(waker);
-        let mut fut = fut;
-        // Safety: `fut` lives on the stack for the duration of this call and is
-        // never moved after being pinned.
-        let fut = unsafe { Pin::new_unchecked(&mut fut) };
-        fut.poll(&mut cx)
+        let mut fut = std::pin::pin!(fut);
+        fut.as_mut().poll(&mut cx)
     }
 
     // The varchar length read yields `Pending` (no bytes available yet).

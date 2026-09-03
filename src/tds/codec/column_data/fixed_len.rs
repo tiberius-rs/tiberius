@@ -11,9 +11,7 @@ where
         // Wire type 0x1F (MS-TDS 2.2.5.4.1) carries no data and represents a
         // typeless NULL. Surface it as `I32(None)` to match both the NBCROW
         // packed-null path (`BaseMetaDataColumn::null_value`) and the column's
-        // own `Display` ("int"); previously this ROW path returned `Bit(None)`,
-        // so the same `SELECT NULL` column decoded to a different variant
-        // depending on whether the server packed the row.
+        // own `Display` ("int").
         FixedLenType::Null => ColumnData::I32(None),
         FixedLenType::Bit => ColumnData::Bit(Some(src.read_u8().await? != 0)),
         FixedLenType::Int1 => ColumnData::U8(Some(src.read_u8().await?)),
