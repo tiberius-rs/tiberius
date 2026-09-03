@@ -1,5 +1,4 @@
 use futures_util::io::{AsyncRead, AsyncWrite};
-// use futures_util::stream::TryStreamExt;
 use names::{Generator, Name};
 use once_cell::sync::Lazy;
 use std::cell::RefCell;
@@ -10,7 +9,7 @@ use tiberius::{numeric::Numeric, Command, Result, TableValueRow};
 
 use runtimes_macro::test_on_runtimes;
 
-// This is used in the testing macro :)
+// Used by the test_on_runtimes macro.
 #[allow(dead_code)]
 static LOGGER_SETUP: Once = Once::new();
 

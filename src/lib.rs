@@ -283,24 +283,21 @@ mod driver_version_tests {
 
     #[test]
     fn packs_each_component_into_its_own_byte() {
-        // 1 | 2<<8 | 3<<16 = 0x030201
+        // Each component occupies its own byte, low component first.
         assert_eq!(encode_driver_version("1.2.3"), 0x03_02_01);
-        // Distinct values per position pin the shift amounts.
         assert_eq!(encode_driver_version("4.5.6.7"), 0x07_06_05_04);
     }
 
     #[test]
     fn shift_moves_components_left_not_right() {
-        // With `>>` instead of `<<`, `17 >> 8 == 0`, so the minor version would
-        // vanish and the result would collapse to just the major (34).
+        // The minor version is shifted up by 8 bits, not down.
         assert_eq!(encode_driver_version("34.17"), 34 | (17 << 8));
         assert_ne!(encode_driver_version("34.17"), 34);
     }
 
     #[test]
     fn components_are_combined_with_or_not_xor() {
-        // 257 (0x101) in byte 0 shares bit 8 with `1 << 8` (0x100). OR keeps the
-        // bit set (0x101); XOR would clear it (0x001), so this pins `|` vs `^`.
+        // Overlapping bits are combined with OR, not XOR.
         assert_eq!(encode_driver_version("257.1"), 0x101);
     }
 
@@ -312,8 +309,7 @@ mod driver_version_tests {
 
     #[test]
     fn get_driver_version_encodes_the_crate_version() {
-        // Pins the wrapper to the real version so a body-replacement mutant
-        // (e.g. "-> 0" or "-> 1") is caught.
+        // The wrapper encodes the crate's own version and is non-zero.
         assert_eq!(
             super::get_driver_version(),
             encode_driver_version(env!("CARGO_PKG_VERSION"))
