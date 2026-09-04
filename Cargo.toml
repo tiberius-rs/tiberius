@@ -13,19 +13,14 @@ license = "MIT/Apache-2.0"
 name = "tiberius"
 readme = "README.md"
 repository = "https://github.com/prisma/tiberius"
-version = "0.12.3"
+version = "0.13.0"
 
 [workspace]
-members = ["runtimes-macro"]
+members = ["runtimes-macro", "tiberius-macros"]
 
 [[test]]
 path = "tests/query.rs"
 name = "query"
-
-[[test]]
-path = "tests/named-instance-async.rs"
-name = "named-instance-async"
-required-features = ["sql-browser-async-std"]
 
 [[test]]
 path = "tests/named-instance-tokio.rs"
@@ -37,16 +32,20 @@ path = "tests/named-instance-smol.rs"
 name = "named-instance-smol"
 required-features = ["sql-browser-smol"]
 
+[[example]]
+name = "named-pipes"
+path = "examples/named-pipes.rs"
+
 [dependencies]
 enumflags2 = "0.7"
 byteorder = "1.0"
 encoding_rs = "0.8"
 once_cell = "1.3"
-thiserror = "1.0"
+thiserror = "2"
 bytes = "1.0"
-pretty-hex = "0.3"
+pretty-hex = "0.4"
 pin-project-lite = "0.2"
-asynchronous-codec = "0.6"
+asynchronous-codec = "0.7"
 async-trait = "0.1"
 connection-string = "0.2"
 num-traits = "0.2"
@@ -54,14 +53,15 @@ uuid = "1.0"
 zeroize = "1.8.2"
 
 [target.'cfg(windows)'.dependencies]
-winauth = { version = "0.0.4", optional = true }
+winauth = { version = "0.0.5", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libgssapi = { version = "0.8.1", optional = true, default-features = false }
+libgssapi = { version = "0.11", optional = true, default-features = false }
+sspi = { version = "0.18", optional = true }
+libc = "0.2"
 
 [dependencies.async-native-tls]
-version = "0.4"
-features = ["runtime-async-std"]
+version = "0.6"
 optional = true
 
 [dependencies.tokio]
@@ -73,11 +73,6 @@ features = ["net", "time"]
 version = "0.7"
 features = ["compat"]
 optional = true
-
-[dependencies.async-std]
-version = "1"
-optional = true
-features = ["attributes"]
 
 [dependencies.chrono]
 version = "0.4"
@@ -102,20 +97,25 @@ version = "1.6"
 optional = true
 
 [dependencies.bigdecimal_]
-version = "0.3"
+version = "0.4"
 optional = true
 package = "bigdecimal"
 
+[dependencies.serde]
+version = "1.0"
+optional = true
+features = ["derive", "rc"]
+
 [dependencies.async-io]
-version = "1.8"
+version = "2"
 optional = true
 
 [dependencies.async-net]
-version = "1.7"
+version = "2"
 optional = true
 
 [dependencies.futures-lite]
-version = "1.12.0"
+version = "2"
 optional = true
 
 [dependencies.tokio-rustls]
@@ -157,45 +157,59 @@ features = [
 ]
 version = "1.0"
 
-[dev-dependencies.async-std]
-features = ["attributes"]
-version = "1"
+[dev-dependencies.smol]
+version = "2"
 
 [dev-dependencies.runtimes-macro]
 path = "./runtimes-macro"
+
+[dependencies.tiberius-macros]
+path = "./tiberius-macros"
+version = "0.1.0"
 
 [dev-dependencies]
 names = "0.14"
 anyhow = "1"
 env_logger = "0.11"
-azure_identity = "0.20.0"
-url = "2.2.2"
-reqwest = "0.12"
+azure_identity = "1.0"
+azure_core = "1"
+url = "2.5"
+reqwest = "0.13"
 paste = "1.0"
 indicatif = "0.18"
 chrono = "0.4.38"
-indoc = "1.0.7"
+indoc = "2"
+serde_json = "1.0"
 
 [package.metadata.docs.rs]
-features = ["all", "docs"]
+features = ["all"]
+# docs.rs builds on nightly with this cfg set, enabling #[doc(cfg(...))]
+# annotations (feature(doc_cfg)) without requiring nightly for normal builds.
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 
 [features]
 all = [
     "chrono",
     "time",
     "tds73",
-    "sql-browser-async-std",
+    "tds80",
     "sql-browser-tokio",
     "sql-browser-smol",
     "integrated-auth-gssapi",
     "rust_decimal",
     "bigdecimal",
     "native-tls",
+    "serde",
+    "sspi-rs",
 ]
-default = ["tds73", "winauth", "native-tls"]
+default = ["tds80", "winauth", "native-tls"]
 tds73 = []
-docs = []
-sql-browser-async-std = ["async-std"]
+# Enables TDS 8.0 support, including the `Strict` encryption level (TLS before
+# the TDS prelogin, TDS 8.0 "strict" mode). Requires a TLS backend.
+tds80 = ["tds73"]
 sql-browser-tokio = ["tokio", "tokio-util"]
 sql-browser-smol = ["async-io", "async-net", "futures-lite"]
 integrated-auth-gssapi = ["libgssapi"]
@@ -203,3 +217,10 @@ bigdecimal = ["bigdecimal_"]
 rustls = ["tokio-rustls", "tokio-util", "rustls-native-certs", "rustls-webpki"]
 native-tls = ["async-native-tls"]
 vendored-openssl = ["opentls"]
+# Enables Windows-style SSPI/NTLM authentication (`AuthMethod::Windows`) on Unix
+# platforms without requiring Kerberos, via the pure-Rust `sspi` crate. On
+# Windows the same authentication is provided by the `winauth` feature.
+sspi-rs = ["sspi"]
+# Optional serde Serialize/Deserialize impls for query result types
+# (Row, Column, ColumnData, Numeric, ColumnType and time/xml types).
+serde = ["dep:serde", "uuid/serde"]

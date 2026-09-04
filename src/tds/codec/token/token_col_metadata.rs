@@ -4,7 +4,6 @@ use std::{
 };
 
 use crate::{
-    error::Error,
     tds::codec::{Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
     Column, ColumnData, ColumnType, SqlReadBytes,
 };
@@ -17,10 +16,27 @@ pub struct TokenColMetaData<'a> {
     pub columns: Vec<MetaDataColumn<'a>>,
 }
 
+/// Metadata for a single result/table column: its name plus the
+/// [`BaseMetaDataColumn`] describing its type, size and flags.
 #[derive(Debug, Clone)]
 pub struct MetaDataColumn<'a> {
+    /// The type and flag metadata for the column.
     pub base: BaseMetaDataColumn,
+    /// The name of the column.
     pub col_name: Cow<'a, str>,
+}
+
+impl<'a> MetaDataColumn<'a> {
+    /// The name of the column.
+    pub fn col_name(&self) -> &str {
+        self.col_name.as_ref()
+    }
+
+    /// The [`BaseMetaDataColumn`] describing the column's type and flags
+    /// (nullability, identity, etc.).
+    pub fn base(&self) -> &BaseMetaDataColumn {
+        &self.base
+    }
 }
 
 impl<'a> Display for MetaDataColumn<'a> {
@@ -93,6 +109,7 @@ impl<'a> Display for MetaDataColumn<'a> {
                     8 => write!(f, "float")?,
                     _ => unreachable!(),
                 },
+                VarLenType::SSVariant => write!(f, "sql_variant")?,
                 _ => unreachable!(),
             },
             TypeInfo::VarLenSizedPrecision {
@@ -106,19 +123,53 @@ impl<'a> Display for MetaDataColumn<'a> {
                 _ => unreachable!(),
             },
             TypeInfo::Xml { .. } => write!(f, "xml")?,
+            TypeInfo::Udt(info) => write!(f, "{}.{}", info.schema_name, info.type_name)?,
         }
 
         Ok(())
     }
 }
 
+/// Describes the type and flags of a column, exposing metadata such as the
+/// column type (including size, precision and scale), whether the column is
+/// nullable and whether it is an identity column.
 #[derive(Debug, Clone)]
 pub struct BaseMetaDataColumn {
+    /// The set of [`ColumnFlag`]s describing the column (nullability, identity,
+    /// updateability, and so on).
     pub flags: BitFlags<ColumnFlag>,
+    /// The type of the column, including its size, precision and scale where
+    /// applicable.
     pub ty: TypeInfo,
 }
 
 impl BaseMetaDataColumn {
+    /// The type of the column, including its size, precision and scale where
+    /// applicable.
+    pub fn ty(&self) -> &TypeInfo {
+        &self.ty
+    }
+
+    /// The set of flags describing the column.
+    pub fn flags(&self) -> BitFlags<ColumnFlag> {
+        self.flags
+    }
+
+    /// `true` if the column accepts `NULL` values.
+    pub fn is_nullable(&self) -> bool {
+        self.flags.contains(ColumnFlag::Nullable)
+    }
+
+    /// `true` if the column is an identity column.
+    pub fn is_identity(&self) -> bool {
+        self.flags.contains(ColumnFlag::Identity)
+    }
+
+    /// `true` if the column is writeable (e.g. usable as a bulk-insert target).
+    pub fn is_updateable(&self) -> bool {
+        self.flags.contains(ColumnFlag::Updateable)
+    }
+
     pub(crate) fn null_value(&self) -> ColumnData<'static> {
         match &self.ty {
             TypeInfo::FixedLen(ty) => match ty {
@@ -171,7 +222,9 @@ impl BaseMetaDataColumn {
                 VarLenType::Text => ColumnData::String(None),
                 VarLenType::Image => ColumnData::Binary(None),
                 VarLenType::NText => ColumnData::String(None),
-                VarLenType::SSVariant => todo!(),
+                // A null `sql_variant` carries no base type, so surface a
+                // generic null value.
+                VarLenType::SSVariant => ColumnData::String(None),
             },
             TypeInfo::VarLenSizedPrecision { ty, .. } => match ty {
                 VarLenType::Guid => ColumnData::Guid(None),
@@ -201,9 +254,12 @@ impl BaseMetaDataColumn {
                 VarLenType::Text => ColumnData::String(None),
                 VarLenType::Image => ColumnData::Binary(None),
                 VarLenType::NText => ColumnData::String(None),
-                VarLenType::SSVariant => todo!(),
+                // A null `sql_variant` carries no base type, so surface a
+                // generic null value.
+                VarLenType::SSVariant => ColumnData::String(None),
             },
             TypeInfo::Xml { .. } => ColumnData::Xml(None),
+            TypeInfo::Udt(_) => ColumnData::Binary(None),
         }
     }
 }
@@ -265,9 +321,9 @@ pub enum ColumnFlag {
     /// If column is writeable.
     Updateable = 1 << 3,
     /// Column modification status unknown.
-    UpdateableUnknown = 1 << 4,
+    UpdateableUnknown = 1 << 2,
     /// Column is an identity.
-    Identity = 1 << 5,
+    Identity = 1 << 4,
     /// Coulumn is computed.
     Computed = 1 << 7,
     /// Column is a fixed-length common language runtime user-defined type (CLR
@@ -328,8 +384,11 @@ impl BaseMetaDataColumn {
 
         let _user_ty = src.read_u32_le().await?;
 
-        let flags = BitFlags::from_bits(src.read_u16_le().await?)
-            .map_err(|_| Error::Protocol("column metadata: invalid flags".into()))?;
+        // The COLMETADATA `Flags` field (MS-TDS §2.2.7.4) is a 16-bit field that
+        // includes reserved / ODBC bits the server may set and which future
+        // protocol revisions may extend. Truncate to the flags we model rather
+        // than rejecting the whole token on an unrecognized bit.
+        let flags = BitFlags::from_bits_truncate(src.read_u16_le().await?);
 
         let ty = TypeInfo::decode(src).await?;
 

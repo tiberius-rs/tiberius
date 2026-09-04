@@ -54,6 +54,13 @@ impl TokenDone {
         self.status.is_empty()
     }
 
+    /// `true` when the server has set the `DONE_ATTN` status bit, indicating
+    /// this DONE token acknowledges a client Attention signal (MS-TDS
+    /// section 2.2.7.6).
+    pub(crate) fn is_attention(&self) -> bool {
+        self.status.contains(DoneStatus::Attention)
+    }
+
     pub(crate) fn rows(&self) -> u64 {
         self.done_rows
     }

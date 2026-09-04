@@ -9,6 +9,11 @@ uint_enum! {
         /// the server.
         ReturnStatus = 0x79,
 
+        /// Describes the data type, length, and name of column data that
+        /// result from a COMPUTE clause (`ALTMETADATA`). This token describes
+        /// the format of the following `ALTROW` data streams.
+        AltMetaData = 0x88,
+
         /// Describes the result setfor interpretation of following ROW data
         /// streams
         ColMetaData = 0x81,
@@ -24,6 +29,11 @@ uint_enum! {
 
         /// Describes the column information in browse mode.
         ColInfo = 0xA5,
+
+        /// Used to send the table name to the client in browse mode (for
+        /// example `SELECT ... FOR BROWSE`). Paired with the COLINFO token,
+        /// whose entries reference the tables carried here by index.
+        TabName = 0xA4,
 
         /// Used to send the return value of an RPCto the client. When an RPC is
         /// executed, the associated parameters may be defined as input or
@@ -45,8 +55,24 @@ uint_enum! {
         /// COLMETADATA token.
         NbcRow = 0xD2,
 
+        /// Used to send a complete row of computed data, as defined by the
+        /// `ALTMETADATA` token, to the client. This is the row produced by a
+        /// COMPUTE or COMPUTE BY clause.
+        AltRow = 0xD3,
+
         /// The SSPI token returned during the login process.
         Sspi = 0xED,
+
+        /// Used to inform the client about the current session state so the
+        /// session can be transparently recovered after a broken connection
+        /// (connection resiliency). Sent only when session recovery is enabled.
+        SessionState = 0xE4,
+
+        /// Carries the information the client needs to acquire a federated
+        /// authentication (Azure Active Directory) access token, such as the
+        /// Security Token Service URL and the Service Principal Name. Sent by
+        /// the server during a library-driven federated authentication flow.
+        FedAuthInfo = 0xEE,
 
         /// A notification of an environment change (such as database and
         /// language).

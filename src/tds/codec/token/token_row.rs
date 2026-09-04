@@ -9,6 +9,7 @@ pub use into_row::IntoRow;
 
 /// A row of data.
 #[derive(Debug, Default, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TokenRow<'a> {
     data: Vec<ColumnData<'a>>,
 }

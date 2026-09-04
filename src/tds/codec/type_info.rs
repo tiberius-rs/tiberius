@@ -18,20 +18,58 @@ pub enum TypeLength {
 /// Describes a type of a column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeInfo {
+    /// A fixed-length type, whose size is fully determined by the type itself.
     FixedLen(FixedLenType),
+    /// A variable-length type with an explicit size (and optional collation).
     VarLenSized(VarLenContext),
+    /// A variable-length type carrying a precision and scale, such as `decimal`
+    /// and `numeric`.
     VarLenSizedPrecision {
+        /// The underlying variable-length type.
         ty: VarLenType,
+        /// The reserved size of the column in bytes.
         size: usize,
+        /// The total number of digits.
         precision: u8,
+        /// The number of digits to the right of the decimal point.
         scale: u8,
     },
+    /// The `xml` type, with an optional associated schema.
     Xml {
+        /// The XML schema associated with the column, if any.
         schema: Option<Arc<XmlSchema>>,
+        /// The reserved size of the column in bytes.
         size: usize,
     },
+    /// A CLR user-defined type (UDT), MS-TDS §2.2.5.5.4.
+    Udt(UdtInfo),
 }
 
+/// Metadata describing a CLR user-defined type (UDT) column, as defined by the
+/// `UDT_INFO` rule in MS-TDS §2.2.5.5.4.
+///
+/// This carries only the identifying metadata of the type. The value bytes are
+/// surfaced verbatim (see [`ColumnData::Binary`]); tiberius does not attempt to
+/// deserialize the CLR representation.
+///
+/// [`ColumnData::Binary`]: crate::ColumnData::Binary
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdtInfo {
+    /// Maximum size of the UDT value in bytes. A value of `0xFFFF` indicates a
+    /// large (`MAX`) UDT with no fixed upper bound.
+    pub max_byte_size: u16,
+    /// Name of the database in which the UDT is defined.
+    pub db_name: String,
+    /// Name of the schema that owns the UDT.
+    pub schema_name: String,
+    /// Name of the UDT.
+    pub type_name: String,
+    /// Assembly-qualified name of the CLR type that implements the UDT.
+    pub assembly_qualified_name: String,
+}
+
+/// The context of a variable-length column: its underlying type, size and
+/// optional collation.
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub struct VarLenContext {
     r#type: VarLenType,
@@ -40,6 +78,8 @@ pub struct VarLenContext {
 }
 
 impl VarLenContext {
+    /// Create a new variable-length context from a type, length and optional
+    /// collation.
     pub fn new(r#type: VarLenType, len: usize, collation: Option<Collation>) -> Self {
         Self {
             r#type,
@@ -56,6 +96,11 @@ impl VarLenContext {
     /// Get the var len context's len.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// `true` if the column reserves no length.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// Get the var len context's collation.
@@ -95,7 +140,7 @@ impl Encode<BytesMut> for VarLenContext {
             | VarLenType::BigVarBin => {
                 dst.put_u16_le(self.len() as u16);
             }
-            VarLenType::Image | VarLenType::Text | VarLenType::NText => {
+            VarLenType::Image | VarLenType::Text | VarLenType::NText | VarLenType::SSVariant => {
                 dst.put_u32_le(self.len() as u32);
             }
             VarLenType::Xml => (),
@@ -250,6 +295,34 @@ impl Encode<BytesMut> for TypeInfo {
                     dst.put_u8(0);
                 }
             }
+            TypeInfo::Udt(info) => {
+                dst.put_u8(VarLenType::Udt as u8);
+                dst.put_u16_le(info.max_byte_size);
+
+                let db_name: Vec<u16> = info.db_name.encode_utf16().collect();
+                dst.put_u8(db_name.len() as u8);
+                for chr in db_name {
+                    dst.put_u16_le(chr);
+                }
+
+                let schema_name: Vec<u16> = info.schema_name.encode_utf16().collect();
+                dst.put_u8(schema_name.len() as u8);
+                for chr in schema_name {
+                    dst.put_u16_le(chr);
+                }
+
+                let type_name: Vec<u16> = info.type_name.encode_utf16().collect();
+                dst.put_u8(type_name.len() as u8);
+                for chr in type_name {
+                    dst.put_u16_le(chr);
+                }
+
+                let aqn: Vec<u16> = info.assembly_qualified_name.encode_utf16().collect();
+                dst.put_u16_le(aqn.len() as u16);
+                for chr in aqn {
+                    dst.put_u16_le(chr);
+                }
+            }
         }
 
         Ok(())
@@ -289,6 +362,22 @@ impl TypeInfo {
                     size: 0xfffffffffffffffe_usize,
                 })
             }
+            Ok(VarLenType::Udt) => {
+                // UDT_INFO, MS-TDS §2.2.5.5.4
+                let max_byte_size = src.read_u16_le().await?;
+                let db_name = src.read_b_varchar().await?;
+                let schema_name = src.read_b_varchar().await?;
+                let type_name = src.read_b_varchar().await?;
+                let assembly_qualified_name = src.read_us_varchar().await?;
+
+                Ok(TypeInfo::Udt(UdtInfo {
+                    max_byte_size,
+                    db_name,
+                    schema_name,
+                    type_name,
+                    assembly_qualified_name,
+                }))
+            }
             Ok(ty) => {
                 let len = match ty {
                     #[cfg(feature = "tds73")]
@@ -311,9 +400,10 @@ impl TypeInfo {
                     | VarLenType::BigVarChar
                     | VarLenType::BigBinary
                     | VarLenType::BigVarBin => src.read_u16_le().await? as usize,
-                    VarLenType::Image | VarLenType::Text | VarLenType::NText => {
-                        src.read_u32_le().await? as usize
-                    }
+                    VarLenType::Image
+                    | VarLenType::Text
+                    | VarLenType::NText
+                    | VarLenType::SSVariant => src.read_u32_le().await? as usize,
                     _ => todo!("not yet implemented for {:?}", ty),
                 };
 
@@ -380,6 +470,14 @@ mod tests {
                 40,
                 Some(Collation::new(13632521, 52)),
             )),
+            TypeInfo::Udt(UdtInfo {
+                max_byte_size: 0xffff,
+                db_name: "fake-db".to_string(),
+                schema_name: "dbo".to_string(),
+                type_name: "geometry".to_string(),
+                assembly_qualified_name:
+                    "Microsoft.SqlServer.Types.SqlGeometry, Microsoft.SqlServer.Types".to_string(),
+            }),
         ];
 
         for ti in types {

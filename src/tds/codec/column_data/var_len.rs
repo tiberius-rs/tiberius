@@ -1,6 +1,4 @@
-use crate::{
-    sql_read_bytes::SqlReadBytes, tds::codec::VarLenContext, ColumnData, Error, VarLenType,
-};
+use crate::{sql_read_bytes::SqlReadBytes, tds::codec::VarLenContext, ColumnData, VarLenType};
 
 pub(crate) async fn decode<R>(
     src: &mut R,
@@ -43,11 +41,8 @@ where
         Text => super::text::decode(src, collation).await?,
         NText => super::text::decode(src, None).await?,
         Image => super::image::decode(src).await?,
-        t => {
-            return Err(Error::Protocol(
-                format!("unsupported column type: {:?}", t).into(),
-            ))
-        }
+        SSVariant => super::sql_variant::decode(src).await?,
+        t => unimplemented!("{:?}", t),
     };
 
     Ok(res)

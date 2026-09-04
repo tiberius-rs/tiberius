@@ -38,7 +38,65 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --check
 
-  cargo-test-linux:
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # Keep this in sync with `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install dependencies
+        run: sudo apt-get install -y openssl libkrb5-dev
+      - name: Check on MSRV
+        run: cargo check --features all
+
+  semver:
+    name: semver-checks (advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # Advisory during 0.x: reports API-breaking changes vs the target branch
+    # without blocking (breaking changes are allowed pre-1.0, but should be
+    # visible in review).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install dependencies
+        run: sudo apt-get install -y openssl libkrb5-dev
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@cargo-semver-checks
+      - name: Fetch baseline branch
+        # `actions/checkout` leaves the PR base branch without a local ref, so
+        # `--baseline-rev origin/<base>` can't be resolved; fetch it explicitly
+        # and compare against FETCH_HEAD.
+        run: git fetch --no-tags --depth=100 origin "${{ github.base_ref }}"
+      - name: Check for semver-breaking changes
+        # Scope to one coherent, non-conflicting feature set. Checking all
+        # features at once enables the mutually-exclusive TLS backends
+        # (native-tls + rustls + vendored-openssl) together, whose duplicate
+        # `TlsStream` definitions make rustdoc fail to build (E0428). These are
+        # also the crate's original features, so they exist in every baseline
+        # slice this PR is compared against.
+        run: >-
+          cargo semver-checks --baseline-rev FETCH_HEAD
+          --only-explicit-features
+          --features rustls,chrono,time,tds73,rust_decimal,bigdecimal
+
+  smoke:
+    name: integration smoke (SQL 2022)
+    # Fast real-server signal on the dev lane; the full matrix runs on qa.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')
     runs-on: ubuntu-latest
 
     strategy:
@@ -109,7 +167,73 @@ jobs:
       - name: Run tests
         run: cargo test ${{matrix.features}}
 
-  cargo-test-windows:
+  integration-linux-next:
+    name: linux (SQL 2025, experimental)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/qa')
+    runs-on: ubuntu-latest
+    # Newest server; kept non-blocking so a not-yet-published image or a
+    # server-side behaviour change on the bleeding edge cannot red-wall qa.
+    continue-on-error: true
+    env:
+      TIBERIUS_TEST_CONNECTION_STRING: "server=tcp:localhost,1433;user=SA;password=<YourStrong@Passw0rd>;TrustServerCertificate=true"
+      RUSTFLAGS: "-Dwarnings"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Start SQL Server 2025
+        run: DOCKER_BUILDKIT=1 docker compose -f docker-compose.yml up -d mssql-2025
+      - name: Install dependencies
+        run: sudo apt-get install -y openssl libkrb5-dev
+      - name: Wait for SQL Server
+        # Authenticated readiness (not just an open port) — see the smoke job.
+        run: |
+          pw='<YourStrong@Passw0rd>'
+          for _ in $(seq 1 60); do
+            if docker run --rm --network host mcr.microsoft.com/mssql-tools \
+                 /opt/mssql-tools/bin/sqlcmd -S localhost,1433 -U SA -P "$pw" -Q "SELECT 1" >/dev/null 2>&1; then
+              echo "SQL Server ready (authenticated login succeeded)"; exit 0
+            fi
+            sleep 3
+          done
+          echo "SQL Server did not accept an authenticated login in time" >&2
+          docker compose -f docker-compose.yml logs mssql-2025 || true
+          exit 1
+      - name: Run tests
+        run: cargo test --features=all
+
+  integration-macos:
+    name: macos build + unit tests
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/qa')
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features --features=rustls,chrono,time,tds73,sql-browser-tokio,sql-browser-smol,rust_decimal,bigdecimal"
+          - "--no-default-features --features=vendored-openssl"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # No live SQL Server on hosted macOS runners; this verifies the crate
+      # builds and its unit tests pass on macOS/Apple targets.
+      - name: Build
+        run: cargo build ${{ matrix.features }}
+      - name: Run library unit tests
+        run: cargo test --lib ${{ matrix.features }}
+
+  integration-windows:
+    name: windows (SQL 2019, integrated auth)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/qa')
     runs-on: windows-latest
 
     strategy:
@@ -216,42 +340,3 @@ jobs:
       - name: Run normal tests
         shell: powershell
         run: cargo test ${{matrix.features}}
-
-  cargo-test-macos:
-    runs-on: macos-26-intel
-
-    strategy:
-      fail-fast: false
-      matrix:
-        features:
-          - "--no-default-features --features=rustls,chrono,time,tds73,sql-browser-async-std,sql-browser-tokio,sql-browser-smol,integrated-auth-gssapi,rust_decimal,bigdecimal"
-          - "--no-default-features --features=vendored-openssl"
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
-        with:
-          toolchain: stable
-
-      - name: Compute cache key
-        shell: bash
-        run: |
-          key="${{ matrix.features }}"
-          key="${key//,/+}"
-          echo "RUST_CACHE_KEY=$key" >> "$GITHUB_ENV"
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-        with:
-          shared-key: ${{ env.RUST_CACHE_KEY }}
-
-      # macOS runners can't host the Linux SQL Server container, so this lane is
-      # compile + library unit tests only (no server-dependent integration tests,
-      # which run on the Linux and Windows lanes).
-      - name: Build
-        run: cargo build ${{matrix.features}}
-
-      - name: Run library unit tests
-        run: cargo test --lib ${{matrix.features}}
