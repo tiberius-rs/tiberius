@@ -442,3 +442,191 @@ impl Encode<BytesMut> for DateTimeOffset {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+
+    #[test]
+    fn datetime_accessors() {
+        let dt = DateTime::new(-100, 12345);
+        assert_eq!(dt.days(), -100);
+        assert_eq!(dt.seconds_fragments(), 12345);
+    }
+
+    #[tokio::test]
+    async fn datetime_round_trip_including_pre_1900() {
+        for dt in [
+            DateTime::new(0, 0),
+            DateTime::new(200, 3000),
+            DateTime::new(-53690, 25920000),
+        ] {
+            let mut buf = BytesMut::new();
+            dt.encode(&mut buf).unwrap();
+            let decoded = DateTime::decode(&mut buf.into_sql_read_bytes())
+                .await
+                .unwrap();
+            assert_eq!(decoded, dt);
+        }
+    }
+
+    #[test]
+    fn smalldatetime_accessors() {
+        let dt = SmallDateTime::new(100, 200);
+        assert_eq!(dt.days(), 100);
+        assert_eq!(dt.seconds_fragments(), 200);
+    }
+
+    #[tokio::test]
+    async fn smalldatetime_round_trip() {
+        let dt = SmallDateTime::new(65535, 1439);
+        let mut buf = BytesMut::new();
+        dt.encode(&mut buf).unwrap();
+        let decoded = SmallDateTime::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .unwrap();
+        assert_eq!(decoded, dt);
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn date_accessor_and_new() {
+        let date = Date::new(730119);
+        assert_eq!(date.days(), 730119);
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    #[should_panic]
+    fn date_new_panics_on_overflow() {
+        // Anything not representable in three bytes must panic.
+        Date::new(0x0100_0000);
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn date_round_trip() {
+        for days in [0u32, 1, 730119, 0x00ff_ffff] {
+            let date = Date::new(days);
+            let mut buf = BytesMut::new();
+            date.encode(&mut buf).unwrap();
+            assert_eq!(buf.len(), 3);
+            let decoded = Date::decode(&mut buf.into_sql_read_bytes()).await.unwrap();
+            assert_eq!(decoded, date);
+        }
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn time_accessors_and_len() {
+        let time = Time::new(1234, 5);
+        assert_eq!(time.increments(), 1234);
+        assert_eq!(time.scale(), 5);
+        assert_eq!(time.len().unwrap(), 5);
+
+        assert_eq!(Time::new(0, 0).len().unwrap(), 3);
+        assert_eq!(Time::new(0, 3).len().unwrap(), 4);
+        assert!(Time::new(0, 8).len().is_err());
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn time_partial_eq_across_scales() {
+        // 1 second expressed at two different scales must compare equal.
+        assert_eq!(Time::new(100, 2), Time::new(10_000_000, 7));
+        assert_ne!(Time::new(100, 2), Time::new(200, 2));
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn time_round_trip_all_len_buckets() {
+        for (increments, scale) in [(255u64, 2u8), (65535, 4), (16_777_215, 7)] {
+            let time = Time::new(increments, scale);
+            let rlen = time.len().unwrap();
+            let mut buf = BytesMut::new();
+            time.encode(&mut buf).unwrap();
+            let decoded = Time::decode(
+                &mut buf.into_sql_read_bytes(),
+                scale as usize,
+                rlen as usize,
+            )
+            .await
+            .unwrap();
+            assert_eq!(decoded, time);
+        }
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn time_round_trip_high_bytes_set() {
+        // Values whose most-significant byte (the byte handled by the
+        // `lo << 16` / `lo << 32` shift in `decode` and the `>> 16` / `>> 32`
+        // shift in `encode`) is non-zero. This distinguishes:
+        //   * decode `<< N` from `>> N` (the latter zeroes an `u8`), and
+        //   * encode `>> N` from `<< N` (the latter zeroes the byte written).
+        // The 16-bit / 32-bit low halves and the shifted high byte occupy
+        // disjoint bit ranges, so `|` vs `^` cannot be distinguished here.
+        for (increments, scale) in [(0x00FF_1234u64, 2u8), (0x00AB_1234_5678u64, 7)] {
+            let time = Time::new(increments, scale);
+            let rlen = time.len().unwrap();
+
+            let mut buf = BytesMut::new();
+            time.encode(&mut buf).unwrap();
+
+            let decoded = Time::decode(
+                &mut buf.into_sql_read_bytes(),
+                scale as usize,
+                rlen as usize,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(decoded, time);
+            assert_eq!(decoded.increments(), increments);
+        }
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn time_decode_invalid_length_errors() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0);
+        // scale/length combination not one of the accepted pairs.
+        let err = Time::decode(&mut buf.into_sql_read_bytes(), 0, 4).await;
+        assert!(err.is_err());
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn datetime2_round_trip_and_accessors() {
+        let dt2 = DateTime2::new(Date::new(730119), Time::new(222, 7));
+        assert_eq!(dt2.date(), Date::new(730119));
+        assert_eq!(dt2.time(), Time::new(222, 7));
+
+        let rlen = dt2.time().len().unwrap();
+        let mut buf = BytesMut::new();
+        dt2.encode(&mut buf).unwrap();
+        let decoded = DateTime2::decode(&mut buf.into_sql_read_bytes(), 7, rlen as usize)
+            .await
+            .unwrap();
+        assert_eq!(decoded, dt2);
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn datetimeoffset_round_trip_and_accessors() {
+        let dt2 = DateTime2::new(Date::new(730119), Time::new(222, 7));
+        let dto = DateTimeOffset::new(dt2, -120);
+        assert_eq!(dto.datetime2(), dt2);
+        assert_eq!(dto.offset(), -120);
+
+        let rlen = dto.datetime2().time().len().unwrap();
+        let mut buf = BytesMut::new();
+        dto.encode(&mut buf).unwrap();
+        let decoded = DateTimeOffset::decode(&mut buf.into_sql_read_bytes(), 7, rlen)
+            .await
+            .unwrap();
+        assert_eq!(decoded, dto);
+    }
+}

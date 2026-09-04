@@ -203,4 +203,76 @@ mod tests {
         ));
         assert!(fixed_to_var_len(FixedLenType::Null).is_none());
     }
+
+    #[test]
+    fn rewrites_all_fixed_len_variants() {
+        use super::super::VarLenType;
+
+        let cases = [
+            (FixedLenType::Int1, VarLenType::Intn, 1),
+            (FixedLenType::Bit, VarLenType::Bitn, 1),
+            (FixedLenType::Int2, VarLenType::Intn, 2),
+            (FixedLenType::Int4, VarLenType::Intn, 4),
+            (FixedLenType::Datetime4, VarLenType::Datetimen, 4),
+            (FixedLenType::Float4, VarLenType::Floatn, 4),
+            (FixedLenType::Money, VarLenType::Money, 8),
+            (FixedLenType::Datetime, VarLenType::Datetimen, 8),
+            (FixedLenType::Float8, VarLenType::Floatn, 8),
+            (FixedLenType::Money4, VarLenType::Money, 4),
+            (FixedLenType::Int8, VarLenType::Intn, 8),
+        ];
+
+        for (fixed, expected_ty, expected_len) in cases {
+            match fixed_to_var_len(fixed) {
+                Some(TypeInfo::VarLenSized(ctx)) => {
+                    assert_eq!(ctx.r#type(), expected_ty, "{:?}", fixed);
+                    assert_eq!(ctx.len(), expected_len, "{:?}", fixed);
+                }
+                other => panic!("unexpected result for {:?}: {:?}", fixed, other),
+            }
+        }
+    }
+
+    #[test]
+    fn with_metadata_rewrites_fixed_len_columns() {
+        use crate::{BaseMetaDataColumn, ColumnFlag};
+        use enumflags2::BitFlags;
+
+        let metadata = vec![MetaDataColumn {
+            base: BaseMetaDataColumn {
+                flags: BitFlags::from(ColumnFlag::Nullable),
+                ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            },
+            col_name: Default::default(),
+        }];
+
+        let tvp = TypeInfoTvp::new("MyType", Vec::new()).with_metadata(metadata);
+        let columns = tvp.columns.as_ref().unwrap();
+        assert!(matches!(columns[0].base.ty, TypeInfo::VarLenSized(_)));
+    }
+
+    #[test]
+    fn encodes_metadata_and_row_data() {
+        use crate::{BaseMetaDataColumn, ColumnData, ColumnFlag, VarLenContext, VarLenType};
+        use enumflags2::BitFlags;
+
+        let metadata = vec![MetaDataColumn {
+            base: BaseMetaDataColumn {
+                flags: BitFlags::from(ColumnFlag::Nullable),
+                ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+            },
+            col_name: Default::default(),
+        }];
+
+        let rows = vec![vec![ColumnData::I32(Some(7))]];
+        let tvp = TypeInfoTvp::new("dbo.MyType", rows).with_metadata(metadata);
+
+        let mut buf = BytesMut::new();
+        tvp.encode(&mut buf).unwrap();
+
+        // Ends with the TVP_END_TOKEN.
+        assert_eq!(*buf.last().unwrap(), 0);
+        // A single TVP_ROW_TOKEN (0x01) must appear before the row data.
+        assert!(buf.contains(&0x01u8));
+    }
 }

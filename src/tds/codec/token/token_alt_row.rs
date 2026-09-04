@@ -113,4 +113,27 @@ mod tests {
         assert_eq!(1, row.len());
         assert!(matches!(row.get(0), Some(ColumnData::I32(Some(42)))));
     }
+
+    #[test]
+    fn accessors_reflect_id_and_columns() {
+        // Empty row: id must be the stored value (not a hardcoded 1), len 0,
+        // is_empty true.
+        let empty = TokenAltRow {
+            id: 5,
+            data: vec![],
+        };
+        assert_eq!(empty.id(), 5);
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+
+        // Non-empty row with a distinct id and two columns: len 2, is_empty
+        // false.
+        let filled = TokenAltRow {
+            id: 9,
+            data: vec![ColumnData::I32(Some(10)), ColumnData::I32(Some(20))],
+        };
+        assert_eq!(filled.id(), 9);
+        assert_eq!(filled.len(), 2);
+        assert!(!filled.is_empty());
+    }
 }
