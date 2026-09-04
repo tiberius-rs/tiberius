@@ -20,7 +20,7 @@ use asynchronous_codec::Framed;
 use bytes::BytesMut;
 #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
 use codec::TokenSspi;
-use futures_util::io::{AsyncRead, AsyncWrite};
+use futures_util::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use futures_util::ready;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{Stream, TryStream, TryStreamExt};
@@ -39,6 +39,7 @@ use task::Poll;
 use tracing::{event, Level};
 #[cfg(all(windows, feature = "winauth"))]
 use winauth::{windows::NtlmSspiBuilder, NextBytes};
+use zeroize::{Zeroize, Zeroizing};
 
 /// A `Connection` is an abstraction between the [`Client`] and the server. It
 /// can be used as a `Stream` to fetch [`Packet`]s from and to `send` packets
@@ -106,6 +107,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 config.host,
                 config.application_name,
                 config.readonly,
+                config.packet_size,
                 prelogin,
             )
             .await?;
@@ -192,6 +194,45 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         }
 
         self.flush_sink().await?;
+
+        Ok(())
+    }
+
+    async fn send_sensitive_login(
+        &mut self,
+        mut header: PacketHeader,
+        mut payload: Zeroizing<Vec<u8>>,
+    ) -> crate::Result<()> {
+        self.flushed = false;
+        let packet_size = (self.context.packet_size() as usize) - HEADER_BYTES;
+        let mut offset = 0;
+
+        while offset < payload.len() {
+            let end = cmp::min(payload.len(), offset + packet_size);
+
+            if end == payload.len() {
+                header.set_status(PacketStatus::EndOfMessage);
+            } else {
+                header.set_status(PacketStatus::NormalMessage);
+            }
+
+            let mut frame = Zeroizing::new(Vec::with_capacity(HEADER_BYTES + end - offset));
+            header.encode(&mut *frame)?;
+            frame.extend_from_slice(&payload[offset..end]);
+
+            let size = (frame.len() as u16).to_be_bytes();
+            frame[2] = size[0];
+            frame[3] = size[1];
+
+            event!(Level::TRACE, "Sending a packet ({} bytes)", frame.len(),);
+
+            self.transport.write_all(frame.as_slice()).await?;
+            frame.zeroize();
+            payload[offset..end].zeroize();
+            offset = end;
+        }
+
+        self.transport.flush().await?;
 
         Ok(())
     }
@@ -293,6 +334,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         server_name: Option<String>,
         application_name: Option<String>,
         readonly: bool,
+        packet_size: Option<u32>,
         prelogin: PreloginMessage,
     ) -> crate::Result<Self> {
         let mut login_message = LoginMessage::new();
@@ -310,6 +352,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         }
 
         login_message.readonly(readonly);
+
+        if let Some(size) = packet_size {
+            login_message.packet_size(size);
+        }
 
         match auth {
             #[cfg(all(windows, feature = "winauth"))]
@@ -332,7 +378,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                         event!(Level::TRACE, sspi_response_len = sspi_response.len());
 
                         let id = self.context.next_packet_id();
-                        let header = PacketHeader::login(id);
+                        let header = PacketHeader::sspi(id);
 
                         let token = TokenSspi::new(sspi_response);
                         self.send(header, token).await?;
@@ -415,11 +461,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 self = self.post_login_encryption(encryption);
             }
             AuthMethod::SqlServer(auth) => {
-                login_message.user_name(auth.user());
-                login_message.password(auth.password());
+                let (user, mut password) = auth.into_credentials();
+
+                login_message.user_name(user);
+                login_message.password(password.as_str());
+                let payload = login_message.encode_to_vec()?;
+                password.zeroize();
 
                 let id = self.context.next_packet_id();
-                self.send(PacketHeader::login(id), login_message).await?;
+                self.send_sensitive_login(PacketHeader::login(id), payload)
+                    .await?;
                 self = self.post_login_encryption(encryption);
             }
             AuthMethod::AADToken(token) => {
