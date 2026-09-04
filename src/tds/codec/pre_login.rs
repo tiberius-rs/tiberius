@@ -62,18 +62,22 @@ impl PreloginMessage {
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
-    pub fn negotiated_encryption(&self, expected: EncryptionLevel) -> EncryptionLevel {
-        match (expected, self.encryption) {
+    pub fn negotiated_encryption(&self, expected: EncryptionLevel) -> Result<EncryptionLevel> {
+        let level = match (expected, self.encryption) {
             (EncryptionLevel::NotSupported, EncryptionLevel::NotSupported) => {
                 EncryptionLevel::NotSupported
             }
             (EncryptionLevel::Off, EncryptionLevel::Off) => EncryptionLevel::Off,
             (EncryptionLevel::On, EncryptionLevel::Off)
             | (EncryptionLevel::On, EncryptionLevel::NotSupported) => {
-                panic!("Server does not allow the requested encryption level.")
+                return Err(Error::Protocol(
+                    "Server does not allow the requested encryption level.".into(),
+                ))
             }
             (_, _) => EncryptionLevel::On,
-        }
+        };
+
+        Ok(level)
     }
 
     #[cfg(not(any(
@@ -81,8 +85,8 @@ impl PreloginMessage {
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]
-    pub fn negotiated_encryption(&self, _: EncryptionLevel) -> EncryptionLevel {
-        EncryptionLevel::NotSupported
+    pub fn negotiated_encryption(&self, _: EncryptionLevel) -> Result<EncryptionLevel> {
+        Ok(EncryptionLevel::NotSupported)
     }
 }
 
@@ -205,7 +209,9 @@ impl Decode<BytesMut> for PreloginMessage {
                     } else if length == 4 {
                         cursor.read_u32::<BigEndian>()?
                     } else {
-                        panic!("should never happen")
+                        return Err(Error::Protocol(
+                            format!("prelogin: invalid threadid length: {}", length).into(),
+                        ));
                     }
                 }
                 // mars
@@ -240,7 +246,11 @@ impl Decode<BytesMut> for PreloginMessage {
 
                     ret.nonce = Some(data);
                 }
-                _ => panic!("unsupported prelogin token: {}", token),
+                _ => {
+                    return Err(Error::Protocol(
+                        format!("unsupported prelogin token: {}", token).into(),
+                    ))
+                }
             }
 
             cursor.set_position(old_pos);
@@ -281,5 +291,34 @@ mod tests {
         let decoded = PreloginMessage::decode(&mut payload).expect("decode should succeed");
 
         assert_eq!(prelogin, decoded);
+    }
+
+    // #425: a server declining the requested encryption level must yield a
+    // catchable protocol error instead of panicking.
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    #[test]
+    fn negotiated_encryption_rejects_declined_level() {
+        let mut prelogin = PreloginMessage::new();
+        // Server responds with an encryption level the client did not offer /
+        // that is weaker than the required `On`.
+        prelogin.encryption = EncryptionLevel::Off;
+
+        let result = prelogin.negotiated_encryption(EncryptionLevel::On);
+
+        match result {
+            Err(Error::Protocol(_)) => {}
+            other => panic!("expected Err(Error::Protocol), got {:?}", other),
+        }
+
+        // A matching, valid negotiation still succeeds.
+        prelogin.encryption = EncryptionLevel::On;
+        assert_eq!(
+            prelogin.negotiated_encryption(EncryptionLevel::On).unwrap(),
+            EncryptionLevel::On
+        );
     }
 }

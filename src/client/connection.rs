@@ -94,7 +94,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             .prelogin(config.encryption, fed_auth_required)
             .await?;
 
-        let encryption = prelogin.negotiated_encryption(config.encryption);
+        let encryption = prelogin.negotiated_encryption(config.encryption)?;
 
         let connection = connection.tls_handshake(&config, encryption).await?;
 
@@ -285,7 +285,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// Defines the login record rules with SQL Server. Authentication with
     /// connection options.
     #[allow(clippy::too_many_arguments)]
-    async fn login<'a>(
+    async fn login(
         mut self,
         auth: AuthMethod,
         encryption: EncryptionLevel,
@@ -445,7 +445,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         encryption: EncryptionLevel,
     ) -> crate::Result<Self> {
         if encryption != EncryptionLevel::NotSupported {
-            event!(Level::INFO, "Performing a TLS handshake");
+            event!(Level::DEBUG, "Performing a TLS handshake");
 
             let Self {
                 transport, context, ..
@@ -458,7 +458,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             };
 
             stream.get_mut().handshake_complete();
-            event!(Level::INFO, "TLS handshake successful");
+            event!(Level::DEBUG, "TLS handshake successful");
 
             let transport = Framed::new(MaybeTlsStream::Tls(stream), PacketCodec);
 
@@ -484,7 +484,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]
-    async fn tls_handshake(self, _: &Config, _: EncryptionLevel) -> crate::Result<Self> {
+    async fn tls_handshake(self, config: &Config, _: EncryptionLevel) -> crate::Result<Self> {
+        check_tls_backend_available(config.encryption)?;
+
         event!(
             Level::WARN,
             "TLS encryption is not enabled. All traffic including the login credentials are not encrypted."
@@ -495,6 +497,51 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
 
     pub(crate) async fn close(mut self) -> crate::Result<()> {
         self.transport.close().await
+    }
+}
+
+/// Returns an error when the user requested encryption but no TLS backend was
+/// compiled in. Without this check, a `Required`/`On` encryption request would
+/// silently fall back to an unencrypted connection.
+#[cfg(not(any(
+    feature = "rustls",
+    feature = "native-tls",
+    feature = "vendored-openssl"
+)))]
+fn check_tls_backend_available(encryption: EncryptionLevel) -> crate::Result<()> {
+    if let EncryptionLevel::On | EncryptionLevel::Required = encryption {
+        return Err(crate::Error::Tls(
+            "TLS encryption was requested but the crate was compiled without a TLS backend. \
+             Enable one of the `native-tls`, `rustls` or `vendored-openssl` features."
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(all(
+    test,
+    not(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))
+))]
+mod tests {
+    use super::check_tls_backend_available;
+    use crate::EncryptionLevel;
+
+    #[test]
+    fn requested_encryption_without_tls_backend_errors() {
+        assert!(check_tls_backend_available(EncryptionLevel::Required).is_err());
+        assert!(check_tls_backend_available(EncryptionLevel::On).is_err());
+    }
+
+    #[test]
+    fn no_encryption_without_tls_backend_is_ok() {
+        assert!(check_tls_backend_available(EncryptionLevel::Off).is_ok());
+        assert!(check_tls_backend_available(EncryptionLevel::NotSupported).is_ok());
     }
 }
 

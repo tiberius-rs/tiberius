@@ -177,7 +177,7 @@ impl RowBitmap {
     where
         R: SqlReadBytes + Unpin,
     {
-        let size = (columns + 8 - 1) / 8;
+        let size = columns.div_ceil(8);
         let mut data = vec![0; size];
         src.read_exact(&mut data[0..size]).await?;
 

@@ -184,27 +184,27 @@ where
             _ => (),
         }
 
-        event!(Level::INFO, "{}", change);
+        event!(Level::DEBUG, "{}", change);
 
         Ok(ReceivedToken::EnvChange(change))
     }
 
     async fn get_info(&mut self) -> crate::Result<ReceivedToken> {
         let info = TokenInfo::decode(self.conn).await?;
-        event!(Level::INFO, "{}", info.message);
+        event!(Level::DEBUG, "{}", info.message);
         Ok(ReceivedToken::Info(info))
     }
 
     async fn get_login_ack(&mut self) -> crate::Result<ReceivedToken> {
         let ack = TokenLoginAck::decode(self.conn).await?;
-        event!(Level::INFO, "{} version {}", ack.prog_name, ack.version);
+        event!(Level::DEBUG, "{} version {}", ack.prog_name, ack.version);
         Ok(ReceivedToken::LoginAck(ack))
     }
 
     async fn get_feature_ext_ack(&mut self) -> crate::Result<ReceivedToken> {
         let ack = TokenFeatureExtAck::decode(self.conn).await?;
         event!(
-            Level::INFO,
+            Level::DEBUG,
             "FeatureExtAck with {} features",
             ack.features.len()
         );
@@ -247,7 +247,11 @@ where
                 TokenType::LoginAck => this.get_login_ack().await?,
                 TokenType::Sspi => this.get_sspi().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
-                _ => panic!("Token {:?} unimplemented!", ty),
+                _ => {
+                    return Err(Error::Protocol(
+                        format!("Token {:?} unimplemented!", ty).into(),
+                    ))
+                }
             };
 
             Ok(Some((token, this)))

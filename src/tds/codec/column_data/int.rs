@@ -1,4 +1,4 @@
-use crate::{sql_read_bytes::SqlReadBytes, ColumnData};
+use crate::{sql_read_bytes::SqlReadBytes, ColumnData, Error};
 
 pub(crate) async fn decode<R>(src: &mut R, type_len: usize) -> crate::Result<ColumnData<'static>>
 where
@@ -15,7 +15,11 @@ where
         (2, _) => ColumnData::I16(Some(src.read_i16_le().await?)),
         (4, _) => ColumnData::I32(Some(src.read_i32_le().await?)),
         (8, _) => ColumnData::I64(Some(src.read_i64_le().await?)),
-        _ => unimplemented!(),
+        _ => {
+            return Err(Error::Protocol(
+                format!("invalid integer length: {}", recv_len).into(),
+            ))
+        }
     };
 
     Ok(res)

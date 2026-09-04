@@ -260,14 +260,17 @@ where
 }
 
 impl QueryIdx for usize {
-    fn idx(&self, _row: &Row) -> Option<usize> {
-        Some(*self)
+    fn idx(&self, row: &Row) -> Option<usize> {
+        (*self < row.columns.len()).then_some(*self)
     }
 }
 
 impl QueryIdx for &str {
     fn idx(&self, row: &Row) -> Option<usize> {
-        row.columns.iter().position(|c| c.name() == *self)
+        // Allow matching a column selected with a Rust raw identifier (e.g.
+        // `r#type`) against the plain SQL column name (`type`).
+        let name = self.strip_prefix("r#").unwrap_or(self);
+        row.columns.iter().position(|c| c.name() == name)
     }
 }
 
@@ -421,5 +424,53 @@ impl IntoIterator for Row {
 
     fn into_iter(self) -> Self::IntoIter {
         self.data.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_row() -> Row {
+        let columns = Arc::new(vec![
+            Column::new("foo".to_string(), ColumnType::Int4),
+            Column::new("type".to_string(), ColumnType::Int4),
+        ]);
+
+        let mut data = TokenRow::new();
+        data.push(ColumnData::I32(Some(1)));
+        data.push(ColumnData::I32(Some(2)));
+
+        Row {
+            columns,
+            data,
+            result_index: 0,
+        }
+    }
+
+    // Regression test for #211: an out-of-range usize index must not panic.
+    #[test]
+    fn try_get_out_of_range_index_returns_none() {
+        let row = make_row();
+
+        assert_eq!(None, 2usize.idx(&row));
+        assert_eq!(Some(0), 0usize.idx(&row));
+
+        let value: crate::Result<Option<i32>> = row.try_get(5usize);
+        assert!(value.is_err());
+    }
+
+    // Regression test for #382: a raw-identifier column name (`r#type`) must
+    // match the plain SQL column name (`type`).
+    #[test]
+    fn raw_identifier_column_name_matches() {
+        let row = make_row();
+
+        assert_eq!(Some(1), "type".idx(&row));
+        assert_eq!(Some(1), "r#type".idx(&row));
+        assert_eq!(Some(0), "r#foo".idx(&row));
+        assert_eq!(None, "r#missing".idx(&row));
+
+        assert_eq!(Some(2i32), row.get::<i32, _>("r#type"));
     }
 }

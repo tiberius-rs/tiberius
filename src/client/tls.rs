@@ -215,7 +215,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsPreloginWrapper<
             }
 
             let header = PacketHeader::decode(&mut BytesMut::from(&inner.header_buf[..]))
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+                .map_err(io::Error::other)?;
 
             // We only get pre-login packets in the handshake process.
             assert_eq!(header.r#type(), PacketType::PreLogin);

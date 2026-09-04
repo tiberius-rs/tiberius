@@ -98,7 +98,7 @@ fn get_server_name(config: &Config) -> crate::Result<ServerName<'static>> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
     pub(super) async fn new(config: &Config, stream: S) -> crate::Result<Self> {
-        event!(Level::INFO, "Performing a TLS handshake");
+        event!(Level::DEBUG, "Performing a TLS handshake");
 
         // Negotiate TLS 1.2 or 1.3.
         let builder = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
@@ -168,7 +168,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                     .with_no_client_auth()
             }
             TrustConfig::Default => {
-                event!(Level::INFO, "Using default trust configuration.");
+                event!(Level::DEBUG, "Using default trust configuration.");
                 builder.with_native_roots().with_no_client_auth()
             }
         };

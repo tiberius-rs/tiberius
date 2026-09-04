@@ -40,6 +40,9 @@ async fn random_table() -> String {
 
 static DOT_CONN_STR: Lazy<String> = Lazy::new(|| CONN_STR.replace("localhost", "."));
 
+static APP_NAME_CONN_STR: Lazy<String> =
+    Lazy::new(|| format!("{};Application Name=meow", *CONN_STR));
+
 static ENCRYPTED_CONN_STR: Lazy<String> = Lazy::new(|| format!("{};encrypt=true", *CONN_STR));
 
 static PLAIN_TEXT_CONN_STR: Lazy<String> =
@@ -2685,94 +2688,62 @@ where
     Ok(())
 }
 
-#[test]
-#[cfg(feature = "sql-browser-async-std")]
-fn cyrillic_collations_should_work() -> Result<()> {
-    LOGGER_SETUP.call_once(|| {
-        env_logger::init();
-    });
+#[test_on_runtimes]
+async fn cyrillic_collations_should_work<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    conn.simple_query(
+        "CREATE TABLE #cyrillic_test (
+            single CHAR(1)       COLLATE Cyrillic_General_CI_AS,
+            multi  VARCHAR(255)  COLLATE Cyrillic_General_CI_AS,
+            huge   TEXT          COLLATE Cyrillic_General_CI_AS
+        )",
+    )
+    .await?;
 
-    async_std::task::block_on(async {
-        let mut admin = {
-            let config = tiberius::Config::from_ado_string(&CONN_STR)?;
+    conn.execute(
+        "INSERT INTO #cyrillic_test (single, multi, huge) VALUES (@P1, @P2, @P3)",
+        &[
+            &"Ж",
+            &"В Советском Союзе попытки борьбы с пьянством предпринимались не единожды. Первая антиалкогольная",
+            &"Первая антиалкогольная",
+        ],
+    )
+    .await?;
 
-            let tcp = async_std::net::TcpStream::connect(config.get_addr()).await?;
-            tcp.set_nodelay(true)?;
+    let row = conn
+        .query("SELECT single, multi, huge FROM #cyrillic_test", &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
 
-            tiberius::Client::connect(config, tcp).await?
-        };
+    assert_eq!(Some("Ж"), row.get(0));
+    assert_eq!(
+        Some("В Советском Союзе попытки борьбы с пьянством предпринимались не единожды. Первая антиалкогольная"),
+        row.get(1)
+    );
+    assert_eq!(Some("Первая антиалкогольная"), row.get(2));
 
-        admin
-            .simple_query("CREATE DATABASE ru_test COLLATE Cyrillic_General_CI_AS")
-            .await?;
-
-        {
-            let mut client = {
-                let mut config = tiberius::Config::from_ado_string(&CONN_STR)?;
-                config.database("ru_test");
-
-                let tcp = async_std::net::TcpStream::connect(config.get_addr()).await?;
-                tcp.set_nodelay(true)?;
-
-                tiberius::Client::connect(config, tcp).await?
-            };
-
-            client
-                .simple_query(
-                    "CREATE TABLE test (id INT IDENTITY PRIMARY KEY, single CHAR(1), multi VARCHAR(255), huge TEXT)",
-                )
-                .await?;
-
-            client.execute(
-                "INSERT INTO test (single, multi, huge) VALUES (@P1, @P2, @P3)",
-                &[&"Ж", &"В Советском Союзе попытки борьбы с пьянством предпринимались не единожды. Первая антиалкогольная", &"Первая антиалкогольная"]
-            ).await?;
-
-            let row = client
-                .query("SELECT single, multi, huge FROM test", &[])
-                .await?
-                .into_row()
-                .await?
-                .unwrap();
-
-            assert_eq!(Some("Ж"), row.get(0));
-            assert_eq!(Some("В Советском Союзе попытки борьбы с пьянством предпринимались не единожды. Первая антиалкогольная"), row.get(1));
-            assert_eq!(Some("Первая антиалкогольная"), row.get(2));
-        }
-
-        admin.simple_query("DROP DATABASE ru_test").await?;
-
-        Ok(())
-    })
+    Ok(())
 }
 
-#[test]
-#[cfg(feature = "sql-browser-async-std")]
-fn application_name_should_be_set_correctly() -> Result<()> {
-    LOGGER_SETUP.call_once(|| {
-        env_logger::init();
-    });
+#[test_on_runtimes(connection_string = "APP_NAME_CONN_STR")]
+async fn application_name_should_be_set_correctly<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let row = conn
+        .query("SELECT APP_NAME()", &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
 
-    async_std::task::block_on(async {
-        let mut config = tiberius::Config::from_ado_string(&CONN_STR)?;
-        config.application_name("meow");
+    assert_eq!(Some("meow"), row.get(0));
 
-        let tcp = async_std::net::TcpStream::connect(config.get_addr()).await?;
-        tcp.set_nodelay(true)?;
-
-        let mut client = tiberius::Client::connect(config, tcp).await?;
-
-        let row = client
-            .query("SELECT APP_NAME()", &[])
-            .await?
-            .into_row()
-            .await?
-            .unwrap();
-
-        assert_eq!(Some("meow"), row.get(0));
-
-        Ok(())
-    })
+    Ok(())
 }
 
 #[test_on_runtimes]

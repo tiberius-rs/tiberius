@@ -1,4 +1,4 @@
-use crate::{SqlReadBytes, FEA_EXT_FEDAUTH, FEA_EXT_TERMINATOR};
+use crate::{Error, SqlReadBytes, FEA_EXT_FEDAUTH, FEA_EXT_TERMINATOR};
 use futures_util::AsyncReadExt;
 
 #[derive(Debug)]
@@ -40,12 +40,20 @@ impl TokenFeatureExtAck {
                 } else if data_len == 0 {
                     None
                 } else {
-                    panic!("invalid Feature_Ext_Ack token");
+                    return Err(Error::Protocol(
+                        format!(
+                            "invalid Feature_Ext_Ack token: invalid data length {}",
+                            data_len
+                        )
+                        .into(),
+                    ));
                 };
 
                 features.push(FeatureAck::FedAuth(FedAuthAck::SecurityToken { nonce }))
             } else {
-                unimplemented!("unsupported feature {}", feature_id)
+                return Err(Error::Protocol(
+                    format!("unsupported feature {}", feature_id).into(),
+                ));
             }
         }
 

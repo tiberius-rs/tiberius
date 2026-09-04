@@ -69,7 +69,7 @@ impl<'a> Query<'a> {
     /// [`ToSql`]: trait.ToSql.html
     /// [`FromSql`]: trait.FromSql.html
     /// [`Client#execute`]: struct.Client.html#method.execute
-    pub async fn execute<'b, S>(self, client: &'b mut Client<S>) -> crate::Result<ExecuteResult>
+    pub async fn execute<S>(self, client: &mut Client<S>) -> crate::Result<ExecuteResult>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {

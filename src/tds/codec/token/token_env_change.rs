@@ -84,10 +84,10 @@ pub enum TokenEnvChange {
 impl fmt::Display for TokenEnvChange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Database(ref old, ref new) => {
+            Self::Database(ref new, ref old) => {
                 write!(f, "Database change from '{}' to '{}'", old, new)
             }
-            Self::PacketSize(old, new) => {
+            Self::PacketSize(new, old) => {
                 write!(f, "Packet size change from '{}' to '{}'", old, new)
             }
             Self::SqlCollation { old, new } => match (old, new) {
@@ -258,5 +258,30 @@ impl TokenEnvChange {
         };
 
         Ok(token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenEnvChange;
+
+    #[test]
+    fn database_display_uses_old_then_new() {
+        // Fields are stored (new, old); Display must print "from old to new".
+        let change = TokenEnvChange::Database("newdb".to_string(), "olddb".to_string());
+        assert_eq!(
+            format!("{}", change),
+            "Database change from 'olddb' to 'newdb'"
+        );
+    }
+
+    #[test]
+    fn packet_size_display_uses_old_then_new() {
+        // Fields are stored (new, old); Display must print "from old to new".
+        let change = TokenEnvChange::PacketSize(8192, 4096);
+        assert_eq!(
+            format!("{}", change),
+            "Packet size change from '4096' to '8192'"
+        );
     }
 }

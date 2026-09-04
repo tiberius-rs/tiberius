@@ -10,9 +10,12 @@ pub use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 use crate::tds::codec::ColumnData;
 
 #[inline]
-fn from_days(days: u64, start_year: i32) -> Date {
-    Date::from_calendar_date(start_year, Month::January, 1).unwrap()
-        + Duration::from_secs(60 * 60 * 24 * days)
+fn from_days(days: i64, start_year: i32) -> Date {
+    // Use the signed `time::Duration` so that negative day offsets (dates
+    // before `start_year`, e.g. `datetime` values prior to 1900) do not
+    // overflow. Casting a negative day count into an unsigned type and
+    // multiplying it out panics with "multiply with overflow".
+    Date::from_calendar_date(start_year, Month::January, 1).unwrap() + time::Duration::days(days)
 }
 
 #[inline]
@@ -46,15 +49,15 @@ fn to_sec_fragments(from: Time) -> i64 {
 from_sql!(
     PrimitiveDateTime:
         ColumnData::SmallDateTime(ref dt) => dt.map(|dt| PrimitiveDateTime::new(
-            from_days(dt.days as u64, 1900),
+            from_days(dt.days as i64, 1900),
             from_secs(dt.seconds_fragments as u64 * 60),
         )),
         ColumnData::DateTime2(ref dt) => dt.map(|dt| PrimitiveDateTime::new(
-            from_days(dt.date.days() as u64, 1),
+            from_days(dt.date.days() as i64, 1),
             Time::from_hms(0,0,0).unwrap() + Duration::from_nanos(dt.time.increments * 10u64.pow(9 - dt.time.scale as u32))
         )),
         ColumnData::DateTime(ref dt) => dt.map(|dt| PrimitiveDateTime::new(
-            from_days(dt.days as u64, 1900),
+            from_days(dt.days as i64, 1900),
             from_sec_fragments(dt.seconds_fragments as u64)
         ));
     Time:
@@ -63,10 +66,10 @@ from_sql!(
             Time::from_hms(0,0,0).unwrap() + Duration::from_nanos(ns)
         });
     Date:
-        ColumnData::Date(ref date) => date.map(|date| from_days(date.days() as u64, 1));
+        ColumnData::Date(ref date) => date.map(|date| from_days(date.days() as i64, 1));
     OffsetDateTime:
         ColumnData::DateTimeOffset(ref dto) => dto.map(|dto| {
-            let date = from_days(dto.datetime2.date.days() as u64, 1);
+            let date = from_days(dto.datetime2.date.days() as i64, 1);
             let dt = dto.datetime2;
 
             let time = Time::from_hms(0,0,0).unwrap()
@@ -129,6 +132,50 @@ to_sql!(self_,
 from_sql!(
     PrimitiveDateTime:
     ColumnData::DateTime(ref dt) => dt.map(|dt| {
-        from_days(dt.days as u64, 1900).with_time(from_sec_fragments(dt.seconds_fragments as u64))
+        from_days(dt.days as i64, 1900).with_time(from_sec_fragments(dt.seconds_fragments as u64))
     })
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test for #316: a `datetime` value with a date before 1900 has
+    // a negative day offset from the 1900 base date. This must round-trip
+    // without a "multiply with overflow" panic.
+    #[test]
+    fn from_days_handles_negative_offsets() {
+        // 1899-12-31 is one day before the 1900 base date.
+        assert_eq!(
+            from_days(-1, 1900),
+            Date::from_calendar_date(1899, Month::December, 31).unwrap()
+        );
+
+        // A date well before 1900, at the lower edge of the `datetime` range.
+        let expected = Date::from_calendar_date(1850, Month::January, 1).unwrap();
+        let days = to_days(expected, 1900);
+        assert!(
+            days < 0,
+            "expected a negative day offset for pre-1900 dates"
+        );
+
+        // Rebuilding from the (negative) day offset must not overflow.
+        assert_eq!(from_days(days, 1900), expected);
+    }
+
+    // Exercise the full decode path (`DateTime` -> `PrimitiveDateTime`) for a
+    // pre-1900 value, matching what happens when reading a `datetime` column.
+    #[test]
+    fn datetime_before_1900_decodes() {
+        let expected_date = Date::from_calendar_date(1850, Month::January, 1).unwrap();
+        let days = to_days(expected_date, 1900) as i32;
+
+        // Reconstruct the way the `from_sql!` mapping does for `ColumnData::DateTime`.
+        let dt = crate::tds::time::DateTime::new(days, 0);
+        let decoded = from_days(dt.days() as i64, 1900)
+            .with_time(from_sec_fragments(dt.seconds_fragments() as u64));
+
+        assert_eq!(decoded.date(), expected_date);
+        assert_eq!(decoded.time(), Time::from_hms(0, 0, 0).unwrap());
+    }
+}

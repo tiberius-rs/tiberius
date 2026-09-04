@@ -60,7 +60,7 @@ where
 from_sql!(bool: ColumnData::Bit(val) => (*val, val));
 from_sql!(u8: ColumnData::U8(val) => (*val, val), ColumnData::I32(None) => (None, None));
 from_sql!(i16: ColumnData::I16(val) => (*val, val), ColumnData::U8(None) => (None, None), ColumnData::I32(None) => (None, None));
-from_sql!(i32: ColumnData::I32(val) => (*val, val), ColumnData::U8(None) => (None, None));
+from_sql!(i32: ColumnData::I32(val) => (*val, val), ColumnData::I16(val) => (val.map(i32::from), val.map(i32::from)), ColumnData::U8(None) => (None, None));
 from_sql!(i64: ColumnData::I64(val) => (*val, val), ColumnData::U8(None) => (None, None), ColumnData::I32(None) => (None, None));
 from_sql!(f32: ColumnData::F32(val) => (*val, val));
 from_sql!(f64: ColumnData::F64(val) => (*val, val));
@@ -130,5 +130,24 @@ impl<'a> FromSql<'a> for &'a [u8] {
                 format!("cannot interpret {:?} as a &[u8] value", v).into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn i16_column_converts_to_i32() {
+        let data = ColumnData::I16(Some(8));
+        assert_eq!(Some(8i32), i32::from_sql(&data).unwrap());
+        assert_eq!(Some(8i32), i32::from_sql_owned(data).unwrap());
+    }
+
+    #[test]
+    fn null_i16_column_converts_to_i32() {
+        let data = ColumnData::I16(None);
+        assert_eq!(None, i32::from_sql(&data).unwrap());
+        assert_eq!(None, i32::from_sql_owned(ColumnData::I16(None)).unwrap());
     }
 }

@@ -385,7 +385,7 @@ pub(crate) trait ConfigString {
     fn readonly(&self) -> bool {
         self.dict()
             .get("applicationintent")
-            .filter(|val| *val == "ReadOnly")
+            .filter(|val| val.trim().eq_ignore_ascii_case("ReadOnly"))
             .is_some()
     }
 }
