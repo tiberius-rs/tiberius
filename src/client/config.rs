@@ -529,11 +529,25 @@ impl Config {
             builder.application_name(name);
         }
 
-        if s.trust_cert()? {
+        let trust_cert = s.trust_cert()?;
+        let trust_cert_ca = s.trust_cert_ca();
+
+        // `TrustServerCertificate` and `TrustServerCertificateCA` are mutually
+        // exclusive. Detect the conflict here and return an error instead of
+        // letting `trust_cert`/`trust_cert_ca` panic on external input.
+        if trust_cert && trust_cert_ca.is_some() {
+            return Err(crate::Error::Conversion(
+                "'TrustServerCertificate' and 'TrustServerCertificateCA' are \
+                 mutually exclusive; specify only one"
+                    .into(),
+            ));
+        }
+
+        if trust_cert {
             builder.trust_cert();
         }
 
-        if let Some(ca) = s.trust_cert_ca() {
+        if let Some(ca) = trust_cert_ca {
             builder.trust_cert_ca(ca);
         }
 
@@ -1035,6 +1049,61 @@ mod tests {
                 assert_eq!(Some("DOMAIN"), auth.domain.as_deref());
             }
             other => panic!("expected Windows NTLM auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ado_conflicting_trust_cert_settings_return_err_not_panic() {
+        let result = Config::from_ado_string(
+            "server=tcp:localhost,1433;TrustServerCertificate=true;\
+             TrustServerCertificateCA=/tmp/ca.pem",
+        );
+
+        match result {
+            Err(crate::Error::Conversion(msg)) => {
+                assert!(
+                    msg.contains("mutually exclusive"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jdbc_conflicting_trust_cert_settings_return_err_not_panic() {
+        let result = Config::from_jdbc_string(
+            "jdbc:sqlserver://localhost:1433;trustServerCertificate=true;\
+             trustServerCertificateCA=/tmp/ca.pem",
+        );
+
+        assert!(
+            matches!(result, Err(crate::Error::Conversion(_))),
+            "expected Conversion error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn ado_trust_cert_alone_trusts_all() {
+        let config =
+            Config::from_ado_string("server=tcp:localhost,1433;TrustServerCertificate=true")
+                .unwrap();
+
+        assert!(matches!(config.trust, TrustConfig::TrustAll));
+    }
+
+    #[test]
+    fn ado_trust_cert_ca_alone_sets_ca_location() {
+        let config = Config::from_ado_string(
+            "server=tcp:localhost,1433;TrustServerCertificateCA=/tmp/ca.pem",
+        )
+        .unwrap();
+
+        match &config.trust {
+            TrustConfig::CaCertificateLocation(path) => {
+                assert_eq!(path, &PathBuf::from("/tmp/ca.pem"));
+            }
+            other => panic!("expected CaCertificateLocation, got {other:?}"),
         }
     }
 }

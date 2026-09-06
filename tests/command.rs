@@ -226,3 +226,89 @@ where
 
     Ok(())
 }
+
+/// Server-free test that exercises `#[derive(TableValueRow)]` end to end:
+/// it declares structs with owned `String`/`Vec<u8>` and scalar fields (and a
+/// borrowed `&str` field via a struct lifetime), constructs values, and asserts
+/// the bound column data. This is the regression test for owned, non-`Copy`
+/// fields, which previously failed to compile (E0507) in the generated
+/// `bind_fields`.
+#[test]
+fn derive_table_value_row_binds_owned_and_borrowed_fields() {
+    use tiberius::{ColumnData, TableValue};
+
+    #[derive(TableValueRow)]
+    struct OwnedRow {
+        #[colname = "Id"]
+        id: i32,
+        #[colname = "Name"]
+        name: String,
+        #[colname = "Payload"]
+        payload: Vec<u8>,
+        #[colname = "Score"]
+        score: Numeric,
+    }
+
+    // get_db_type derives from the struct name.
+    assert_eq!(OwnedRow::get_db_type(), "OwnedRow");
+
+    let rows = vec![
+        OwnedRow {
+            id: 1,
+            name: "one".to_owned(),
+            payload: vec![0xDE, 0xAD],
+            score: Numeric::new_with_scale(10, 0),
+        },
+        OwnedRow {
+            id: 2,
+            name: "two".to_owned(),
+            payload: vec![0xBE, 0xEF],
+            score: Numeric::new_with_scale(20, 0),
+        },
+    ];
+
+    let data = TableValue::into_sql(rows);
+    assert_eq!(data.rows().len(), 2);
+
+    let cols = data.rows()[0].columns();
+    assert_eq!(cols.len(), 4);
+    assert!(matches!(cols[0], ColumnData::I32(Some(1))));
+    match &cols[1] {
+        ColumnData::String(Some(s)) => assert_eq!(s.as_ref(), "one"),
+        other => panic!("expected String, got {other:?}"),
+    }
+    match &cols[2] {
+        ColumnData::Binary(Some(b)) => assert_eq!(b.as_ref(), [0xDE, 0xAD]),
+        other => panic!("expected Binary, got {other:?}"),
+    }
+    assert!(matches!(cols[3], ColumnData::Numeric(Some(_))));
+
+    // Second row values, to be sure per-row binding is correct.
+    match &data.rows()[1].columns()[1] {
+        ColumnData::String(Some(s)) => assert_eq!(s.as_ref(), "two"),
+        other => panic!("expected String, got {other:?}"),
+    }
+
+    // Borrowed fields via a struct lifetime must also compile and bind, without
+    // cloning the underlying data.
+    #[derive(TableValueRow)]
+    struct BorrowedRow<'a> {
+        #[colname = "Id"]
+        id: i32,
+        #[colname = "Name"]
+        name: &'a str,
+    }
+
+    let owned = String::from("borrowed");
+    let brows = vec![BorrowedRow {
+        id: 7,
+        name: &owned,
+    }];
+    let bdata = TableValue::into_sql(brows);
+    let bcols = bdata.rows()[0].columns();
+    assert!(matches!(bcols[0], ColumnData::I32(Some(7))));
+    match &bcols[1] {
+        ColumnData::String(Some(v)) => assert_eq!(v.as_ref(), "borrowed"),
+        other => panic!("expected String, got {other:?}"),
+    }
+}

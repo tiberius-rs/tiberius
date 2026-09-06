@@ -100,7 +100,15 @@ impl FieldExt {
     }
     pub(crate) fn as_bind(&self) -> TokenStream {
         let name = &self.ident;
-        sp_quote!(data_row.add_field(self.#name))
+        // `bind_fields` receives `&self`, so we cannot move the field out (that
+        // would fail with E0507 for non-`Copy` types such as `String`/`Vec<u8>`).
+        // Borrowing (`&self.#name`) does not work either: the anonymous `&self`
+        // borrow is not guaranteed to outlive the `SqlTableDataRow<'a>` lifetime,
+        // so `&'_ String: IntoSql<'a>` fails to unify. Cloning produces an owned
+        // (or, for reference fields like `&str`, a copied reference) value that
+        // satisfies `IntoSql<'a>` for every documented field type. `.clone()` is
+        // a no-op copy for `Copy` scalars and reference fields.
+        sp_quote!(data_row.add_field(self.#name.clone()))
     }
 }
 
@@ -134,9 +142,9 @@ mod tests {
                     stringify! { SomeGeoList }
                 }
                 fn bind_fields(&self, data_row: &mut tiberius::SqlTableDataRow<'query>) {
-                    data_row.add_field(self.id);
-                    data_row.add_field(self.lat);
-                    data_row.add_field(self.lon);
+                    data_row.add_field(self.id.clone());
+                    data_row.add_field(self.lat.clone());
+                    data_row.add_field(self.lon.clone());
                 }
             }
         );
@@ -169,8 +177,8 @@ mod tests {
                     stringify! { AnotherGeoList }
                 }
                 fn bind_fields(&self, data_row: &mut tiberius::SqlTableDataRow<'e>) {
-                    data_row.add_field(self.id);
-                    data_row.add_field(self.s);
+                    data_row.add_field(self.id.clone());
+                    data_row.add_field(self.s.clone());
                 }
             }
         );
