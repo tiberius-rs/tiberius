@@ -132,13 +132,31 @@ impl<'a> TransactionManagerRequest<'a> {
 
 /// Encodes a `B_VARCHAR`: a single-byte count of UTF-16 code units followed by
 /// the string encoded as little-endian UCS-2 (MS-TDS 2.2.5.1.2).
-fn encode_b_varchar(dst: &mut BytesMut, s: &str) {
+///
+/// The length prefix is a single byte, so a string longer than 255 UTF-16 code
+/// units cannot be represented. Truncating the count with `as u8` while still
+/// writing every unit would corrupt the stream, so an over-long name is
+/// rejected instead.
+fn encode_b_varchar(dst: &mut BytesMut, s: &str) -> crate::Result<()> {
     let units: Vec<u16> = s.encode_utf16().collect();
+
+    if units.len() > u8::MAX as usize {
+        return Err(crate::Error::Protocol(
+            format!(
+                "transaction name is too long ({} UTF-16 code units, max 255)",
+                units.len()
+            )
+            .into(),
+        ));
+    }
+
     dst.put_u8(units.len() as u8);
 
     for unit in units {
         dst.put_u16_le(unit);
     }
+
+    Ok(())
 }
 
 impl<'a> Encode<BytesMut> for TransactionManagerRequest<'a> {
@@ -159,16 +177,16 @@ impl<'a> Encode<BytesMut> for TransactionManagerRequest<'a> {
                 name,
             } => {
                 dst.put_u8(isolation_level as u8);
-                encode_b_varchar(dst, &name);
+                encode_b_varchar(dst, &name)?;
             }
             TransactionRequestBody::Commit { name } | TransactionRequestBody::Rollback { name } => {
-                encode_b_varchar(dst, &name);
+                encode_b_varchar(dst, &name)?;
                 // Flags byte: bit 0 (`fBeginXact`) unset — do not begin a new
                 // transaction after commit/rollback.
                 dst.put_u8(0);
             }
             TransactionRequestBody::Save { name } => {
-                encode_b_varchar(dst, &name);
+                encode_b_varchar(dst, &name)?;
             }
         }
 
@@ -279,5 +297,30 @@ mod tests {
         }
 
         assert_eq!(&buf[..], &expected[..]);
+    }
+
+    // A B_VARCHAR length prefix is a single byte; a name longer than 255 UTF-16
+    // code units must error rather than truncate the count with `as u8` (which
+    // would keep writing every unit and corrupt the stream).
+    #[test]
+    fn encode_rejects_over_long_save_name() {
+        let desc = [1, 2, 3, 4, 5, 6, 7, 8];
+        let long = "a".repeat(256);
+        let req = TransactionManagerRequest::save(desc, long);
+
+        let mut buf = BytesMut::new();
+        let err = req.encode(&mut buf).unwrap_err();
+        assert!(matches!(err, crate::Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A name of exactly 255 units is still allowed (boundary of the guard).
+    #[test]
+    fn encode_accepts_max_length_save_name() {
+        let desc = [1, 2, 3, 4, 5, 6, 7, 8];
+        let name = "a".repeat(255);
+        let req = TransactionManagerRequest::save(desc, name);
+
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf).expect("255-unit name must encode");
     }
 }

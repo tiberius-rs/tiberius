@@ -394,10 +394,13 @@ pub enum ColumnFlag {
     /// Set for string columns with binary collation and always for the XML data
     /// type.
     CaseSensitive = 1 << 1,
-    /// If column is writeable.
-    Updateable = 1 << 3,
-    /// Column modification status unknown.
-    UpdateableUnknown = 1 << 2,
+    /// If column is writeable. This is value 1 (0b01) of the 2-bit
+    /// `usUpdateable` sub-field (MS-TDS §2.2.7.4), i.e. the low bit at position
+    /// 2 (0x04): `0 = read-only, 1 = read/write, 2 = unknown`.
+    Updateable = 1 << 2,
+    /// Column modification status unknown. This is value 2 (0b10) of the 2-bit
+    /// `usUpdateable` sub-field, i.e. the high bit at position 3 (0x08).
+    UpdateableUnknown = 1 << 3,
     /// Column is an identity.
     Identity = 1 << 4,
     /// Coulumn is computed.
@@ -651,6 +654,62 @@ mod tests {
             },
             col_name: Cow::Borrowed(name),
         }
+    }
+
+    // Bit-exact layout of the COLMETADATA `Flags` field per MS-TDS §2.2.7.4,
+    // in least-significant-bit order:
+    //   bit 0        fNullable
+    //   bit 1        fCaseSen
+    //   bits 2-3     usUpdateable (0=read-only, 1=read/write, 2=unknown)
+    //   bit 4        fIdentity
+    //   bit 5        fComputed
+    //   bits 6-7     usReservedODBC
+    //   bit 8        fFixedLenCLRType
+    //   ...
+    //   bit 13       fHidden
+    //   bit 14       fKey
+    //   bit 15       fNullableUnknown
+    // The `usUpdateable` sub-field is a 2-bit value, so read/write (value 1) is
+    // the low bit 0x04 and unknown (value 2) is the high bit 0x08. A server
+    // reporting a genuinely writeable column sets 0x04; `is_updateable()` must
+    // therefore key off 0x04, not 0x08.
+    #[test]
+    fn column_flag_bit_positions_match_ms_tds() {
+        assert_eq!(BitFlags::bits(BitFlags::from(ColumnFlag::Nullable)), 0x0001);
+        assert_eq!(
+            BitFlags::bits(BitFlags::from(ColumnFlag::CaseSensitive)),
+            0x0002
+        );
+        // usUpdateable: read/write = 0x04 (bit 2), unknown = 0x08 (bit 3).
+        assert_eq!(
+            BitFlags::bits(BitFlags::from(ColumnFlag::Updateable)),
+            0x0004
+        );
+        assert_eq!(
+            BitFlags::bits(BitFlags::from(ColumnFlag::UpdateableUnknown)),
+            0x0008
+        );
+        assert_eq!(BitFlags::bits(BitFlags::from(ColumnFlag::Identity)), 0x0010);
+    }
+
+    // A column the server reports as read/write (usUpdateable = 1, wire bit
+    // 0x04) must be seen as updateable; a column whose updateability is unknown
+    // (usUpdateable = 2, wire bit 0x08) must not.
+    #[test]
+    fn is_updateable_keys_off_read_write_bit() {
+        let read_write = BaseMetaDataColumn {
+            flags: BitFlags::from_bits_truncate(0x0004),
+            ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            table_name: None,
+        };
+        assert!(read_write.is_updateable());
+
+        let unknown = BaseMetaDataColumn {
+            flags: BitFlags::from_bits_truncate(0x0008),
+            ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            table_name: None,
+        };
+        assert!(!unknown.is_updateable());
     }
 
     #[test]
