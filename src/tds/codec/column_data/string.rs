@@ -18,7 +18,9 @@ where
     match (data, ty) {
         // Codepages other than UTF
         (Some(buf), BigChar) | (Some(buf), BigVarChar) => {
-            let collation = collation.as_ref().unwrap();
+            let collation = collation
+                .as_ref()
+                .ok_or_else(|| Error::Protocol("string column missing collation".into()))?;
             let encoder = collation.encoding()?;
 
             let s = encoder
@@ -44,5 +46,40 @@ where
             Ok(Some(s.into()))
         }
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+    use bytes::{BufMut, BytesMut};
+
+    // A BigVarChar (non-UTF codepage) value with the collation omitted by the
+    // server must return a protocol error rather than panicking on `unwrap`.
+    #[tokio::test]
+    async fn decode_bigvarchar_missing_collation_errors() {
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(2); // fixed-size PLP length prefix
+        buf.put_slice(&[0x41, 0x42]); // "AB" in an 8-bit codepage
+
+        let err = decode(
+            &mut buf.into_sql_read_bytes(),
+            VarLenType::BigVarChar,
+            2,
+            None,
+        )
+        .await
+        .expect_err("missing collation must error, not panic");
+
+        match err {
+            Error::Protocol(msg) => {
+                assert!(
+                    msg.contains("missing collation"),
+                    "unexpected protocol message: {msg}"
+                );
+            }
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
     }
 }
