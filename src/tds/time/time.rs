@@ -10,19 +10,45 @@ pub use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 use crate::tds::codec::ColumnData;
 
 #[inline]
-fn from_days(days: i64, start_year: i32) -> Date {
+fn from_days(days: i64, start_year: i32) -> crate::Result<Date> {
     // Use the signed `time::Duration` so that negative day offsets (dates
     // before `start_year`, e.g. `datetime` values prior to 1900) do not
     // overflow. Casting a negative day count into an unsigned type and
     // multiplying it out panics with "multiply with overflow".
     //
     // `days` ultimately comes from untrusted server bytes, so a malformed value
-    // can land outside the range `time::Date` can represent. Use `checked_add`
-    // and clamp to the type's bounds instead of panicking with "resulting value
-    // is out of range".
+    // can land outside the range `time::Date` can represent. Every valid SQL
+    // date (SQL's 0001-01-01..=9999-12-31 all fit within `time::Date`) succeeds;
+    // a genuinely out-of-range/malformed day offset is rejected as a protocol
+    // error rather than silently clamped to MIN/MAX (which would yield a wrong
+    // date).
     let base = Date::from_calendar_date(start_year, Month::January, 1).unwrap();
-    base.checked_add(time::Duration::days(days))
-        .unwrap_or(if days < 0 { Date::MIN } else { Date::MAX })
+    base.checked_add(time::Duration::days(days)).ok_or_else(|| {
+        crate::Error::Protocol(
+            format!("date day offset {days} is out of the representable range").into(),
+        )
+    })
+}
+
+/// Validate and convert a server-supplied UTC offset (in whole minutes) into a
+/// `UtcOffset`. SQL Server's `datetimeoffset` is only valid for the range
+/// -14:00..=+14:00; a malformed offset outside that range is rejected as a
+/// protocol error rather than silently falling back to UTC (which would shift
+/// the represented instant).
+#[inline]
+#[cfg(feature = "tds73")]
+fn offset_from_minutes(minutes: i16) -> crate::Result<UtcOffset> {
+    if !(-840..=840).contains(&minutes) {
+        return Err(crate::Error::Protocol(
+            format!(
+                "datetimeoffset offset {minutes} minutes is outside the valid -14:00..=+14:00 range"
+            )
+            .into(),
+        ));
+    }
+
+    UtcOffset::from_whole_seconds(minutes as i32 * 60)
+        .map_err(|_| crate::Error::Protocol("datetimeoffset offset is not representable".into()))
 }
 
 /// Convert a server-supplied fractional-seconds `increments` at the given
@@ -66,40 +92,57 @@ fn to_sec_fragments(from: Time) -> i64 {
 #[cfg(feature = "tds73")]
 from_sql!(
     PrimitiveDateTime:
-        ColumnData::SmallDateTime(ref dt) => dt.map(|dt| PrimitiveDateTime::new(
-            from_days(dt.days as i64, 1900),
-            from_secs(dt.seconds_fragments as u64 * 60),
-        )),
-        ColumnData::DateTime2(ref dt) => dt.map(|dt| PrimitiveDateTime::new(
-            from_days(dt.date.days() as i64, 1),
-            Time::from_hms(0,0,0).unwrap() + Duration::from_nanos(nanos_from_increments(dt.time.increments, dt.time.scale))
-        )),
-        ColumnData::DateTime(ref dt) => dt.map(|dt| PrimitiveDateTime::new(
-            from_days(dt.days as i64, 1900),
-            from_sec_fragments(dt.seconds_fragments as u64)
-        ));
+        ColumnData::SmallDateTime(ref dt) => match *dt {
+            Some(dt) => Some(PrimitiveDateTime::new(
+                from_days(dt.days as i64, 1900)?,
+                from_secs(dt.seconds_fragments as u64 * 60),
+            )),
+            None => None,
+        },
+        ColumnData::DateTime2(ref dt) => match *dt {
+            Some(dt) => Some(PrimitiveDateTime::new(
+                from_days(dt.date.days() as i64, 1)?,
+                Time::from_hms(0,0,0).unwrap() + Duration::from_nanos(nanos_from_increments(dt.time.increments, dt.time.scale))
+            )),
+            None => None,
+        },
+        ColumnData::DateTime(ref dt) => match *dt {
+            Some(dt) => Some(PrimitiveDateTime::new(
+                from_days(dt.days as i64, 1900)?,
+                from_sec_fragments(dt.seconds_fragments as u64)
+            )),
+            None => None,
+        };
     Time:
-        ColumnData::Time(ref time) => time.map(|time| {
-            let ns = nanos_from_increments(time.increments, time.scale);
-            Time::from_hms(0,0,0).unwrap() + Duration::from_nanos(ns)
-        });
+        ColumnData::Time(ref time) => match *time {
+            Some(time) => {
+                let ns = nanos_from_increments(time.increments, time.scale);
+                Some(Time::from_hms(0,0,0).unwrap() + Duration::from_nanos(ns))
+            }
+            None => None,
+        };
     Date:
-        ColumnData::Date(ref date) => date.map(|date| from_days(date.days() as i64, 1));
+        ColumnData::Date(ref date) => match *date {
+            Some(date) => Some(from_days(date.days() as i64, 1)?),
+            None => None,
+        };
     OffsetDateTime:
-        ColumnData::DateTimeOffset(ref dto) => dto.map(|dto| {
-            let date = from_days(dto.datetime2.date.days() as i64, 1);
-            let dt = dto.datetime2;
+        ColumnData::DateTimeOffset(ref dto) => match *dto {
+            Some(dto) => {
+                let date = from_days(dto.datetime2.date.days() as i64, 1)?;
+                let dt = dto.datetime2;
 
-            let time = Time::from_hms(0,0,0).unwrap()
-                + Duration::from_nanos(nanos_from_increments(dt.time.increments, dt.time.scale));
+                let time = Time::from_hms(0,0,0).unwrap()
+                    + Duration::from_nanos(nanos_from_increments(dt.time.increments, dt.time.scale));
 
-            // A malformed server offset outside ±14h is not representable by
-            // `UtcOffset`; fall back to UTC rather than panicking.
-            let offset = UtcOffset::from_whole_seconds(dto.offset as i32 * 60)
-                .unwrap_or(UtcOffset::UTC);
+                // A malformed server offset outside ±14h is rejected as a
+                // protocol error rather than silently shifting the instant to UTC.
+                let offset = offset_from_minutes(dto.offset)?;
 
-            date.with_time(time).assume_utc().to_offset(offset)
-        })
+                Some(date.with_time(time).assume_utc().to_offset(offset))
+            }
+            None => None,
+        }
 );
 
 #[cfg(feature = "tds73")]
@@ -152,9 +195,12 @@ to_sql!(self_,
 #[cfg(not(feature = "tds73"))]
 from_sql!(
     PrimitiveDateTime:
-    ColumnData::DateTime(ref dt) => dt.map(|dt| {
-        from_days(dt.days as i64, 1900).with_time(from_sec_fragments(dt.seconds_fragments as u64))
-    })
+    ColumnData::DateTime(ref dt) => match *dt {
+        Some(dt) => Some(
+            from_days(dt.days as i64, 1900)?.with_time(from_sec_fragments(dt.seconds_fragments as u64))
+        ),
+        None => None,
+    }
 );
 
 #[cfg(test)]
@@ -168,7 +214,7 @@ mod tests {
     fn from_days_handles_negative_offsets() {
         // 1899-12-31 is one day before the 1900 base date.
         assert_eq!(
-            from_days(-1, 1900),
+            from_days(-1, 1900).unwrap(),
             Date::from_calendar_date(1899, Month::December, 31).unwrap()
         );
 
@@ -181,7 +227,7 @@ mod tests {
         );
 
         // Rebuilding from the (negative) day offset must not overflow.
-        assert_eq!(from_days(days, 1900), expected);
+        assert_eq!(from_days(days, 1900).unwrap(), expected);
     }
 
     // Exercise the full decode path (`DateTime` -> `PrimitiveDateTime`) for a
@@ -194,6 +240,7 @@ mod tests {
         // Reconstruct the way the `from_sql!` mapping does for `ColumnData::DateTime`.
         let dt = crate::tds::time::DateTime::new(days, 0);
         let decoded = from_days(dt.days() as i64, 1900)
+            .unwrap()
             .with_time(from_sec_fragments(dt.seconds_fragments() as u64));
 
         assert_eq!(decoded.date(), expected_date);
@@ -201,12 +248,74 @@ mod tests {
     }
 
     #[test]
-    fn from_days_clamps_on_overflow() {
-        // A day offset far outside the representable `time::Date` range forces
-        // the `checked_add` fallback. Positive overflow clamps to MAX, negative
-        // to MIN. Pins the `days < 0` sign test (vs `==` / `>`).
-        assert_eq!(from_days(10_000_000, 1), Date::MAX);
-        assert_eq!(from_days(-10_000_000, 1), Date::MIN);
+    fn from_days_out_of_range_errors() {
+        // A day offset far outside the representable `time::Date` range must
+        // return a protocol error (rather than silently clamping to MIN/MAX,
+        // which would decode a malformed value to a plausible-but-wrong date).
+        for days in [10_000_000_i64, -10_000_000_i64] {
+            let err = from_days(days, 1).expect_err("out-of-range day offset must error");
+            assert!(
+                matches!(err, crate::Error::Protocol(_)),
+                "expected a protocol error, got {err:?}"
+            );
+        }
+
+        // A valid in-range date still decodes correctly (happy path unchanged).
+        assert_eq!(
+            from_days(0, 1).unwrap(),
+            Date::from_calendar_date(1, Month::January, 1).unwrap()
+        );
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn offset_from_minutes_rejects_out_of_range() {
+        // Valid SQL Server range -14:00..=+14:00 (±840 minutes) succeeds.
+        assert_eq!(
+            offset_from_minutes(60).unwrap(),
+            UtcOffset::from_whole_seconds(3600).unwrap()
+        );
+        assert_eq!(
+            offset_from_minutes(-840).unwrap(),
+            UtcOffset::from_whole_seconds(-840 * 60).unwrap()
+        );
+
+        // A malformed offset beyond ±14h must error, not silently fall back to UTC.
+        for minutes in [841_i16, -841, 5000, -5000] {
+            let err = offset_from_minutes(minutes).expect_err("out-of-range offset must error");
+            assert!(
+                matches!(err, crate::Error::Protocol(_)),
+                "expected a protocol error, got {err:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn nanos_from_increments_survives_large_scale() {
+        // A server-controlled `scale > 9` must not panic on the `9 - scale`
+        // underflow; the saturating arithmetic yields a bounded value.
+        let _ = nanos_from_increments(1, 255);
+        let _ = nanos_from_increments(u64::MAX, 0);
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn datetimeoffset_out_of_range_offset_errors() {
+        use crate::FromSql;
+
+        // Build a DateTimeOffset with an offset well outside ±14h.
+        let dt2 =
+            super::super::DateTime2::new(super::super::Date::new(0), super::super::Time::new(0, 7));
+        let dto = super::super::DateTimeOffset::new(dt2, 5000);
+        let data = ColumnData::DateTimeOffset(Some(dto));
+
+        let err =
+            OffsetDateTime::from_sql(&data).expect_err("out-of-range offset must error, not panic");
+        assert!(
+            matches!(err, crate::Error::Protocol(_)),
+            "expected a protocol error, got {err:?}"
+        );
     }
 
     #[cfg(feature = "tds73")]
@@ -317,13 +426,13 @@ mod tests {
         let sdt = crate::tds::time::SmallDateTime::new(1, 30); // 30 minutes past midnight on day 1 (1900-01-02)
         let data = ColumnData::SmallDateTime(Some(sdt));
         let decoded = PrimitiveDateTime::from_sql(&data).unwrap().unwrap();
-        assert_eq!(decoded.date(), from_days(1, 1900));
+        assert_eq!(decoded.date(), from_days(1, 1900).unwrap());
 
         // DateTime path.
         let dt = crate::tds::time::DateTime::new(1, 0);
         let data = ColumnData::DateTime(Some(dt));
         let decoded = PrimitiveDateTime::from_sql(&data).unwrap().unwrap();
-        assert_eq!(decoded.date(), from_days(1, 1900));
+        assert_eq!(decoded.date(), from_days(1, 1900).unwrap());
     }
 
     #[cfg(feature = "tds73")]
