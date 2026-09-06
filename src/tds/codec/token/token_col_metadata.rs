@@ -25,7 +25,11 @@ pub struct MetaDataColumn<'a> {
 
 impl<'a> Display for MetaDataColumn<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] ", self.col_name)?;
+        // Bracket-quote the identifier, escaping any literal `]` by doubling it
+        // (`]]`) per the T-SQL rule. Without this a column name containing `]`
+        // (e.g. `my]col`) would emit a malformed identifier `[my]col]`, breaking
+        // the `INSERT BULK (...)` column list this Display feeds into.
+        write!(f, "[{}] ", self.col_name.replace(']', "]]"))?;
 
         match &self.base.ty {
             TypeInfo::FixedLen(fixed) => match fixed {
@@ -578,5 +582,32 @@ mod tests {
                 "expected {rendered:?} to end with {expected_suffix:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(name: &'static str) -> MetaDataColumn<'static> {
+        MetaDataColumn {
+            base: BaseMetaDataColumn {
+                flags: BitFlags::empty(),
+                ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            },
+            col_name: Cow::Borrowed(name),
+        }
+    }
+
+    #[test]
+    fn display_escapes_closing_bracket_in_column_name() {
+        // A `]` in the column name must be doubled so the bracket-quoted
+        // identifier stays well-formed for the `INSERT BULK (...)` column list.
+        assert_eq!(format!("{}", column("my]col")), "[my]]col] int");
+    }
+
+    #[test]
+    fn display_leaves_plain_column_name_unchanged() {
+        assert_eq!(format!("{}", column("foo")), "[foo] int");
     }
 }
