@@ -3,12 +3,6 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use futures_util::io::AsyncReadExt;
 use std::io::{Cursor, Read};
 
-/// Upper bound on the server-declared token length before it is used to size an
-/// allocation. Session-state payloads are small (a few KiB of recoverable
-/// server settings); anything beyond a few MiB is malformed. Capping avoids a
-/// large-allocation DoS from a bogus length. 16 MiB is far above any legitimate
-/// token.
-
 /// A single session state value carried by a [`TokenSessionState`] token.
 ///
 /// Each entry is identified by a `state_id` and carries an opaque, driver
