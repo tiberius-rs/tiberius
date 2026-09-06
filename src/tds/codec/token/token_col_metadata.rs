@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     tds::codec::{Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
-    Column, ColumnData, ColumnType, SqlReadBytes,
+    Column, ColumnData, ColumnType, Error, SqlReadBytes,
 };
 use asynchronous_codec::BytesMut;
 use bytes::BufMut;
