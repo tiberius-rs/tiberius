@@ -184,12 +184,18 @@ impl Encode<BytesMut> for Numeric {
 
 impl Debug for Numeric {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+        // Use `unsigned_abs()` rather than `.abs()`: a server may send an
+        // adversarial magnitude that decodes to `i128::MIN` (or any value whose
+        // negation overflows), and `i128::abs()` panics ("attempt to negate with
+        // overflow") for `i128::MIN`. `unsigned_abs()` returns a `u128` and never
+        // overflows, so `Debug`-formatting is total for all i128 inputs while
+        // preserving the output for every in-range value.
         write!(
             f,
             "{}{}.{:0pad$}",
             if self.value() < 0 { "-" } else { "" },
-            self.int_part().abs(),
-            self.dec_part().abs(),
+            self.int_part().unsigned_abs(),
+            self.dec_part().unsigned_abs(),
             pad = self.scale as usize
         )
     }
@@ -414,6 +420,36 @@ mod tests {
             Numeric::new_with_scale(-123, 37).to_string(),
             "-0.0000000000000000000000000000000000123"
         );
+    }
+
+    // An adversarial server can send a 17-byte NUMERIC magnitude that
+    // `Numeric::decode` casts `as i128` into `i128::MIN` (whose two's-complement
+    // negation overflows). `Debug`/`Display` must not panic on such a value.
+    #[test]
+    fn debug_does_not_panic_on_i128_min() {
+        for scale in [0u8, 2, 37] {
+            let n = Numeric {
+                value: i128::MIN,
+                scale,
+            };
+            // Both must produce *some* string without panicking on `.abs()`.
+            let _ = format!("{:?}", n);
+            let _ = format!("{}", n);
+        }
+    }
+
+    // A value just below 2^127 also wraps negative when cast `as i128`; formatting
+    // it must likewise be total.
+    #[test]
+    fn debug_does_not_panic_near_2_pow_127() {
+        // (2^127 - 1) reinterpreted as i128 is i128::MAX; (2^127) wraps to i128::MIN.
+        // Exercise a spread of large-magnitude values around the boundary.
+        for value in [i128::MAX, i128::MIN, i128::MIN + 1, i128::MAX - 1] {
+            for scale in [0u8, 5, 37] {
+                let n = Numeric { value, scale };
+                let _ = format!("{:?}", n);
+            }
+        }
     }
 
     #[test]

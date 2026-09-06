@@ -388,6 +388,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         // as cheap defense-in-depth; see the `# Security` note above.
         validate_bulk_table_identifier(table)?;
 
+        // Each `columns` entry is likewise interpolated directly into the SQL
+        // (both the metadata `SELECT` and the `INSERT BULK` column list), so it
+        // gets the same cheap defense-in-depth guard as `table`.
+        for column in columns {
+            validate_bulk_column_identifier(column)?;
+        }
+
         // Start the bulk request
         self.connection.flush_stream().await?;
 
@@ -522,9 +529,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
 /// multi-part names (`schema.table`), already-bracketed names (`[my table]`) and
 /// temp tables (`##bulk_test`) keep working unchanged.
 fn validate_bulk_table_identifier(table: &str) -> crate::Result<()> {
-    if table.chars().any(|c| c.is_ascii_control()) {
+    validate_bulk_identifier("table", table)
+}
+
+/// Reject an obviously-malformed or dangerous bulk-insert `column` identifier.
+///
+/// Column names are interpolated into the metadata `SELECT` and `INSERT BULK`
+/// column list exactly like `table`, so they get the same cheap
+/// defense-in-depth check. See [`validate_bulk_table_identifier`].
+fn validate_bulk_column_identifier(column: &str) -> crate::Result<()> {
+    validate_bulk_identifier("column", column)
+}
+
+/// Shared implementation for the bulk `table`/`column` identifier guards.
+/// `what` names the kind of identifier for the error message.
+fn validate_bulk_identifier(what: &str, ident: &str) -> crate::Result<()> {
+    if ident.chars().any(|c| c.is_ascii_control()) {
         return Err(crate::Error::BulkInput(
-            "bulk insert table identifier must not contain NUL or control characters".into(),
+            format!("bulk insert {what} identifier must not contain NUL or control characters")
+                .into(),
         ));
     }
 
@@ -533,7 +556,7 @@ fn validate_bulk_table_identifier(table: &str) -> crate::Result<()> {
     // outside of any bracket is unbalanced and rejected. Tracking bracket state
     // keeps legitimate names like `[dbo].[my table]` and `[weird]]name]`
     // working while catching stray closing brackets such as `Foo]`.
-    let bytes = table.as_bytes();
+    let bytes = ident.as_bytes();
     let mut in_bracket = false;
     let mut i = 0;
     while i < bytes.len() {
@@ -550,7 +573,8 @@ fn validate_bulk_table_identifier(table: &str) -> crate::Result<()> {
             }
             b']' => {
                 return Err(crate::Error::BulkInput(
-                    "bulk insert table identifier contains an unbalanced `]` bracket".into(),
+                    format!("bulk insert {what} identifier contains an unbalanced `]` bracket")
+                        .into(),
                 ));
             }
             _ => {}
@@ -563,7 +587,27 @@ fn validate_bulk_table_identifier(table: &str) -> crate::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_bulk_table_identifier;
+    use super::{validate_bulk_column_identifier, validate_bulk_table_identifier};
+
+    #[test]
+    fn accepts_normal_column_identifiers() {
+        for column in ["foo", "bar", "*", "[my col]", "[weird]]col]"] {
+            assert!(
+                validate_bulk_column_identifier(column).is_ok(),
+                "expected column {column:?} to be accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bad_column_identifiers() {
+        // control character
+        assert!(validate_bulk_column_identifier("foo\0bar").is_err());
+        assert!(validate_bulk_column_identifier("foo\nbar").is_err());
+        // lone / unbalanced closing bracket
+        assert!(validate_bulk_column_identifier("foo]").is_err());
+        assert!(validate_bulk_column_identifier("a]b").is_err());
+    }
 
     #[test]
     fn accepts_normal_identifiers() {
