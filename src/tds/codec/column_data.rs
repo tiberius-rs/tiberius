@@ -196,7 +196,11 @@ impl<'a> ColumnData<'a> {
                 VarLenType::Decimaln | VarLenType::Numericn => {
                     ColumnData::Numeric(Numeric::decode(src, *scale).await?)
                 }
-                _ => todo!(),
+                _ => {
+                    return Err(crate::Error::Protocol(
+                        format!("unexpected type {ty:?} for a precision/scale-typed column").into(),
+                    ))
+                }
             },
             TypeInfo::Xml { schema, size } => xml::decode(src, *size, schema.clone()).await?,
             TypeInfo::Udt(_) => udt::decode(src).await?,
@@ -880,18 +884,25 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     let num = if target_scale == num.scale() {
                         num
                     } else if target_scale > num.scale() {
-                        // Scale up: multiply, checking for i128 overflow.
-                        let factor = 10i128.pow((target_scale - num.scale()) as u32);
-                        let value = num.value().checked_mul(factor).ok_or_else(|| {
-                            crate::Error::Conversion(
-                                "numeric value overflows when scaling to the column's scale".into(),
-                            )
-                        })?;
+                        // Scale up: multiply, checking for i128 overflow. Both the
+                        // exponent (10^delta) and the multiplication use server-
+                        // controlled scales, so both must be checked to avoid a
+                        // panic (debug) / silent wrap (release).
+                        let exp = (target_scale - num.scale()) as u32;
+                        let value = 10i128
+                            .checked_pow(exp)
+                            .and_then(|factor| num.value().checked_mul(factor))
+                            .ok_or_else(|| {
+                                crate::Error::Protocol("numeric rescale overflow".into())
+                            })?;
                         Numeric::new_with_scale(value, target_scale)
                     } else {
                         // Scale down: divide, rounding half away from zero
                         // (this loses precision beyond the column's scale).
-                        let factor = 10i128.pow((num.scale() - target_scale) as u32);
+                        let exp = (num.scale() - target_scale) as u32;
+                        let factor = 10i128.checked_pow(exp).ok_or_else(|| {
+                            crate::Error::Protocol("numeric rescale overflow".into())
+                        })?;
                         let half = factor / 2;
                         let v = num.value();
                         let value = if v >= 0 {
@@ -1831,8 +1842,7 @@ mod tests {
     // ----- decode: line 199 (VarLenSizedPrecision non-numeric -> todo!()) -----
 
     #[tokio::test]
-    #[should_panic]
-    async fn decode_varlen_sized_precision_unsupported_panics() {
+    async fn decode_varlen_sized_precision_unsupported_errors() {
         let ti = TypeInfo::VarLenSizedPrecision {
             ty: VarLenType::Money,
             size: 8,
@@ -1841,7 +1851,10 @@ mod tests {
         };
         let buf = BytesMut::new();
         let reader = &mut buf.into_sql_read_bytes();
-        let _ = ColumnData::decode(reader, &ti).await;
+        let err = ColumnData::decode(reader, &ti)
+            .await
+            .expect_err("decode should error, not panic");
+        assert!(matches!(err, Error::Protocol(_)), "got {:?}", err);
     }
 
     // ----- decode: line 202 (Udt) -----
@@ -2124,6 +2137,42 @@ mod tests {
             nd,
             ColumnData::Numeric(Some(Numeric::new_with_scale(123, 2)))
         );
+    }
+
+    #[tokio::test]
+    async fn numeric_rescale_up_overflow_errors() {
+        // A server-controlled column scale far above the value's scale makes the
+        // rescale factor (10^delta) overflow i128. This must return a protocol
+        // error instead of panicking (debug) / silently wrapping (release).
+        let ti = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Numericn,
+            size: 17,
+            precision: 38,
+            scale: 39, // delta 39 from the value's scale 0 -> 10^39 overflows i128
+        };
+        let err = encode_with_ti(
+            &ti,
+            ColumnData::Numeric(Some(Numeric::new_with_scale(1, 0))),
+        )
+        .expect_err("overflowing rescale must error, not panic");
+        assert!(matches!(err, Error::Protocol(_)), "got {:?}", err);
+    }
+
+    #[tokio::test]
+    async fn numeric_rescale_up_large_value_overflow_errors() {
+        // In-range factor but the multiplication overflows i128.
+        let ti = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Numericn,
+            size: 17,
+            precision: 38,
+            scale: 30,
+        };
+        let err = encode_with_ti(
+            &ti,
+            ColumnData::Numeric(Some(Numeric::new_with_scale(i128::MAX / 2, 0))),
+        )
+        .expect_err("overflowing multiply must error, not panic");
+        assert!(matches!(err, Error::Protocol(_)), "got {:?}", err);
     }
 
     // ----- SQL_VARIANT encode (lines 897-898) -----
