@@ -242,8 +242,72 @@ impl<'a> LoginMessage<'a> {
         self.packet_size = size;
     }
 
+    /// Exact number of bytes [`Self::encode_to_vec`] will write, i.e. the final
+    /// length of the LOGIN7 buffer.
+    ///
+    /// This is used to reserve the whole buffer up front so it never reallocates
+    /// while the (obfuscated) password lives inside it — see the security note
+    /// in `encode_to_vec`. The layout mirrors the writes in `encode_to_vec`
+    /// exactly; if that layout changes this must change with it (the capacity
+    /// assertion at the end of `encode_to_vec` guards against drift).
+    fn encoded_len(&self) -> usize {
+        // Fixed prefix written before any variable-length data. This equals the
+        // initial `data_offset` computed in `encode_to_vec`:
+        //   4 (length) + 5 * 4 (header u32s) + 4 (flag bytes) + 2 * 4 (tz + lcid)
+        //     = 36 bytes of fixed header, then
+        //   var_data.len() (13) * 2 * 2 offset/length table entries + 6
+        //     (2 extra ClientId bytes + 4-byte cbSSPILong)
+        //     = 36 + 52 + 6 = 94.
+        const FIXED_OVERHEAD: usize = 94;
+
+        // Every variable-length string is encoded as UTF-16 (2 bytes/unit).
+        fn utf16_bytes(s: &str) -> usize {
+            s.encode_utf16().count() * 2
+        }
+
+        let mut len = FIXED_OVERHEAD;
+        len += utf16_bytes(&self.hostname);
+        len += utf16_bytes(&self.username);
+        len += utf16_bytes(&self.password);
+        len += utf16_bytes(&self.app_name);
+        len += utf16_bytes(&self.server_name);
+        len += utf16_bytes(&self.db_name);
+
+        if let Some(ref bytes) = self.integrated_security {
+            len += bytes.len();
+        }
+
+        if let Some(ref ext) = self.fed_auth_ext {
+            // 4 (FeatureExt data offset) + 1 (FEA_EXT_FEDAUTH) + 4 (feature ext
+            // length) + 1 (options) + 4 (token length) + token bytes + nonce
+            // + 1 (FEA_EXT_TERMINATOR).
+            len += 15 + utf16_bytes(&ext.fed_auth_token);
+            if ext.nonce.is_some() {
+                len += 32;
+            }
+        }
+
+        len
+    }
+
     pub(crate) fn encode_to_vec(self) -> crate::Result<Zeroizing<Vec<u8>>> {
-        let mut cursor = Cursor::new(Vec::with_capacity(512));
+        // SECURITY (password zeroization): the password is written into this
+        // buffer (only lightly obfuscated with a trivially reversible transform)
+        // and the returned `Vec` is wrapped in `Zeroizing` so it is wiped on
+        // drop. That wipe only covers the buffer's *current* heap allocation. If
+        // the `Vec` were to reallocate *after* the password bytes were written
+        // (e.g. because a later field such as db_name or the fed-auth token grew
+        // it past its capacity), the old allocation would be freed WITHOUT being
+        // zeroized, leaving a recoverable plaintext-equivalent copy of the
+        // password in freed heap.
+        //
+        // To make that impossible we reserve the exact final size up front,
+        // before writing any variable-length data, so no reallocation can occur
+        // during encoding. The `assert_eq!` at the end verifies the capacity
+        // never changed, so any future change that breaks this invariant fails
+        // loudly instead of silently leaking a password copy.
+        let mut cursor = Cursor::new(Vec::with_capacity(self.encoded_len()));
+        let reserved_capacity = cursor.get_ref().capacity();
 
         // Space for the length
         cursor.write_u32::<LittleEndian>(0)?;
@@ -393,6 +457,17 @@ impl<'a> LoginMessage<'a> {
 
         cursor.set_position(0);
         cursor.write_u32::<LittleEndian>(cursor.get_ref().len() as u32)?;
+
+        // The password lived in this buffer; a reallocation here would have
+        // leaked an un-zeroized copy into freed heap (see the security note
+        // above). Reserving `encoded_len()` up front must have prevented any
+        // growth — verify the invariant held.
+        assert_eq!(
+            cursor.get_ref().capacity(),
+            reserved_capacity,
+            "LOGIN7 encode buffer reallocated during encoding: a plaintext-equivalent \
+             password copy may have been left in freed heap. `encoded_len()` under-reserved."
+        );
 
         Ok(Zeroizing::new(cursor.into_inner()))
     }
@@ -639,6 +714,53 @@ mod tests {
                 nonce: Some(nonce)
             }
         )
+    }
+
+    #[test]
+    fn encoded_len_matches_actual_output_length() {
+        // The reserved capacity must equal the bytes actually produced, so no
+        // reallocation can occur while the password is in the buffer.
+        let mut login = LoginMessage::new();
+        login.db_name("some-database");
+        login.user_name("some-user");
+        login.password("hunter2");
+        login.server_name("some-server");
+
+        let expected = login.encoded_len();
+        let encoded = login.encode_to_vec().expect("encode should succeed");
+        assert_eq!(encoded.len(), expected);
+    }
+
+    #[test]
+    fn large_fields_do_not_reallocate_encode_buffer() {
+        // Fields far larger than the old fixed 512-byte capacity: with the old
+        // code the Vec would reallocate after the password was written, leaking
+        // an un-zeroized copy. `encode_to_vec` now asserts the capacity never
+        // changed, so this both exercises and enforces the fix.
+        let mut login = LoginMessage::new();
+        login.user_name("u".repeat(200));
+        login.password("p".repeat(400));
+        login.db_name("d".repeat(400));
+        login.server_name("s".repeat(200));
+        login.app_name("a".repeat(200));
+
+        let expected = login.encoded_len();
+        let encoded = login.encode_to_vec().expect("encode should succeed");
+        assert_eq!(encoded.len(), expected);
+    }
+
+    #[test]
+    fn large_fed_auth_token_does_not_reallocate() {
+        // Same invariant on the fed-auth path, whose token/nonce are written
+        // after the password.
+        let mut login = LoginMessage::new();
+        login.password("p".repeat(300));
+        login.db_name("d".repeat(300));
+        login.aad_token("t".repeat(500), true, Some([7u8; 32]));
+
+        let expected = login.encoded_len();
+        let encoded = login.encode_to_vec().expect("encode should succeed");
+        assert_eq!(encoded.len(), expected);
     }
 
     #[test]
