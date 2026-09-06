@@ -575,6 +575,106 @@ mod tests {
     }
 
     #[test]
+    fn read_private_key_missing_file_preserves_io_error() {
+        let err = read_private_key(Path::new("docker/certs/does-not-exist.key")).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Could not read private key"),
+            "error should name the read failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_private_key_reads_pem() {
+        let key = read_private_key(Path::new("docker/certs/server.key")).unwrap();
+        assert!(!key.secret_der().is_empty());
+    }
+
+    #[test]
+    fn read_private_key_reads_der() {
+        // No .der fixture is checked in, so derive one from the PEM key and write
+        // it to a temp file to exercise the `der` branch.
+        let der = read_private_key(Path::new("docker/certs/server.key"))
+            .unwrap()
+            .secret_der()
+            .to_vec();
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "tiberius_read_private_key_{}.der",
+            std::process::id()
+        ));
+        std::fs::write(&path, &der).unwrap();
+        let key = read_private_key(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(!key.unwrap().secret_der().is_empty());
+    }
+
+    #[test]
+    fn read_private_key_unsupported_extension_errors() {
+        // README.md exists under docker/certs but isn't a supported key type.
+        let err = read_private_key(Path::new("docker/certs/README.md")).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unsupported file-extension"),
+            "error should name the unsupported extension, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_private_key_malformed_pem_errors() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "tiberius_read_private_key_malformed_{}.pem",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            b"-----BEGIN PRIVATE KEY-----\nnot valid base64!!!\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let err = read_private_key(&path);
+        std::fs::remove_file(&path).ok();
+        let msg = format!("{:?}", err.unwrap_err());
+        assert!(
+            msg.contains("Failed to parse PEM private key"),
+            "error should name the parse failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_cert_chain_zero_cert_pem_is_empty() {
+        // A PEM file with no certificate blocks parses to zero certificates.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "tiberius_read_cert_chain_zero_{}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"# no certificates here\n").unwrap();
+        let chain = read_cert_chain(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(chain.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn build_ca_trust_store_rejects_zero_cert_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "tiberius_build_ca_trust_store_zero_{}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"# no certificates here\n").unwrap();
+        let certs = read_cert_chain(&path).unwrap();
+        assert_eq!(certs.len(), 0);
+        let err = build_ca_trust_store(certs, &path);
+        std::fs::remove_file(&path).ok();
+        let msg = format!("{:?}", err.unwrap_err());
+        assert!(
+            msg.contains("found 0"),
+            "error should mention the zero-cert count, got: {msg}"
+        );
+    }
+
+    #[test]
     fn supported_verify_schemes_are_stable() {
         let schemes = NoCertVerifier.supported_verify_schemes();
         assert_eq!(schemes.len(), 11);
