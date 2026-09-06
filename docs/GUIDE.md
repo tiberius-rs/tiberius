@@ -178,13 +178,24 @@ Named RPC with input, output and table-valued parameters is supported via the
 [`Command`] API. A TVP row type derives `TableValueRow`:
 
 ```rust,ignore
-use tiberius::TableValueRow;
+use tiberius::{Command, TableValueRow};
 
+// Fields may be `Copy` scalars (`i32`, `Numeric`, `Uuid`, …), owned columns
+// (`String`, `Vec<u8>`), or borrowed `&str`/`&[u8]` (with a struct lifetime).
 #[derive(TableValueRow)]
 struct Item {
     #[colname = "Id"]   id: i32,
     #[colname = "Name"] name: String,
 }
+
+let rows = vec![
+    Item { id: 1, name: "one".to_owned() },
+    Item { id: 2, name: "two".to_owned() },
+];
+
+let mut cmd = Command::new("dbo.InsertItems");
+cmd.bind_table_with_dbtype("items", "dbo.ItemList", rows);
+let mut stream = cmd.exec(&mut client).await?;
 ```
 
 ## Transactions

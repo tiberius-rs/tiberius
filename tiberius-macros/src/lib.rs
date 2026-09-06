@@ -28,6 +28,8 @@ mod table_value_param;
 /// pub struct SomeGeoList {
 ///   #[colname = "SomeID"]
 ///   pub id: i32,
+///   #[colname = "Label"]
+///   pub label: String,
 ///   #[colname = "LastSyncIPGeoLat"]
 ///   pub lat: Numeric,
 ///   #[colname = "LastSyncIPGeoLong"]
@@ -37,12 +39,24 @@ mod table_value_param;
 ///
 /// # Supported field types
 ///
-/// Each field is bound with `SqlTableDataRow::add_field(self.<field>)`, so the
-/// field type must implement `IntoSql` *by value*. That covers the `Copy`
-/// scalar/marker types (`i32`, `i64`, `bool`, `f64`, `Numeric`, `Uuid`, …) and
-/// borrowed strings/bytes (`&str`, `&[u8]`). Owned, non-`Copy` columns such as
-/// `String` or `Vec<u8>` cannot be moved out of `&self`; model those columns as
-/// `&str` / `&[u8]` (with a struct lifetime) instead.
+/// Each field is bound with `SqlTableDataRow::add_field(self.<field>.clone())`.
+/// Because `bind_fields` receives `&self`, the field value cannot be moved out
+/// and is instead cloned into the row, so every field type must implement both
+/// `Clone` and `IntoSql`. That covers:
+///
+/// - the `Copy` scalar/marker types (`i32`, `i64`, `bool`, `f64`, `u8`, `i16`,
+///   `f32`, `Numeric`, `Uuid`), where `clone` is a plain copy;
+/// - owned, non-`Copy` columns (`String`, `Vec<u8>`, `XmlData`), which are
+///   cloned by value;
+/// - borrowed strings/bytes (`&str`, `&[u8]`) via a struct lifetime, where
+///   `clone` just copies the reference (no allocation);
+/// - `Option<T>` of any of the above.
+///
+/// # Limitations
+///
+/// The derive supports structs with named fields and at most one lifetime
+/// parameter. Generic type parameters (`struct Row<T> { .. }`), tuple/unit
+/// structs, and enums/unions are not supported and produce a compile error.
 #[proc_macro_derive(TableValueRow, attributes(colname))]
 pub fn table_value_param(input: TokenStream) -> TokenStream {
     let ast: syn::DeriveInput = match syn::parse(input) {

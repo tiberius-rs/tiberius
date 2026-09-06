@@ -103,6 +103,29 @@ impl<'a> SqlTableDataRow<'a> {
     pub fn add_field(&mut self, data: impl IntoSql<'a> + 'a) {
         self.col_data.push(data.into_sql());
     }
+
+    /// The column values bound to this row, in bind order. Exposed for testing
+    /// `TableValueRow` implementations without a live server connection.
+    #[doc(hidden)]
+    pub fn columns(&self) -> &[ColumnData<'a>] {
+        &self.col_data
+    }
+}
+
+impl<'a> SqlTableData<'a> {
+    /// The rows collected for this table-valued parameter. Exposed for testing
+    /// `TableValue`/`TableValueRow` implementations without a live server.
+    #[doc(hidden)]
+    pub fn rows(&self) -> &[SqlTableDataRow<'a>] {
+        &self.rows
+    }
+
+    /// The database type name for this table-valued parameter. Exposed for
+    /// testing.
+    #[doc(hidden)]
+    pub fn db_type(&self) -> &str {
+        self.db_type
+    }
 }
 
 impl<'a> Command<'a> {
