@@ -1,6 +1,12 @@
 use crate::{Error, SqlReadBytes};
 use futures_util::io::AsyncReadExt;
 
+/// Upper bound on the server-declared `TokenLength` before it is used to size an
+/// allocation. A `FEDAUTHINFO` token only carries a small handful of URLs/SPNs,
+/// so anything beyond a few MiB is malformed; capping avoids a large-allocation
+/// DoS from a bogus length. 16 MiB is far above any legitimate token.
+const MAX_FED_AUTH_INFO_LEN: usize = 16 * 1024 * 1024;
+
 /// `FedAuthInfoId` for the STS URL, an Active Directory Security Token Service
 /// endpoint that the client contacts to acquire an access token.
 const FED_AUTH_INFO_ID_STSURL: u8 = 0x01;
@@ -40,6 +46,15 @@ impl TokenFedAuthInfo {
         // TokenLength: the length, in bytes, of the token value that follows,
         // starting at (and including) `CountOfInfoIDs`.
         let token_length = src.read_u32_le().await? as usize;
+
+        if token_length > MAX_FED_AUTH_INFO_LEN {
+            return Err(Error::Protocol(
+                format!(
+                    "FEDAUTHINFO token length {token_length} exceeds the maximum of {MAX_FED_AUTH_INFO_LEN}"
+                )
+                .into(),
+            ));
+        }
 
         let mut body = vec![0u8; token_length];
         src.read_exact(&mut body).await?;
@@ -183,5 +198,21 @@ mod tests {
         body.extend_from_slice(&1000u32.to_le_bytes()); // bogus offset
 
         assert!(TokenFedAuthInfo::parse(&body).is_err());
+    }
+
+    // A bogus TokenLength beyond the cap must be rejected before it is used to
+    // size the body allocation, rather than attempting a multi-GiB allocation.
+    #[tokio::test]
+    async fn rejects_oversized_token_length() {
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+        use bytes::{BufMut, BytesMut};
+
+        let mut buf = BytesMut::new();
+        buf.put_u32_le(MAX_FED_AUTH_INFO_LEN as u32 + 1);
+
+        let err = TokenFedAuthInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
     }
 }

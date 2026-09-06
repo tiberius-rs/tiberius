@@ -42,8 +42,40 @@ where
         NText => super::text::decode(src, None).await?,
         Image => super::image::decode(src).await?,
         SSVariant => super::sql_variant::decode(src).await?,
-        t => unimplemented!("{:?}", t),
+        // A VarLenType with no decode arm here is either a type the server must
+        // not send in a ROW (e.g. Xml/Udt are handled elsewhere) or one we do
+        // not model. Return a protocol error rather than `unimplemented!()`,
+        // which would panic the connection task on server-controlled input.
+        t => {
+            return Err(crate::Error::Protocol(
+                format!(
+                    "unsupported variable-length column type in row data: {:?}",
+                    t
+                )
+                .into(),
+            ))
+        }
     };
 
     Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+    use bytes::BytesMut;
+
+    // A VarLenType with no decode arm (here Udt) must surface a protocol error
+    // rather than panic via `unimplemented!()` on server-controlled input.
+    #[tokio::test]
+    async fn unsupported_var_len_type_errors_not_panics() {
+        let ctx = VarLenContext::new(VarLenType::Udt, 0, None);
+        let mut reader = BytesMut::new().into_sql_read_bytes();
+
+        let err = decode(&mut reader, &ctx)
+            .await
+            .expect_err("an unsupported var-len type must error");
+        assert!(matches!(err, crate::Error::Protocol(_)), "got {err:?}");
+    }
 }
