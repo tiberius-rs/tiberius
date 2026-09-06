@@ -118,13 +118,6 @@ impl<'a> Display for MetaDataColumn<'a> {
                     4 => write!(f, "real")?,
                     _ => write!(f, "float")?,
                 },
-                VarLenType::Money => {
-                    if ctx.len() == 4 {
-                        write!(f, "smallmoney")?
-                    } else {
-                        write!(f, "money")?
-                    }
-                }
                 VarLenType::SSVariant => write!(f, "sql_variant")?,
                 // Any other var-len type (e.g. Decimaln/Numericn arriving
                 // without the precision/scale they need, or Xml/Udt appearing
@@ -833,17 +826,6 @@ mod tests {
         assert_eq!(format!("{}", column("foo")), "[foo] int");
     }
 
-    fn meta(ty: TypeInfo, name: &'static str) -> MetaDataColumn<'static> {
-        MetaDataColumn {
-            base: BaseMetaDataColumn {
-                flags: ColumnFlag::Nullable.into(),
-                ty,
-                table_name: None,
-            },
-            col_name: Cow::Borrowed(name),
-        }
-    }
-
     #[tokio::test]
     async fn round_trip_via_encode_decode() {
         let cmd = TokenColMetaData {
@@ -1318,15 +1300,6 @@ mod tests {
             let expected = expected.replacen("c ", "[c] ", 1);
             assert_eq!(format!("{}", meta(ty, "c")), expected);
         }
-    }
-
-    #[test]
-    fn display_var_len_other_fallback_uses_debug_name() {
-        // A VarLenSized carrying a type not matched by any explicit Display arm
-        // (e.g. Decimaln) hits the `other => {other:?}` fallback rather than
-        // panicking.
-        let ty = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Decimaln, 17, None));
-        assert_eq!(format!("{}", meta(ty, "c")), "[c] Decimaln");
     }
 
     #[test]

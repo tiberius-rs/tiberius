@@ -1,11 +1,6 @@
 use crate::{Error, SqlReadBytes};
 use futures_util::io::AsyncReadExt;
 
-/// Upper bound on the server-declared `TokenLength` before it is used to size an
-/// allocation. A `FEDAUTHINFO` token only carries a small handful of URLs/SPNs,
-/// so anything beyond a few MiB is malformed; capping avoids a large-allocation
-/// DoS from a bogus length. 16 MiB is far above any legitimate token.
-
 /// `FedAuthInfoId` for the STS URL, an Active Directory Security Token Service
 /// endpoint that the client contacts to acquire an access token.
 const FED_AUTH_INFO_ID_STSURL: u8 = 0x01;
