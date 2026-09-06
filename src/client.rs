@@ -22,7 +22,7 @@ use crate::{
         codec::{self, IteratorJoin},
         stream::{QueryStream, TokenStream},
     },
-    BulkLoadRequest, ColumnFlag, MetaDataColumn, SqlReadBytes, ToSql,
+    BulkLoadRequest, MetaDataColumn, SqlReadBytes, ToSql,
 };
 use codec::{
     BatchRequest, ColumnData, IsolationLevel, PacketHeader, RpcParam, RpcProcId, TokenRpcRequest,
@@ -423,7 +423,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .column_metadata(table, columns)
             .await?
             .into_iter()
-            .filter(|column| column.base.flags.contains(ColumnFlag::Updateable))
+            .filter(|column| column.base.is_updateable())
             .collect();
 
         // `text`/`ntext`/`image` columns must carry the destination TableName in

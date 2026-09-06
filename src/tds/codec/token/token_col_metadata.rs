@@ -191,8 +191,15 @@ impl BaseMetaDataColumn {
     }
 
     /// `true` if the column is writeable (e.g. usable as a bulk-insert target).
+    ///
+    /// The COLMETADATA `usUpdateable` sub-field (MS-TDS §2.2.7.4) is one of
+    /// read-only (0), read/write (1), or **unknown** (2). SQL Server reports
+    /// `unknown` for many legitimate bulk-target columns rather than an explicit
+    /// read/write, so both read/write and unknown are treated as writeable here;
+    /// only an explicit read-only column (neither flag set) is excluded.
     pub fn is_updateable(&self) -> bool {
         self.flags.contains(ColumnFlag::Updateable)
+            || self.flags.contains(ColumnFlag::UpdateableUnknown)
     }
 
     pub(crate) fn null_value(&self) -> ColumnData<'static> {
@@ -699,11 +706,14 @@ mod tests {
         assert_eq!(BitFlags::bits(BitFlags::from(ColumnFlag::Identity)), 0x0010);
     }
 
-    // A column the server reports as read/write (usUpdateable = 1, wire bit
-    // 0x04) must be seen as updateable; a column whose updateability is unknown
-    // (usUpdateable = 2, wire bit 0x08) must not.
+    // `is_updateable()` means "not read-only", i.e. a valid bulk-insert target.
+    // usUpdateable read/write (1, wire bit 0x04) and unknown (2, wire bit 0x08)
+    // are both writeable; only explicit read-only (0, neither bit) is excluded.
+    // SQL Server reports `unknown` for many real bulk-target columns, so treating
+    // it as writeable is required (keying off the read/write bit alone drops
+    // every column and breaks bulk insert entirely).
     #[test]
-    fn is_updateable_keys_off_read_write_bit() {
+    fn is_updateable_true_for_read_write_and_unknown_false_for_read_only() {
         let read_write = BaseMetaDataColumn {
             flags: BitFlags::from_bits_truncate(0x0004),
             ty: TypeInfo::FixedLen(FixedLenType::Int4),
@@ -716,7 +726,14 @@ mod tests {
             ty: TypeInfo::FixedLen(FixedLenType::Int4),
             table_name: None,
         };
-        assert!(!unknown.is_updateable());
+        assert!(unknown.is_updateable());
+
+        let read_only = BaseMetaDataColumn {
+            flags: BitFlags::from_bits_truncate(0x0000),
+            ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            table_name: None,
+        };
+        assert!(!read_only.is_updateable());
     }
 
     // Byte-exact decode of a COLMETADATA `Flags` USHORT with a known set of
