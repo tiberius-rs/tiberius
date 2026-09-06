@@ -403,17 +403,24 @@ pub enum ColumnFlag {
     UpdateableUnknown = 1 << 3,
     /// Column is an identity.
     Identity = 1 << 4,
-    /// Coulumn is computed.
-    Computed = 1 << 7,
+    /// Column is computed. Per MS-TDS §2.2.7.4 `fComputed` is bit 5 (0x0020),
+    /// immediately after `fIdentity` and before the 2-bit `usReservedODBC`
+    /// field (bits 6-7). Introduced in TDS 7.2.
+    Computed = 1 << 5,
     /// Column is a fixed-length common language runtime user-defined type (CLR
-    /// UDT).
-    FixedLenClrType = 1 << 10,
-    /// Column is the special XML column for the sparse column set.
-    SparseColumnSet = 1 << 11,
+    /// UDT). Per MS-TDS §2.2.7.4 `fFixedLenCLRType` is bit 8 (0x0100), directly
+    /// after `usReservedODBC` (bits 6-7). Introduced in TDS 7.2.
+    FixedLenClrType = 1 << 8,
+    /// Column is the special XML column for the sparse column set. Per
+    /// MS-TDS §2.2.7.4 `fSparseColumnSet` is bit 10 (0x0400): bit 9 is a
+    /// reserved bit (`FRESERVEDBIT`). Introduced in TDS 7.3.B.
+    SparseColumnSet = 1 << 10,
     /// Column is encrypted transparently and has to be decrypted to view the
     /// plaintext value. This flag is valid when the column encryption feature
-    /// is negotiated between client and server and is turned on.
-    Encrypted = 1 << 12,
+    /// is negotiated between client and server and is turned on. Per
+    /// MS-TDS §2.2.7.4 `fEncrypted` is bit 11 (0x0800), directly after
+    /// `fSparseColumnSet`. Introduced in TDS 7.4.
+    Encrypted = 1 << 11,
     /// Column is part of a hidden primary key created to support a T-SQL SELECT
     /// statement containing FOR BROWSE.
     Hidden = 1 << 13,
@@ -710,6 +717,70 @@ mod tests {
             table_name: None,
         };
         assert!(!unknown.is_updateable());
+    }
+
+    // Byte-exact decode of a COLMETADATA `Flags` USHORT with a known set of
+    // sub-fields, constructed per the MS-TDS §2.2.7.4 LSB-first layout:
+    //   bit 0  fNullable            bit 5  fComputed
+    //   bit 1  fCaseSen             bits 6-7 usReservedODBC
+    //   bits 2-3 usUpdateable       bit 8  fFixedLenCLRType
+    //   bit 4  fIdentity            bit 9  (reserved)
+    //   bit 10 fSparseColumnSet     bit 13 fHidden
+    //   bit 11 fEncrypted           bit 14 fKey
+    //   bit 12 (usReserved3)        bit 15 fNullableUnknown
+    // This locks the wire layout: a regression that shifts any bit changes the
+    // decoded flag set and fails here.
+    #[test]
+    fn column_flags_decode_byte_exact_low_and_mid_bits() {
+        // fNullable(0) | usUpdateable=Read/Write(bit2) | fIdentity(4)
+        //   | fComputed(5) | fFixedLenCLRType(8) | fSparseColumnSet(10)
+        //   | fEncrypted(11)  ==>  0x0D35, little-endian on the wire.
+        let wire: [u8; 2] = [0x35, 0x0D];
+        let flags = BitFlags::<ColumnFlag>::from_bits_truncate(u16::from_le_bytes(wire));
+
+        let col = BaseMetaDataColumn {
+            flags,
+            ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            table_name: None,
+        };
+
+        assert!(col.is_nullable());
+        assert!(col.is_updateable()); // usUpdateable == 1 (Read/Write, bit 2)
+        assert!(col.is_identity());
+        assert!(flags.contains(ColumnFlag::Computed));
+        assert!(flags.contains(ColumnFlag::FixedLenClrType));
+        assert!(flags.contains(ColumnFlag::SparseColumnSet));
+        assert!(flags.contains(ColumnFlag::Encrypted));
+
+        // Bits that were NOT set must not read back as set.
+        assert!(!flags.contains(ColumnFlag::CaseSensitive));
+        assert!(!flags.contains(ColumnFlag::UpdateableUnknown));
+        assert!(!flags.contains(ColumnFlag::Hidden));
+        assert!(!flags.contains(ColumnFlag::Key));
+        assert!(!flags.contains(ColumnFlag::NullableUnknown));
+    }
+
+    // Companion to the above, exercising the CaseSen bit, the *high* bit of
+    // usUpdateable (value 2 = unknown) and the top three flags introduced in
+    // TDS 7.2 (fHidden=13, fKey=14, fNullableUnknown=15).
+    #[test]
+    fn column_flags_decode_byte_exact_high_bits() {
+        // fCaseSen(1) | usUpdateable=Unknown(bit3) | fHidden(13) | fKey(14)
+        //   | fNullableUnknown(15)  ==>  0xE00A, little-endian on the wire.
+        let wire: [u8; 2] = [0x0A, 0xE0];
+        let flags = BitFlags::<ColumnFlag>::from_bits_truncate(u16::from_le_bytes(wire));
+
+        assert!(flags.contains(ColumnFlag::CaseSensitive));
+        assert!(flags.contains(ColumnFlag::UpdateableUnknown));
+        assert!(flags.contains(ColumnFlag::Hidden));
+        assert!(flags.contains(ColumnFlag::Key));
+        assert!(flags.contains(ColumnFlag::NullableUnknown));
+
+        // usUpdateable == 2 (unknown) means NOT read/write.
+        assert!(!flags.contains(ColumnFlag::Updateable));
+        assert!(!flags.contains(ColumnFlag::Nullable));
+        assert!(!flags.contains(ColumnFlag::Identity));
+        assert!(!flags.contains(ColumnFlag::Computed));
     }
 
     #[test]
