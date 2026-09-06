@@ -117,7 +117,19 @@ impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
             }
             RpcProcIdValue::Name(ref name) => {
                 // ProcName is a US_VARCHAR: a u16 little-endian character count
-                // followed by that many UTF-16 code units.
+                // followed by that many UTF-16 code units. The count is a u16, so
+                // a name longer than 65535 code units cannot be represented;
+                // reject it rather than overflow the counter and desync the wire.
+                let units = name.encode_utf16().count();
+                if units > u16::MAX as usize {
+                    return Err(crate::Error::Protocol(
+                        format!(
+                            "RPC procedure name is too long ({units} UTF-16 code units, max 65535)"
+                        )
+                        .into(),
+                    ));
+                }
+
                 let len_pos = dst.len();
                 dst.put_u16_le(0u16);
                 let mut length = 0_u16;
@@ -259,5 +271,17 @@ mod tests {
 
         // Status flags byte carries the ByRefValue bit.
         assert_eq!(buf[off], RpcStatus::ByRefValue as u8);
+    }
+
+    // ProcName length is a u16; a name longer than 65535 UTF-16 code units must
+    // error rather than overflow the counter (and desync the wire).
+    #[test]
+    fn rejects_over_long_proc_name() {
+        let long = "a".repeat(u16::MAX as usize + 1);
+        let req = TokenRpcRequest::new(long, vec![], [0u8; 8]);
+
+        let mut buf = BytesMut::new();
+        let err = req.encode(&mut buf).unwrap_err();
+        assert!(matches!(err, crate::Error::Protocol(_)), "got {err:?}");
     }
 }

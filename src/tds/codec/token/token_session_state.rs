@@ -3,6 +3,13 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use futures_util::io::AsyncReadExt;
 use std::io::{Cursor, Read};
 
+/// Upper bound on the server-declared token length before it is used to size an
+/// allocation. Session-state payloads are small (a few KiB of recoverable
+/// server settings); anything beyond a few MiB is malformed. Capping avoids a
+/// large-allocation DoS from a bogus length. 16 MiB is far above any legitimate
+/// token.
+const MAX_SESSION_STATE_LEN: usize = 16 * 1024 * 1024;
+
 /// A single session state value carried by a [`TokenSessionState`] token.
 ///
 /// Each entry is identified by a `state_id` and carries an opaque, driver
@@ -92,6 +99,15 @@ impl TokenSessionState {
         // Status and all SessionStateData entries.
         let len = src.read_u32_le().await? as usize;
 
+        if len > MAX_SESSION_STATE_LEN {
+            return Err(Error::Protocol(
+                format!(
+                    "SESSIONSTATE token length {len} exceeds the maximum of {MAX_SESSION_STATE_LEN}"
+                )
+                .into(),
+            ));
+        }
+
         let mut bytes = vec![0u8; len];
         src.read_exact(&mut bytes[0..len]).await?;
 
@@ -162,5 +178,21 @@ mod tests {
         assert_eq!(token.states[0].id, 2);
         assert_eq!(token.states[0].value.len(), 300);
         assert!(token.states[0].value.iter().all(|&b| b == 0x5A));
+    }
+
+    // A bogus token length beyond the cap must be rejected before it is used to
+    // size the body allocation, rather than attempting a multi-GiB allocation.
+    #[tokio::test]
+    async fn rejects_oversized_token_length() {
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+        use bytes::{BufMut, BytesMut};
+
+        let mut buf = BytesMut::new();
+        buf.put_u32_le(MAX_SESSION_STATE_LEN as u32 + 1);
+
+        let err = TokenSessionState::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
     }
 }
