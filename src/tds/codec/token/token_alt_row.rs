@@ -91,6 +91,7 @@ mod tests {
                 base: BaseMetaDataColumn {
                     flags: ColumnFlag::Nullable.into(),
                     ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                    table_name: None,
                 },
                 col_name: Cow::from("sum"),
             }],
