@@ -583,17 +583,13 @@ mod tests {
             );
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     fn column(name: &'static str) -> MetaDataColumn<'static> {
         MetaDataColumn {
             base: BaseMetaDataColumn {
                 flags: BitFlags::empty(),
                 ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                table_name: None,
             },
             col_name: Cow::Borrowed(name),
         }
