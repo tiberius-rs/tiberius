@@ -47,6 +47,32 @@ where
     Ok(buf)
 }
 
+/// Cross-checks the server-declared `propBytes` count against the number of
+/// property bytes the decode arm for a given base type actually consumes. A
+/// peer declaring the wrong count would otherwise leave `data_len` (derived as
+/// `total_len - 2 - prop_bytes`) wrong and silently desync every subsequent
+/// column.
+fn check_prop_bytes(got: usize, want: usize) -> crate::Result<()> {
+    if got != want {
+        return Err(Error::Protocol(
+            format!("sql_variant: expected {want} property byte(s), got {got}").into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Cross-checks the server-declared value length (`data_len`) against the fixed
+/// number of value bytes a base type must carry (e.g. a `guid` is always 16
+/// bytes). Prevents a wrong/inflated declared length from desyncing the stream.
+fn check_data_len(got: usize, want: usize) -> crate::Result<()> {
+    if got != want {
+        return Err(Error::Protocol(
+            format!("sql_variant: expected value length {want}, got {got}").into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn decode<R>(src: &mut R) -> crate::Result<ColumnData<'static>>
 where
     R: SqlReadBytes + Unpin,
@@ -113,6 +139,8 @@ where
 
     let res = match var {
         VarLenType::Guid => {
+            check_prop_bytes(prop_bytes, 0)?;
+            check_data_len(data_len, 16)?;
             let bytes = read_bytes(src, 16).await?;
             let mut data: [u8; 16] = bytes
                 .try_into()
@@ -122,6 +150,7 @@ where
         }
         VarLenType::Decimaln | VarLenType::Numericn => {
             // propData = precision (1 byte) + scale (1 byte)
+            check_prop_bytes(prop_bytes, 2)?;
             let _precision = src.read_u8().await?;
             let scale = src.read_u8().await?;
 
@@ -129,6 +158,7 @@ where
         }
         VarLenType::BigChar | VarLenType::BigVarChar => {
             // propData = collation (5 bytes) + max length (2 bytes)
+            check_prop_bytes(prop_bytes, 7)?;
             let collation = read_collation(src).await?;
             let _max_len = src.read_u16_le().await?;
 
@@ -143,6 +173,7 @@ where
         }
         VarLenType::NChar | VarLenType::NVarchar => {
             // propData = collation (5 bytes) + max length (2 bytes)
+            check_prop_bytes(prop_bytes, 7)?;
             let _collation = read_collation(src).await?;
             let _max_len = src.read_u16_le().await?;
 
@@ -157,6 +188,7 @@ where
         }
         VarLenType::BigBinary | VarLenType::BigVarBin => {
             // propData = max length (2 bytes)
+            check_prop_bytes(prop_bytes, 2)?;
             let _max_len = src.read_u16_le().await?;
             let buf = read_bytes(src, data_len).await?;
 
@@ -165,11 +197,14 @@ where
         #[cfg(feature = "tds73")]
         VarLenType::Daten => {
             // propData is empty; value is a 3 byte date.
+            check_prop_bytes(prop_bytes, 0)?;
+            check_data_len(data_len, 3)?;
             ColumnData::Date(Some(crate::tds::time::Date::decode(src).await?))
         }
         #[cfg(feature = "tds73")]
         VarLenType::Timen => {
             // propData = scale (1 byte)
+            check_prop_bytes(prop_bytes, 1)?;
             let scale = src.read_u8().await? as usize;
             let time = crate::tds::time::Time::decode(src, scale, data_len).await?;
 
@@ -178,6 +213,7 @@ where
         #[cfg(feature = "tds73")]
         VarLenType::Datetime2 => {
             // propData = scale (1 byte); value = time bytes + 3 date bytes.
+            check_prop_bytes(prop_bytes, 1)?;
             let scale = src.read_u8().await? as usize;
             let time_len = data_len
                 .checked_sub(3)
@@ -189,6 +225,7 @@ where
         #[cfg(feature = "tds73")]
         VarLenType::DatetimeOffsetn => {
             // propData = scale (1 byte); value = datetime2 bytes + 2 offset bytes.
+            check_prop_bytes(prop_bytes, 1)?;
             let scale = src.read_u8().await? as usize;
             let time_len = data_len.checked_sub(5).ok_or_else(|| {
                 Error::Protocol("sql_variant: datetimeoffset value too short".into())
@@ -983,6 +1020,63 @@ mod tests {
         // prop_bytes 1 (scale), value = 261 bytes => time_len 256 (> u8::MAX).
         let mut payload = vec![VarLenType::DatetimeOffsetn as u8, 1, 0 /* scale */];
         payload.extend_from_slice(&[0u8; 261]);
+
+        let err = decode(&mut variant_reader(&payload)).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A guid arm consumes exactly 16 value bytes; a peer declaring a different
+    // (here inflated) data_len must error rather than read 16 and desync the
+    // rest of the row.
+    #[tokio::test]
+    async fn decode_guid_wrong_data_len_errors() {
+        let uuid = uuid::Uuid::from_u128(0x0102030405060708090a0b0c0d0e0f10);
+        let mut wire = *uuid.as_bytes();
+        guid::reorder_bytes(&mut wire);
+
+        // total_len 22, base + prop count = 2, prop_bytes 0 => data_len 20 (!= 16).
+        let mut rest = vec![VarLenType::Guid as u8, 0];
+        rest.extend_from_slice(&wire);
+        rest.extend_from_slice(&[0u8; 4]); // 4 extra bytes to match total_len 22
+
+        let err = decode(&mut raw_reader(22, &rest)).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A guid must not declare any property bytes.
+    #[tokio::test]
+    async fn decode_guid_with_prop_bytes_errors() {
+        // total_len 19, prop_bytes 1 => data_len 16, but prop_bytes must be 0.
+        let mut rest = vec![VarLenType::Guid as u8, 1, 0xff /* stray prop */];
+        rest.extend_from_slice(&[0u8; 16]);
+
+        let err = decode(&mut raw_reader(19, &rest)).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A char/varchar arm consumes exactly 7 property bytes (5 collation + 2 max
+    // length). A peer declaring a different propBytes count must error rather
+    // than read 7 and desync (data_len is derived from prop_bytes).
+    #[tokio::test]
+    async fn decode_bigvarchar_wrong_prop_bytes_errors() {
+        // prop_bytes declared as 5 (should be 7).
+        let mut payload = vec![VarLenType::BigVarChar as u8, 5];
+        payload.extend_from_slice(&13632521u32.to_le_bytes());
+        payload.push(52);
+        payload.extend_from_slice(b"abc");
+
+        let err = decode(&mut variant_reader(&payload)).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A binary arm consumes exactly 2 property bytes (max length). A wrong
+    // propBytes count must error.
+    #[tokio::test]
+    async fn decode_binary_wrong_prop_bytes_errors() {
+        // prop_bytes declared as 7 (should be 2).
+        let mut payload = vec![VarLenType::BigVarBin as u8, 7];
+        payload.extend_from_slice(&[0u8; 7]);
+        payload.extend_from_slice(&[1u8, 2, 3, 4]);
 
         let err = decode(&mut variant_reader(&payload)).await.unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "got {err:?}");

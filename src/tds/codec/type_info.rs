@@ -427,6 +427,30 @@ impl TypeInfo {
                         let precision = src.read_u8().await?;
                         let scale = src.read_u8().await?;
 
+                        // Validate the server-supplied precision/scale before they
+                        // reach the `assert!(scale <= 38)` guards in `column_data`
+                        // and `numeric`. Per MS-TDS §2.2.5.5.1.1, precision is
+                        // 1..=38 and scale is 0..=precision. A malicious or
+                        // buggy peer sending e.g. scale=39..=255 would otherwise
+                        // panic the connection task (remote DoS).
+                        if !(1..=38).contains(&precision) {
+                            return Err(Error::Protocol(
+                                format!(
+                                    "invalid decimal/numeric precision {precision}, must be 1..=38"
+                                )
+                                .into(),
+                            ));
+                        }
+
+                        if scale > precision {
+                            return Err(Error::Protocol(
+                                format!(
+                                    "invalid decimal/numeric scale {scale}, must be 0..={precision}"
+                                )
+                                .into(),
+                            ));
+                        }
+
                         TypeInfo::VarLenSizedPrecision {
                             size: len,
                             ty,
@@ -493,5 +517,64 @@ mod tests {
 
             assert_eq!(nti, ti)
         }
+    }
+
+    // Builds the on-wire bytes of a Numericn TYPE_INFO: type byte, length byte,
+    // precision byte, scale byte.
+    fn numericn_bytes(len: u8, precision: u8, scale: u8) -> BytesMut {
+        let mut buf = BytesMut::new();
+        buf.put_u8(VarLenType::Numericn as u8);
+        buf.put_u8(len);
+        buf.put_u8(precision);
+        buf.put_u8(scale);
+        buf
+    }
+
+    // A server-supplied scale > 38 must decode to an Err, not panic the
+    // connection task via the downstream `assert!(scale <= 38)`.
+    #[tokio::test]
+    async fn decode_numeric_scale_over_max_errors() {
+        for scale in [39u8, 255u8] {
+            let buf = numericn_bytes(17, 38, scale);
+            let err = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+                .await
+                .expect_err("scale > 38 must be rejected");
+            assert!(
+                matches!(err, Error::Protocol(_)),
+                "scale {scale}: got {err:?}"
+            );
+        }
+    }
+
+    // Precision outside 1..=38 must be rejected.
+    #[tokio::test]
+    async fn decode_numeric_bad_precision_errors() {
+        for precision in [0u8, 39u8, 255u8] {
+            let buf = numericn_bytes(17, precision, 0);
+            let err = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+                .await
+                .expect_err("precision outside 1..=38 must be rejected");
+            assert!(
+                matches!(err, Error::Protocol(_)),
+                "precision {precision}: got {err:?}"
+            );
+        }
+    }
+
+    // The scale=38 (precision=38) boundary is still accepted.
+    #[tokio::test]
+    async fn decode_numeric_scale_at_max_ok() {
+        let buf = numericn_bytes(17, 38, 38);
+        let ti = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect("scale 38 must be accepted");
+        assert!(matches!(
+            ti,
+            TypeInfo::VarLenSizedPrecision {
+                precision: 38,
+                scale: 38,
+                ..
+            }
+        ));
     }
 }
