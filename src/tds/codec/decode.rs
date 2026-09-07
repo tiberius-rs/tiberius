@@ -20,13 +20,27 @@ impl Decoder for PacketCodec {
             return Ok(None);
         }
 
-        let header = PacketHeader::decode(&mut BytesMut::from(&src[0..HEADER_BYTES]))?;
-        let length = header.length() as usize;
+        // Peek the packet length directly from the buffered header instead of
+        // allocating a throwaway `BytesMut` and fully decoding the header just
+        // to read one field. The length is a big-endian `u16` at offset 2..4
+        // (see `PacketHeader::encode`); the full header is decoded below once we
+        // know the whole packet is buffered.
+        let length = u16::from_be_bytes([src[2], src[3]]) as usize;
 
         if src.len() < length {
             src.reserve(length);
             return Ok(None);
         }
+
+        // Reject a malformed short-length packet *before* `PacketHeader::decode`
+        // consumes the 8 header bytes. `length` was already peeked inline above,
+        // so this check needs no decoded header; performing it first leaves the
+        // buffer untouched for a bogus length instead of eating the header.
+        if length < HEADER_BYTES {
+            return Err(Error::Protocol("Invalid packet length".into()));
+        }
+
+        let header = PacketHeader::decode(src)?;
 
         event!(
             Level::TRACE,
@@ -34,12 +48,6 @@ impl Decoder for PacketCodec {
             header.r#type(),
             length,
         );
-
-        let header = PacketHeader::decode(src)?;
-
-        if length < HEADER_BYTES {
-            return Err(Error::Protocol("Invalid packet length".into()));
-        }
 
         let payload = src.split_to(length - HEADER_BYTES);
 
