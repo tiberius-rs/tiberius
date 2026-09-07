@@ -13,6 +13,26 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste: dev/test only (tests/bulk.rs + azure_identity example); not shipped" },
 ]
 
+[licenses]
+# Allow-list for the current dependency graph (verified locally with
+# `cargo deny check licenses`). Every crate resolves to at least one of these
+# via its SPDX expression; add new entries here rather than loosening the policy.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+# Confidence threshold for detecting a license from its text (0.0 - 1.0).
+confidence-threshold = 0.8
+
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
