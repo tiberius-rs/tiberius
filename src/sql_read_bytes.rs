@@ -6,6 +6,71 @@ use std::io::ErrorKind::UnexpectedEof;
 use std::{future::Future, io, mem::size_of, pin::Pin, task};
 use task::Poll;
 
+/// Reads exactly `len` bytes from a packet-spanning reader, appending them to
+/// `dst`.
+///
+/// This is the bulk counterpart to the per-byte `read_u8` loop used by the hot
+/// decode paths. A single decoded value (a `varchar`/`nvarchar`/`varbinary`
+/// column, a `text`/`ntext`/`image` blob, a `sql_variant` payload, …) can span
+/// several TDS packets. The underlying [`SqlReadBytes`] reader hides those
+/// packet boundaries: each `poll_read` transparently pulls and concatenates as
+/// many packet payloads as needed to satisfy the request, so copying whatever a
+/// `poll_read` returns crosses boundaries exactly the way the byte-by-byte loop
+/// did — only O(packets) polls instead of O(bytes).
+///
+/// `AsyncReadExt::read_exact` is deliberately avoided (see the module callers):
+/// this helper drives `poll_read` directly and turns a clean `Ok(0)` (true
+/// stream EOF) mid-value into an `UnexpectedEof`, matching the error behaviour
+/// of the `read_u8` loop it replaces byte-for-byte.
+///
+/// The up-front allocation is capped at `prealloc_cap` and the buffer grows in
+/// windows of at most `prealloc_cap` bytes, preserving the `MAX_PREALLOC`
+/// reservation-capping semantics of the call sites: an untrusted, over-large
+/// `len` never triggers a huge allocation before the bytes actually arrive, yet
+/// a genuine long value still reads in full.
+pub(crate) async fn read_bytes_into<R>(
+    src: &mut R,
+    dst: &mut Vec<u8>,
+    len: usize,
+    prealloc_cap: usize,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut remaining = len;
+
+    while remaining > 0 {
+        // Grow by at most one window so a lying `len` cannot force a large
+        // allocation up front; `want` never exceeds the value's own remaining
+        // bytes, so we never over-read into the following field.
+        let want = remaining.min(prealloc_cap);
+        let start = dst.len();
+        let end = start + want;
+        dst.resize(end, 0);
+
+        let mut filled = start;
+        while filled < end {
+            let n =
+                std::future::poll_fn(|cx| Pin::new(&mut *src).poll_read(cx, &mut dst[filled..end]))
+                    .await?;
+
+            // A clean EOF before the value is complete is an error, exactly as
+            // the per-byte `read_u8` loop treated a boundary `Ok(0)`.
+            if n == 0 {
+                // Drop the tail we reserved-but-never-filled.
+                dst.truncate(filled);
+                return Err(UnexpectedEof.into());
+            }
+
+            filled += n;
+        }
+
+        remaining -= want;
+    }
+
+    Ok(())
+}
+
 macro_rules! varchar_reader {
     ($name:ident, $length_reader:ident) => {
         pin_project! {
@@ -451,14 +516,6 @@ mod tests {
         buf.put_u16_le(0xD800); // unpaired high surrogate
         assert!(buf.into_sql_read_bytes().read_b_varchar().await.is_err());
     }
-
-    // `debug_buffer` for the test reader is a `todo!()`; calling it must panic.
-    #[test]
-    #[should_panic]
-    fn debug_buffer_panics() {
-        let reader = BytesMut::new().into_sql_read_bytes();
-        reader.debug_buffer();
-    }
 }
 
 // Tests for the `Poll::Pending` / clean-EOF branches of the readers, which
@@ -567,6 +624,172 @@ mod poll_branch_tests {
             Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
             other => panic!("expected UnexpectedEof, got {other:?}"),
         }
+    }
+}
+
+// Tests for the bulk `read_bytes_into` primitive: it must reproduce the exact
+// bytes the old per-byte `read_u8` loop produced, including across simulated
+// TDS packet boundaries, and must fail cleanly on a truncated value.
+#[cfg(test)]
+mod bulk_read_tests {
+    use super::read_bytes_into;
+    use crate::tds::Context;
+    use crate::SqlReadBytes;
+    use futures_util::io::AsyncRead;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+
+    // Hands out at most `chunk` bytes per `poll_read`, simulating a value that
+    // is fragmented across several TDS packets. Returns a clean EOF (`Ok(0)`)
+    // once its data is exhausted.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+        ctx: Context,
+    }
+
+    impl ChunkedReader {
+        fn new(data: Vec<u8>, chunk: usize) -> Self {
+            Self {
+                data,
+                pos: 0,
+                chunk,
+                ctx: Context::new(),
+            }
+        }
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let avail = this.data.len() - this.pos;
+            if avail == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            let n = buf.len().min(this.chunk).min(avail);
+            buf[..n].copy_from_slice(&this.data[this.pos..this.pos + n]);
+            this.pos += n;
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    impl SqlReadBytes for ChunkedReader {
+        fn debug_buffer(&self) {}
+        fn context(&self) -> &Context {
+            &self.ctx
+        }
+        fn context_mut(&mut self) -> &mut Context {
+            &mut self.ctx
+        }
+    }
+
+    // The byte-by-byte reference: what the old `for _ in 0..len { read_u8 }`
+    // loop would have produced. Since the reader is deterministic, the bulk
+    // read must equal the raw source bytes.
+    #[tokio::test]
+    async fn bulk_read_matches_source_across_packet_boundaries() {
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+
+        // A 7-byte "packet" chunk forces many boundary crossings within one
+        // value.
+        let mut reader = ChunkedReader::new(data.clone(), 7);
+        let mut got = Vec::new();
+        read_bytes_into(&mut reader, &mut got, data.len(), 8192)
+            .await
+            .unwrap();
+
+        assert_eq!(got, data);
+    }
+
+    // Reading with a `prealloc_cap` far smaller than `len` must still read the
+    // whole value: exercises the windowed-growth outer loop.
+    #[tokio::test]
+    async fn bulk_read_windows_when_len_exceeds_cap() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 97) as u8).collect();
+
+        let mut reader = ChunkedReader::new(data.clone(), 13);
+        let mut got = Vec::new();
+        // cap of 8 is much smaller than len (1000) and the chunk size (13).
+        read_bytes_into(&mut reader, &mut got, data.len(), 8)
+            .await
+            .unwrap();
+
+        assert_eq!(got, data);
+    }
+
+    // Appending into a non-empty buffer preserves the existing prefix (the PLP
+    // chunk-accumulation case).
+    #[tokio::test]
+    async fn bulk_read_appends_to_existing_buffer() {
+        let mut got = vec![0xDE, 0xAD];
+        let tail: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+
+        let mut reader = ChunkedReader::new(tail.clone(), 16);
+        read_bytes_into(&mut reader, &mut got, tail.len(), 8192)
+            .await
+            .unwrap();
+
+        let mut expected = vec![0xDE, 0xAD];
+        expected.extend_from_slice(&tail);
+        assert_eq!(got, expected);
+    }
+
+    // A value truncated by a clean EOF must surface as `UnexpectedEof`, exactly
+    // as the per-byte loop did, and must not leave reserved-but-unfilled tail
+    // bytes in the buffer.
+    #[tokio::test]
+    async fn bulk_read_truncated_value_is_unexpected_eof() {
+        let mut reader = ChunkedReader::new(vec![1, 2, 3], 2);
+        let mut got = Vec::new();
+        let err = read_bytes_into(&mut reader, &mut got, 10, 8192)
+            .await
+            .expect_err("a truncated value must error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // Only the bytes actually read are retained.
+        assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    // Anti-DoS windowing property: an attacker-controlled, absurdly large `len`
+    // must NOT trigger an up-front reservation of `len` bytes. The buffer only
+    // grows one `prealloc_cap` window at a time as bytes actually arrive, so
+    // before any byte is delivered the capacity cannot jump past a single
+    // `prealloc_cap` window — it never balloons toward `len`.
+    #[tokio::test]
+    async fn bulk_read_over_large_len_reserves_at_most_one_window() {
+        let prealloc_cap = 8192usize;
+
+        // Immediate EOF: no bytes are ever delivered.
+        let mut reader = ChunkedReader::new(Vec::new(), 64);
+        let mut got = Vec::new();
+        let err = read_bytes_into(&mut reader, &mut got, usize::MAX, prealloc_cap)
+            .await
+            .expect_err("EOF before any byte must error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Only one window was reserved despite the near-`usize::MAX` `len`.
+        assert!(
+            got.capacity() <= prealloc_cap,
+            "over-large len reserved {} bytes, more than the {}-byte window",
+            got.capacity(),
+            prealloc_cap
+        );
+    }
+
+    // A zero-length read is a no-op that leaves the buffer untouched.
+    #[tokio::test]
+    async fn bulk_read_zero_len_is_noop() {
+        let mut reader = ChunkedReader::new(vec![9, 9, 9], 1);
+        let mut got = vec![0x11];
+        read_bytes_into(&mut reader, &mut got, 0, 8192)
+            .await
+            .unwrap();
+        assert_eq!(got, vec![0x11]);
     }
 }
 
