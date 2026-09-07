@@ -1,5 +1,27 @@
 # Changes
 
+## Version 0.13.0
+
+- BREAKING: the connection-string `encrypt` default is now `Required` (was
+  `Off`) when a TLS backend is enabled, matching modern ADO.NET; without a TLS
+  backend it remains `NotSupported`.
+- BREAKING: removed the `sql-browser-async-std` feature and the async-std SQL
+  Browser integration.
+- feat: `Command`/RPC API for parameterized stored-procedure calls, plus a
+  `#[derive(TableValueRow)]` macro (in `tiberius-macros`) for table-valued
+  parameters.
+- feat: `sspi-rs` feature for Windows-style SSPI/NTLM authentication on Unix via
+  the pure-Rust `sspi` crate (no Kerberos required).
+- feat: `serde` feature adding `Serialize`/`Deserialize` impls for query result
+  types (`Row`, `Column`, `ColumnData`, `Numeric`, and the time/xml types).
+- feat: client-certificate authentication, including PEM/DER key files
+  (`Config::client_certificate`) and PKCS#12 bundles
+  (`Config::client_certificate_pkcs12`).
+- chore: upgraded the rustls stack to 0.23 (tokio-rustls 0.26) and resolved the
+  associated advisories.
+- fix: numerous decode-path hardening fixes (protocol errors instead of panics
+  or stream desyncs on hostile server input across the codec/token modules).
+
 ## Version 0.12.3
 - feat: improve column type accuracy (#347)
 - fix: encoding of zero-length values for large varlen columns (#315)

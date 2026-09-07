@@ -32,7 +32,8 @@ use uuid::Uuid;
 /// |[`XmlData`]|`xml`|
 /// |[`NaiveDate`] (with `chrono` feature, TDS 7.3 >)|`date`|
 /// |[`NaiveTime`] (with `chrono` feature, TDS 7.3 >)|`time`|
-/// |[`DateTime`] (with `chrono` feature, TDS 7.3 >)|`datetimeoffset`|
+/// |[`DateTime`]`<Utc>` (with `chrono` feature, TDS 7.3 >)|`datetime2`|
+/// |[`DateTime`]`<FixedOffset>` (with `chrono` feature, TDS 7.3 >)|`datetimeoffset`|
 /// |[`NaiveDateTime`] (with `chrono` feature, TDS 7.3 >)|`datetime2`|
 /// |[`NaiveDateTime`] (with `chrono` feature, TDS 7.2)|`datetime`|
 ///

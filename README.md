@@ -44,10 +44,12 @@ A native Microsoft SQL Server (TDS) client for Rust.
 | `time`                   | Read and write date and time values using `time` crate types.                                                                    | `disabled` |
 | `rust_decimal`           | Read and write `numeric`/`decimal` values using `rust_decimal`'s `Decimal`.                                                      | `disabled` |
 | `bigdecimal`             | Read and write `numeric`/`decimal` values using `bigdecimal`'s `BigDecimal`.                                                     | `disabled` |
-| `sql-browser-async-std`  | SQL Browser implementation for the `TcpStream` of async-std.                                                                     | `disabled` |
 | `sql-browser-tokio`      | SQL Browser implementation for the `TcpStream` of Tokio.                                                                         | `disabled` |
 | `sql-browser-smol`       | SQL Browser implementation for the `TcpStream` of smol.                                                                          | `disabled` |
 | `integrated-auth-gssapi` | Support for using Integrated Auth via GSSAPI                                                                                     | `disabled` |
+| `winauth`                | Windows-only SSPI/NTLM integrated authentication (`AuthMethod::Windows`).                                                        | `enabled`  |
+| `sspi-rs`                | Windows-style SSPI/NTLM authentication on Unix via the pure-Rust `sspi` crate (no Kerberos required).                            | `disabled` |
+| `serde`                  | `serde` `Serialize`/`Deserialize` impls for query result types (`Row`, `Column`, `ColumnData`, `Numeric`, etc.).                 | `disabled` |
 
 ### Supported protocols
 
