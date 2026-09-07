@@ -56,6 +56,13 @@ pub(crate) struct PacketHeader {
 }
 
 impl PacketHeader {
+    /// Builds a packet header with the given wire `length` (including the 8
+    /// header bytes) and packet `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `length` exceeds [`u16::MAX`], as the TDS length field is a
+    /// 16-bit value and cannot represent a larger packet.
     pub fn new(length: usize, id: u8) -> PacketHeader {
         assert!(length <= u16::MAX as usize);
         PacketHeader {
@@ -160,6 +167,17 @@ impl PacketHeader {
         self.ty
     }
 
+    // Outside of tests, the only caller is the TLS pre-login wrapper; a build
+    // with no TLS backend never reads it (the packet codec peeks the length
+    // field directly). Gate the allow so TLS builds still flag genuine disuse.
+    #[cfg_attr(
+        not(any(
+            feature = "rustls",
+            feature = "native-tls",
+            feature = "vendored-openssl"
+        )),
+        allow(dead_code)
+    )]
     pub fn length(&self) -> u16 {
         self.length
     }
@@ -267,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "length <= u16::MAX as usize")]
     fn new_panics_on_length_overflow() {
         PacketHeader::new(usize::from(u16::MAX) + 1, 0);
     }

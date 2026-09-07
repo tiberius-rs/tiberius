@@ -43,7 +43,14 @@ impl TokenDone {
         let done_rows = match done_row_count_bytes {
             8 => src.read_u64_le().await?,
             4 => src.read_u32_le().await? as u64,
-            _ => unreachable!(),
+            // `done_row_count_bytes()` only ever yields 4 or 8, so this arm is
+            // currently unreachable. Return a protocol error rather than panic
+            // so a future/out-of-range width can never crash the decoder.
+            other => {
+                return Err(crate::Error::Protocol(
+                    format!("DONE token: unexpected row-count width {other} bytes").into(),
+                ))
+            }
         };
 
         Ok(TokenDone {

@@ -309,4 +309,53 @@ mod tests {
 
         assert_eq!(info, TokenFedAuthInfo::default());
     }
+
+    #[tokio::test]
+    async fn decode_consumes_exactly_token_length() {
+        // `decode` must read exactly the `TokenLength` bytes of body it is told
+        // to and stop, leaving whatever follows for the next token. A trailing
+        // sentinel that reads back unchanged proves the length-prefixed body was
+        // consumed exactly and the stream was not desynced.
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+        use bytes::{BufMut, BytesMut};
+
+        // Minimal valid body: CountOfInfoIDs == 0, no options.
+        let body = 0u32.to_le_bytes();
+
+        let mut buf = BytesMut::new();
+        buf.put_u32_le(body.len() as u32); // TokenLength
+        buf.put_slice(&body);
+        buf.put_u32_le(0xDEAD_BEEF); // sentinel: belongs to the next token
+
+        let mut reader = buf.into_sql_read_bytes();
+        let info = TokenFedAuthInfo::decode(&mut reader).await.unwrap();
+        assert_eq!(info, TokenFedAuthInfo::default());
+
+        let sentinel = reader
+            .read_u32_le()
+            .await
+            .expect("the sentinel following the FEDAUTHINFO token must still be readable");
+        assert_eq!(
+            sentinel, 0xDEAD_BEEF,
+            "decode consumed past its declared TokenLength and desynced the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_body_shorter_than_token_length() {
+        // `TokenLength` declares more body bytes than the stream actually holds.
+        // The `read_exact` for the body must surface a clean error rather than
+        // hanging or panicking, so a truncated/inconsistent frame fails safely.
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+        use bytes::{BufMut, BytesMut};
+
+        let mut buf = BytesMut::new();
+        buf.put_u32_le(64); // claims 64 body bytes
+        buf.put_slice(&[0u8; 8]); // but only 8 are present
+
+        let err = TokenFedAuthInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect_err("a body shorter than the declared TokenLength must error");
+        assert!(matches!(err, Error::Io { .. }));
+    }
 }

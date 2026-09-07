@@ -1,13 +1,18 @@
 use super::BaseMetaDataColumn;
 use crate::{tds::codec::ColumnData, Error, SqlReadBytes};
 
+// Decoded from the RETURNVALUE token. `param_ordinal`, `param_name`, and
+// `value` are forwarded to callers via `CommandReturnValue` in
+// `src/tds/stream/command.rs`; `udf` and `meta` are not otherwise read and are
+// retained for `Debug` diagnostics and future surfacing to callers.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct TokenReturnValue {
     pub param_ordinal: u16,
     pub param_name: String,
     /// return value of user defined function
+    #[allow(dead_code)]
     pub udf: bool,
+    #[allow(dead_code)]
     pub meta: BaseMetaDataColumn,
     pub value: ColumnData<'static>,
 }

@@ -1,11 +1,12 @@
-use std::borrow::BorrowMut;
-
 use asynchronous_codec::BytesMut;
 use bytes::BufMut;
 
 use crate::ColumnData;
 
-use super::{BytesMutWithTypeInfo, Encode, FixedLenType, MetaDataColumn, TypeInfo, VarLenContext};
+use super::{
+    encode_b_varchar, BytesMutWithTypeInfo, Encode, FixedLenType, MetaDataColumn, TypeInfo,
+    VarLenContext,
+};
 
 const TVPTYPE: u8 = 0xF3;
 
@@ -32,9 +33,9 @@ impl<'a> Encode<BytesMut> for TypeInfoTvp<'a> {
         //                    TVP_END_TOKEN
 
         dst.put_u8(TVPTYPE);
-        put_b_varchar("", dst); // DB name (unused)
-        put_b_varchar(self.schema_name, dst);
-        put_b_varchar(self.db_type_name, dst);
+        encode_b_varchar(dst, "")?; // DB name (unused)
+        encode_b_varchar(dst, self.schema_name)?;
+        encode_b_varchar(dst, self.db_type_name)?;
 
         if let Some(ref columns_metadata) = self.columns {
             dst.put_u16_le(columns_metadata.len() as u16);
@@ -46,7 +47,7 @@ impl<'a> Encode<BytesMut> for TypeInfoTvp<'a> {
                 dst.put_u32_le(0_u32); // UserType
                 col.base.clone().encode(dst)?; // Flags + TYPE_INFO
                                                // 2.2.5.5.5.1: ColName MUST be a zero-length string in the TVP.
-                put_b_varchar("", dst);
+                encode_b_varchar(dst, "")?;
             }
         } else {
             // TVP_NULL_TOKEN: the server is expected to know the type.
@@ -74,21 +75,6 @@ impl<'a> Encode<BytesMut> for TypeInfoTvp<'a> {
 
         Ok(())
     }
-}
-
-/// Writes a `B_VARCHAR`: a single-byte code-unit count followed by that many
-/// UTF-16 code units.
-fn put_b_varchar<T: AsRef<str>>(s: T, dst: &mut BytesMut) {
-    let len_pos = dst.len();
-    dst.put_u8(0u8);
-    let mut length = 0_u8;
-
-    for chr in s.as_ref().encode_utf16() {
-        dst.put_u16_le(chr);
-        length += 1;
-    }
-    let dst: &mut [u8] = dst.borrow_mut();
-    dst[len_pos] = length;
 }
 
 impl<'a> TypeInfoTvp<'a> {
@@ -188,6 +174,30 @@ mod tests {
         let null_token_pos = 1 + 1 + (1 + 6) + (1 + 12);
         let token = u16::from_le_bytes([buf[null_token_pos], buf[null_token_pos + 1]]);
         assert_eq!(token, 0xFFFF);
+    }
+
+    // The TVP type name is written as a B_VARCHAR (u8 length); a name longer than
+    // 255 UTF-16 code units must error rather than wrap the counter and desync
+    // the wire.
+    #[test]
+    fn encode_rejects_over_long_type_name() {
+        let long = "a".repeat(256);
+        let tvp = TypeInfoTvp::new(&long, Vec::new());
+
+        let mut buf = BytesMut::new();
+        let err = tvp.encode(&mut buf).unwrap_err();
+        assert!(matches!(err, crate::Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A type name of exactly 255 units is the boundary and must still encode.
+    #[test]
+    fn encode_accepts_max_length_type_name() {
+        let name = "a".repeat(255);
+        let tvp = TypeInfoTvp::new(&name, Vec::new());
+
+        let mut buf = BytesMut::new();
+        tvp.encode(&mut buf)
+            .expect("255-unit type name must encode");
     }
 
     #[test]
