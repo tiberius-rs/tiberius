@@ -81,7 +81,7 @@ impl FieldExt {
     pub fn new(field: &syn::Field) -> syn::Result<FieldExt> {
         match field.ident.clone() {
             Some(ident) => Ok(FieldExt {
-                attr: FieldAttr::parse(&field.attrs),
+                attr: FieldAttr::parse(&field.attrs)?,
                 ident,
             }),
             None => Err(syn::Error::new_spanned(

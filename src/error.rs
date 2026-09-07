@@ -7,6 +7,7 @@ use thiserror::Error;
 /// A unified error enum that contains several errors that might occurr during
 /// the lifecycle of this driver
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     #[error("An error occurred during the attempt of performing I/O: {}", message)]
     /// An error occurred when performing I/O to the server.
@@ -27,9 +28,15 @@ pub enum Error {
     Conversion(Cow<'static, str>),
     #[error("UTF-8 error")]
     /// Tried to convert data to UTF-8 that was not valid.
+    ///
+    /// The originating [`std::str::Utf8Error`]/[`std::string::FromUtf8Error`]
+    /// source is intentionally not carried on this variant.
     Utf8,
     #[error("UTF-16 error")]
     /// Tried to convert data to UTF-16 that was not valid.
+    ///
+    /// The originating [`std::string::FromUtf16Error`] source is intentionally
+    /// not carried on this variant.
     Utf16,
     #[error("Error parsing an integer: {}", _0)]
     /// Tried to parse an integer that was not an integer.

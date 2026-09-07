@@ -92,7 +92,15 @@ fn datetime2_to_datetime(dt2: &DateTime2) -> crate::Result<DateTime> {
     // then to the 1/300-second fragments used by `datetime`, degrading the
     // sub-second precision in the process.
     let time = dt2.time();
-    let nanos = time.increments() as u128 * 10u128.pow(9 - time.scale() as u32);
+    // `Time::new` accepts any u8 scale, but a scale > 9 makes `9 - scale`
+    // underflow. Reject it rather than panic on hostile/garbage wire input.
+    let scale = time.scale();
+    if scale > 9 {
+        return Err(crate::Error::Protocol(
+            format!("invalid datetime2 scale {scale}, expected 0..=9").into(),
+        ));
+    }
+    let nanos = time.increments() as u128 * 10u128.pow(9 - scale as u32);
     let seconds_fragments = (nanos * 300 / 1_000_000_000) as u32;
 
     Ok(DateTime::new(days, seconds_fragments))
@@ -430,7 +438,10 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     || vlc.r#type() == VarLenType::BigVarChar =>
             {
                 if let Some(str) = opt {
-                    let mut encoder = vlc.collation().as_ref().unwrap().encoding()?.new_encoder();
+                    let collation = vlc.collation().ok_or_else(|| {
+                        crate::Error::Protocol("string column missing collation".into())
+                    })?;
+                    let mut encoder = collation.encoding()?.new_encoder();
                     let len = encoder
                         .max_buffer_length_from_utf8_without_replacement(str.len())
                         .unwrap();
@@ -485,67 +496,46 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 if vlc.r#type() == VarLenType::NVarchar || vlc.r#type() == VarLenType::NChar =>
             {
                 if let Some(str) = opt {
+                    // Encode the UTF-16LE payload into a local buffer and
+                    // validate its length *before* touching `dst`, so a
+                    // length-limit violation leaves `dst` unchanged instead of
+                    // leaving a corrupt half-written value behind (matching the
+                    // BigChar arm above, which validates a local buffer first).
+                    let mut payload = Vec::with_capacity(str.len() * 2);
+                    for chr in str.encode_utf16() {
+                        payload.put_u16_le(chr);
+                    }
+                    let length = payload.len();
+
+                    if length > vlc.len() {
+                        return Err(crate::Error::BulkInput(
+                            format!(
+                                "Encoded string length {} exceed column limit {}",
+                                length,
+                                vlc.len()
+                            )
+                            .into(),
+                        ));
+                    }
+
                     if vlc.len() < 0xffff {
-                        let len_pos = dst.len();
-                        dst.put_u16_le(0u16);
-
-                        for chr in str.encode_utf16() {
-                            dst.put_u16_le(chr);
-                        }
-
-                        let length = dst.len() - len_pos - 2;
-
-                        if length > vlc.len() {
-                            return Err(crate::Error::BulkInput(
-                                format!(
-                                    "Encoded string length {} exceed column limit {}",
-                                    length,
-                                    vlc.len()
-                                )
-                                .into(),
-                            ));
-                        }
-
-                        let dst: &mut [u8] = dst.borrow_mut();
-                        let mut dst = &mut dst[len_pos..];
                         dst.put_u16_le(length as u16);
+                        dst.extend_from_slice(&payload);
                     } else {
-                        // unknown size
-                        dst.put_u64_le(0xfffffffffffffffe);
-
                         assert!(
                             str.len() < 0xffffffff,
                             "if str longer than this, need to implement multiple blobs"
                         );
 
-                        let len_pos = dst.len();
-                        dst.put_u32_le(0u32);
-
-                        for chr in str.encode_utf16() {
-                            dst.put_u16_le(chr);
-                        }
-
-                        let length = dst.len() - len_pos - 4;
-
-                        if length > vlc.len() {
-                            return Err(crate::Error::BulkInput(
-                                format!(
-                                    "Encoded string length {} exceed column limit {}",
-                                    length,
-                                    vlc.len()
-                                )
-                                .into(),
-                            ));
-                        }
+                        // unknown size
+                        dst.put_u64_le(0xfffffffffffffffe);
+                        dst.put_u32_le(length as u32);
+                        dst.extend_from_slice(&payload);
 
                         if length > 0 {
                             // no next blob
                             dst.put_u32_le(0u32);
                         }
-
-                        let dst: &mut [u8] = dst.borrow_mut();
-                        let mut dst = &mut dst[len_pos..];
-                        dst.put_u32_le(length as u32);
                     }
                 } else if vlc.len() < 0xffff {
                     dst.put_u16_le(0xffff);
@@ -567,8 +557,10 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
 
                     if vlc.r#type() == VarLenType::Text {
                         // single-byte character data, encoded with the column collation
-                        let mut encoder =
-                            vlc.collation().as_ref().unwrap().encoding()?.new_encoder();
+                        let collation = vlc.collation().ok_or_else(|| {
+                            crate::Error::Protocol("string column missing collation".into())
+                        })?;
+                        let mut encoder = collation.encoding()?.new_encoder();
                         let len = encoder
                             .max_buffer_length_from_utf8_without_replacement(str.len())
                             .unwrap();
@@ -905,12 +897,17 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                         })?;
                         let half = factor / 2;
                         let v = num.value();
-                        let value = if v >= 0 {
-                            (v + half) / factor
+                        // `v` is a pub-constructible i128, so `v + half` /
+                        // `v - half` can overflow i128 (panic in debug / silent
+                        // wrap in release). Round half away from zero with
+                        // checked arithmetic.
+                        let rounded = if v >= 0 {
+                            v.checked_add(half)
                         } else {
-                            (v - half) / factor
-                        };
-                        Numeric::new_with_scale(value, target_scale)
+                            v.checked_sub(half)
+                        }
+                        .ok_or_else(|| crate::Error::Protocol("numeric rescale overflow".into()))?;
+                        Numeric::new_with_scale(rounded / factor, target_scale)
                     };
                     num.encode(&mut *dst)?;
                 } else {
@@ -1003,6 +1000,70 @@ mod tests {
             .read_u8()
             .await
             .expect_err("decode must consume entire buffer");
+    }
+
+    #[test]
+    fn numeric_rescale_down_does_not_overflow() {
+        // `Numeric::value()` is a pub-constructible i128. Rescaling `i128::MAX`
+        // down one scale adds `half` to it, which overflows i128 (panic in
+        // debug / silent wrap in release) unless done with checked arithmetic.
+        let ti = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Numericn,
+            size: 17,
+            precision: 38,
+            scale: 0,
+        };
+        let mut buf = BytesMut::new();
+        let mut buf_ti = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+        let data = ColumnData::Numeric(Some(Numeric::new_with_scale(i128::MAX, 1)));
+        let err = data
+            .encode(&mut buf_ti)
+            .expect_err("rescale overflow must error, not panic/wrap");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[test]
+    fn bigchar_encode_missing_collation_errors() {
+        // A pub `VarLenContext::new(.., None)` can reach the ENCODE path (bulk /
+        // TVP). The BigChar/BigVarChar/Text arms must not `.unwrap()` a `None`
+        // collation; they must return a protocol error (mirroring the decode
+        // side).
+        for ty in [
+            VarLenType::BigChar,
+            VarLenType::BigVarChar,
+            VarLenType::Text,
+        ] {
+            let ti = TypeInfo::VarLenSized(VarLenContext::new(ty, 40, None));
+            let mut buf = BytesMut::new();
+            let mut buf_ti = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+            let data = ColumnData::String(Some("abc".into()));
+            let err = data
+                .encode(&mut buf_ti)
+                .expect_err("missing collation must error, not panic");
+            assert!(matches!(err, Error::Protocol(_)), "ty={ty:?}");
+        }
+    }
+
+    #[test]
+    fn nvarchar_overlong_leaves_dst_unchanged() {
+        // Column limit of 2 bytes; a 3-char string encodes to 6 UTF-16 bytes and
+        // must error. The pre-fix code wrote the payload into `dst` *before*
+        // checking the length, leaving corrupt bytes behind on error.
+        let ti = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::NVarchar, 2, None));
+        let mut buf = BytesMut::new();
+        {
+            let mut buf_ti = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+            let data = ColumnData::String(Some("abc".into()));
+            let err = data
+                .encode(&mut buf_ti)
+                .expect_err("over-long nvarchar must error");
+            assert!(matches!(err, Error::BulkInput(_)));
+        }
+        assert!(
+            buf.is_empty(),
+            "dst must be left unchanged on error, got {} bytes",
+            buf.len()
+        );
     }
 
     #[test]
@@ -1810,6 +1871,14 @@ mod tests {
         // Dates earlier than 1900-01-01 cannot be represented by `datetime`.
         let dt2 = DateTime2::new(Date::new(0), Time::new(0, 7));
         assert!(datetime2_to_datetime(&dt2).is_err());
+
+        // A scale > 9 (invalid per MS-TDS) must return an error, not panic on
+        // the `9 - scale` underflow inside `10u128.pow(...)`.
+        let dt2 = DateTime2::new(Date::new(737_425), Time::new(0, 10));
+        assert!(matches!(
+            datetime2_to_datetime(&dt2),
+            Err(crate::Error::Protocol(_))
+        ));
     }
 
     // ----- helpers for the coverage tests below -----

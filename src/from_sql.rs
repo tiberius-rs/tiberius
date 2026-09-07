@@ -25,7 +25,8 @@ use uuid::Uuid;
 /// |[`NaiveDateTime`] (with feature flag `chrono`)|`datetime`/`datetime2`/`smalldatetime`|
 /// |[`NaiveDate`] (with feature flag `chrono`)|`date`|
 /// |[`NaiveTime`] (with feature flag `chrono`)|`time`|
-/// |[`DateTime`] (with feature flag `chrono`)|`datetimeoffset`|
+/// |[`DateTime`]`<Utc>` (with feature flag `chrono`)|`datetimeoffset`/`datetime2`|
+/// |[`DateTime`]`<FixedOffset>` (with feature flag `chrono`)|`datetimeoffset`|
 ///
 /// See the [`time`] module for more information about the date and time structs.
 ///

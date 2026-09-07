@@ -48,12 +48,21 @@ impl TokenTabName {
         // whole payload up front and parse it in memory so that the exact
         // number of bytes is always consumed, regardless of how many table
         // names are packed into the token.
+        // `len` is bounded by the u16 length field (<= 64 KiB), so no named
+        // allocation cap is required here.
         let len = src.read_u16_le().await? as usize;
 
-        let mut data = vec![0u8; len];
-        for byte in data.iter_mut() {
-            *byte = src.read_u8().await?;
-        }
+        // Bulk-read the payload in one packet-aware pass instead of `len`
+        // separate `read_u8().await` calls. `len` is u16-bounded (<= 64 KiB);
+        // cap the up-front reservation like the sibling token decoders.
+        let mut data = Vec::new();
+        crate::sql_read_bytes::read_bytes_into(
+            src,
+            &mut data,
+            len,
+            crate::tds::codec::column_data::MAX_PREALLOC,
+        )
+        .await?;
 
         Self::parse(&data)
     }

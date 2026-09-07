@@ -174,6 +174,18 @@ impl Date {
         Date(days)
     }
 
+    /// Construct a `Date` from a raw day count *without* the 3-byte range check,
+    /// deferring validation to [`Encode::encode`]. Used by the chrono
+    /// conversion path, whose `ToSql`/`IntoSql` impls return a `ColumnData`
+    /// directly (not a `Result`) and so cannot reject an out-of-range
+    /// `NaiveDate` at conversion time; the out-of-range value instead surfaces
+    /// as an `Err` when the value is encoded.
+    #[inline]
+    #[cfg(feature = "chrono")]
+    pub(crate) fn new_unchecked(days: u32) -> Date {
+        Date(days)
+    }
+
     #[inline]
     /// The number of days from 1st of January, year 1.
     pub fn days(self) -> u32 {
@@ -196,7 +208,14 @@ impl Encode<BytesMut> for Date {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
         let mut tmp = [0u8; 4];
         LittleEndian::write_u32(&mut tmp, self.days());
-        assert_eq!(tmp[3], 0);
+        // A `date` is a 3-byte value; a day count that does not fit (e.g. a
+        // chrono `NaiveDate` outside the SQL Server range) is rejected here
+        // rather than panicking.
+        if tmp[3] != 0 {
+            return Err(crate::Error::Protocol(
+                format!("date day count {} is out of the 3-byte range", self.days()).into(),
+            ));
+        }
         dst.extend_from_slice(&tmp[0..3]);
 
         Ok(())
@@ -301,18 +320,36 @@ impl Time {
 #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 impl Encode<BytesMut> for Time {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
+        // The field width is determined by the scale; an `increments` value
+        // that does not fit that width (e.g. a `Time` built directly via the
+        // pub `Time::new`) is rejected here rather than panicking.
+        let width_bits = match self.len()? {
+            3 => 24,
+            4 => 32,
+            5 => 40,
+            _ => unreachable!(),
+        };
+        if self.increments >> width_bits != 0 {
+            return Err(crate::Error::Protocol(
+                format!(
+                    "time increments {} do not fit the {}-byte field for scale {}",
+                    self.increments,
+                    width_bits / 8,
+                    self.scale
+                )
+                .into(),
+            ));
+        }
+
         match self.len()? {
             3 => {
-                assert_eq!(self.increments >> 24, 0);
                 dst.put_u16_le(self.increments as u16);
                 dst.put_u8((self.increments >> 16) as u8);
             }
             4 => {
-                assert_eq!(self.increments >> 32, 0);
                 dst.put_u32_le(self.increments as u32);
             }
             5 => {
-                assert_eq!(self.increments >> 40, 0);
                 dst.put_u32_le(self.increments as u32);
                 dst.put_u8((self.increments >> 32) as u8);
             }
@@ -376,11 +413,9 @@ impl DateTime2 {
 impl Encode<BytesMut> for DateTime2 {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
         self.time.encode(dst)?;
-
-        let mut tmp = [0u8; 4];
-        LittleEndian::write_u32(&mut tmp, self.date.days());
-        assert_eq!(tmp[3], 0);
-        dst.extend_from_slice(&tmp[0..3]);
+        // Reuse `Date::encode` so an out-of-range date surfaces as an `Err`
+        // (same 3-byte wire layout as the previous inline encoding).
+        self.date.encode(dst)?;
 
         Ok(())
     }
@@ -498,9 +533,11 @@ mod tests {
 
     #[cfg(feature = "tds73")]
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "left == right")]
     fn date_new_panics_on_overflow() {
-        // Anything not representable in three bytes must panic.
+        // Anything not representable in three bytes must panic. `Date::new`
+        // asserts `days >> 24 == 0` via `assert_eq!`, whose panic message
+        // contains "assertion `left == right` failed".
         Date::new(0x0100_0000);
     }
 

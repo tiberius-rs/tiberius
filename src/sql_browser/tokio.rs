@@ -15,7 +15,7 @@ use tracing::Level;
 #[async_trait]
 impl SqlBrowser for TcpStream {
     /// This method can be used to connect to SQL Server named instances
-    /// when on a Windows paltform with the `sql-browser-tokio` feature
+    /// when on a Windows platform with the `sql-browser-tokio` feature
     /// enabled. Please see the crate examples for more detailed examples.
     async fn connect_named(builder: &Config) -> crate::Result<Self> {
         let addrs = net::lookup_host(builder.get_addr()).await?;
@@ -66,13 +66,13 @@ async fn connect_addr(builder: &Config, mut addr: SocketAddr) -> crate::Result<T
             builder.get_port()
         );
 
-        let msg = [&[4u8], instance_name.as_bytes()].concat();
-        let mut buf = vec![0u8; 4096];
+        let msg = [&[super::SSRP_CLIENT_UNICAST], instance_name.as_bytes()].concat();
+        let mut buf = vec![0u8; super::SSRP_REPLY_BUF_LEN];
 
         let socket = UdpSocket::bind(&local_bind).await?;
         socket.send_to(&msg, &addr).await?;
 
-        let timeout = Duration::from_millis(1000);
+        let timeout = Duration::from_millis(super::SSRP_TIMEOUT_MS);
 
         let len = time::timeout(timeout, socket.recv(&mut buf))
             .map_err(|_: Elapsed| {

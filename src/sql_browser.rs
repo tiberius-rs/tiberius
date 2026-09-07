@@ -24,6 +24,21 @@ pub trait SqlBrowser {
         Self: Sized + Send + Sync;
 }
 
+/// SSRP `CLNT_UCAST_INST` opcode: a client unicast request for a specific
+/// named instance (MS-SQLR §2.2.1).
+#[cfg(any(feature = "sql-browser-tokio", feature = "sql-browser-smol"))]
+pub(crate) const SSRP_CLIENT_UNICAST: u8 = 4;
+
+/// Size of the buffer used to receive an SSRP reply datagram. The protocol caps
+/// a reply at 65535 bytes, but real replies are small; 4 KiB comfortably holds
+/// any practical `tcp;<port>` response.
+#[cfg(any(feature = "sql-browser-tokio", feature = "sql-browser-smol"))]
+pub(crate) const SSRP_REPLY_BUF_LEN: usize = 4096;
+
+/// How long to wait for an SSRP reply before giving up, in milliseconds.
+#[cfg(any(feature = "sql-browser-tokio", feature = "sql-browser-smol"))]
+pub(crate) const SSRP_TIMEOUT_MS: u64 = 1000;
+
 #[cfg(any(feature = "sql-browser-tokio", feature = "sql-browser-smol"))]
 fn get_port_from_sql_browser_reply(
     mut buf: Vec<u8>,

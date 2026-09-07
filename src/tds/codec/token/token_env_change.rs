@@ -116,6 +116,21 @@ impl fmt::Display for TokenEnvChange {
     }
 }
 
+/// Read a `B_VARCHAR`: a single `u8` UTF-16 code-unit count followed by that
+/// many little-endian `u16` code units, decoded strictly as UTF-16. Kept
+/// behavior-identical to the inlined copies it replaces (a `FromUtf16Error`
+/// surfaces as `Error::Utf16` via `?`).
+fn read_b_varchar<R: Read>(buf: &mut R) -> crate::Result<String> {
+    let len = buf.read_u8()? as usize;
+    let mut units = vec![0u16; len];
+
+    for unit in units.iter_mut() {
+        *unit = buf.read_u16::<LittleEndian>()?;
+    }
+
+    Ok(String::from_utf16(&units[..])?)
+}
+
 impl TokenEnvChange {
     pub(crate) async fn decode<R>(src: &mut R) -> crate::Result<Self>
     where
@@ -125,7 +140,8 @@ impl TokenEnvChange {
 
         // We read all the bytes now, due to whatever environment change tokens
         // we read, they might contain padding zeroes in the end we must
-        // discard.
+        // discard. `len` is bounded by the u16 length field (<= 64 KiB), so no
+        // named allocation cap is required here.
         let mut bytes = vec![0; len];
         src.read_exact(&mut bytes[0..len]).await?;
 
@@ -137,23 +153,8 @@ impl TokenEnvChange {
 
         let token = match ty {
             EnvChangeTy::Database => {
-                let len = buf.read_u8()? as usize;
-                let mut bytes = vec![0; len];
-
-                for item in bytes.iter_mut().take(len) {
-                    *item = buf.read_u16::<LittleEndian>()?;
-                }
-
-                let new_value = String::from_utf16(&bytes[..])?;
-
-                let len = buf.read_u8()? as usize;
-                let mut bytes = vec![0; len];
-
-                for item in bytes.iter_mut().take(len) {
-                    *item = buf.read_u16::<LittleEndian>()?;
-                }
-
-                let old_value = String::from_utf16(&bytes[..])?;
+                let new_value = read_b_varchar(&mut buf)?;
+                let old_value = read_b_varchar(&mut buf)?;
 
                 TokenEnvChange::Database {
                     new: new_value,
@@ -161,23 +162,8 @@ impl TokenEnvChange {
                 }
             }
             EnvChangeTy::PacketSize => {
-                let len = buf.read_u8()? as usize;
-                let mut bytes = vec![0; len];
-
-                for item in bytes.iter_mut().take(len) {
-                    *item = buf.read_u16::<LittleEndian>()?;
-                }
-
-                let new_value = String::from_utf16(&bytes[..])?;
-
-                let len = buf.read_u8()? as usize;
-                let mut bytes = vec![0; len];
-
-                for item in bytes.iter_mut().take(len) {
-                    *item = buf.read_u16::<LittleEndian>()?;
-                }
-
-                let old_value = String::from_utf16(&bytes[..])?;
+                let new_value = read_b_varchar(&mut buf)?;
+                let old_value = read_b_varchar(&mut buf)?;
 
                 TokenEnvChange::PacketSize {
                     new: new_value.parse()?,
@@ -259,15 +245,7 @@ impl TokenEnvChange {
                 TokenEnvChange::Routing { host, port }
             }
             EnvChangeTy::Rtls => {
-                let len = buf.read_u8()? as usize;
-                let mut bytes = vec![0; len];
-
-                for item in bytes.iter_mut().take(len) {
-                    *item = buf.read_u16::<LittleEndian>()?;
-                }
-
-                let mirror_name = String::from_utf16(&bytes[..])?;
-
+                let mirror_name = read_b_varchar(&mut buf)?;
                 TokenEnvChange::ChangeMirror(mirror_name)
             }
             ty => TokenEnvChange::Ignored(ty),

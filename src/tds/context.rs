@@ -19,6 +19,14 @@ pub(crate) struct Context {
 impl Context {
     pub fn new() -> Context {
         Context {
+            // Overwritten with the server's negotiated TDS version from LOGINACK
+            // on a successful login (`set_version`, called from
+            // `TokenStream::get_login_ack` in stream/token.rs). tiberius targets
+            // TDS 7.2+ (SQL Server 2005+), so this default's 7.2+ field widths
+            // (4-byte ERROR/INFO LineNumber, 8-byte DONE row-count) are correct
+            // for all supported servers even on the login-failure path, where no
+            // LOGINACK ever arrives to update this value. A pre-7.2 server that
+            // rejects login is out of supported scope.
             version: FeatureLevel::SqlServerN,
             packet_size: 4096,
             packet_id: 0,
@@ -70,9 +78,9 @@ impl Context {
         self.transaction_desc = desc;
     }
 
-    /// Overrides the negotiated protocol version. Used by tests to exercise
-    /// version-dependent decode paths (e.g. the pre-2005 4-byte DONE rowcount).
-    #[cfg(test)]
+    /// Records the protocol version negotiated with the server (from the
+    /// LOGINACK token). This drives version-dependent decode paths such as the
+    /// pre-2005 4-byte DONE rowcount and the 2-byte ERROR/INFO LineNumber.
     pub(crate) fn set_version(&mut self, version: FeatureLevel) {
         self.version = version;
     }

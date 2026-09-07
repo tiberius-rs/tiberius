@@ -77,6 +77,14 @@ impl TokenColInfo {
         let mut columns = Vec::new();
 
         while consumed < length {
+            // Each entry has a fixed 3-byte header (ColNum, TableNum, Status).
+            // A truncated header would read past the declared `length`.
+            if length - consumed < 3 {
+                return Err(crate::error::Error::Protocol(
+                    "COLINFO entry header extends past the token length".into(),
+                ));
+            }
+
             let col_num = src.read_u8().await?;
             let table_num = src.read_u8().await?;
             let status = src.read_u8().await?;
@@ -84,17 +92,35 @@ impl TokenColInfo {
 
             let col_name = if status & STATUS_DIFFERENT_NAME != 0 {
                 // ColName is a B_VARCHAR: a byte length (in UCS-2 characters)
-                // followed by that many little-endian UTF-16 code units.
+                // followed by that many little-endian UTF-16 code units. Both the
+                // length byte and the code units must stay within `length`.
+                if length - consumed < 1 {
+                    return Err(crate::error::Error::Protocol(
+                        "COLINFO ColName length byte extends past the token length".into(),
+                    ));
+                }
                 let char_len = src.read_u8().await? as usize;
                 consumed += 1;
+
+                let name_bytes = char_len * 2;
+                if length - consumed < name_bytes {
+                    return Err(crate::error::Error::Protocol(
+                        "COLINFO ColName extends past the token length".into(),
+                    ));
+                }
 
                 let mut units = Vec::with_capacity(char_len);
                 for _ in 0..char_len {
                     units.push(src.read_u16_le().await?);
                 }
-                consumed += char_len * 2;
+                consumed += name_bytes;
 
-                Some(String::from_utf16_lossy(&units))
+                // Strict decode with a descriptive protocol error, matching the
+                // sibling string decoders (TABNAME, the varchar readers) rather
+                // than silently substituting replacement characters.
+                Some(String::from_utf16(&units).map_err(|_| {
+                    crate::error::Error::Protocol("COLINFO ColName is not valid UTF-16".into())
+                })?)
             } else {
                 None
             };
@@ -230,5 +256,76 @@ mod tests {
         assert_eq!(token.columns[0].col_name.as_deref(), Some("abc"));
         assert_eq!(token.columns[1].col_num, 2);
         assert!(token.columns[1].is_key());
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_colname_overrunning_length() {
+        // A different-name entry claims a 3-char (6-byte) name, but the declared
+        // token length only covers the header + length byte. Decoding must fail
+        // with a protocol error rather than reading past `length`.
+        let mut body = BytesMut::new();
+        body.put_u8(1); // ColNum
+        body.put_u8(0); // TableNum
+        body.put_u8(STATUS_EXPRESSION | STATUS_DIFFERENT_NAME); // Status
+        body.put_u8(3); // ColName length in characters (claims 6 bytes)
+
+        // Declared length stops right after the length byte (4 bytes total),
+        // even though real name bytes follow on the wire.
+        let declared_len = body.len() as u16;
+        body.put_u16_le(u16::from(b'a'));
+        body.put_u16_le(u16::from(b'b'));
+        body.put_u16_le(u16::from(b'c'));
+
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(declared_len);
+        buf.extend_from_slice(&body);
+
+        let mut reader = buf.into_sql_read_bytes();
+        let err = TokenColInfo::decode(&mut reader)
+            .await
+            .expect_err("ColName overrun must be rejected");
+        assert!(matches!(err, crate::error::Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_invalid_utf16_colname() {
+        // A different-name column whose ColName is a lone high surrogate is not
+        // valid UTF-16. Strict decoding must reject it with a protocol error
+        // rather than lossily substituting a replacement character.
+        let mut body = BytesMut::new();
+        body.put_u8(1); // ColNum
+        body.put_u8(0); // TableNum
+        body.put_u8(STATUS_EXPRESSION | STATUS_DIFFERENT_NAME); // Status
+        body.put_u8(1); // ColName length in characters
+        body.put_u16_le(0xD800); // unpaired high surrogate
+
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(body.len() as u16);
+        buf.extend_from_slice(&body);
+
+        let mut reader = buf.into_sql_read_bytes();
+        let err = TokenColInfo::decode(&mut reader)
+            .await
+            .expect_err("invalid UTF-16 ColName must be rejected");
+        assert!(matches!(err, crate::error::Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_truncated_entry_header() {
+        // Declared length of 2 bytes cannot hold a full 3-byte entry header.
+        let mut body = BytesMut::new();
+        body.put_u8(1); // ColNum
+        body.put_u8(0); // TableNum (only 2 of 3 header bytes fit in `length`)
+
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(2);
+        buf.extend_from_slice(&body);
+        buf.put_u8(0); // trailing status byte present on the wire but past length
+
+        let mut reader = buf.into_sql_read_bytes();
+        let err = TokenColInfo::decode(&mut reader)
+            .await
+            .expect_err("truncated header must be rejected");
+        assert!(matches!(err, crate::error::Error::Protocol(_)));
     }
 }

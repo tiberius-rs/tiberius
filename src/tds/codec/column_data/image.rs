@@ -10,20 +10,18 @@ where
         return Ok(ColumnData::Binary(None));
     }
 
-    for _ in 0..ptr_len {
-        src.read_u8().await?;
-    }
+    // Skip the text pointer (packet-aware bulk read into a throwaway buffer).
+    let mut ptr = Vec::new();
+    crate::sql_read_bytes::read_bytes_into(src, &mut ptr, ptr_len, super::MAX_PREALLOC).await?;
 
     src.read_i32_le().await?; // days
     src.read_u32_le().await?; // second fractions
 
     let len = src.read_u32_le().await? as usize;
-    // `len` is untrusted; cap the up-front reservation (see MAX_PREALLOC).
-    let mut buf = Vec::with_capacity(len.min(super::MAX_PREALLOC));
-
-    for _ in 0..len {
-        buf.push(src.read_u8().await?);
-    }
+    // `len` is untrusted; the bulk reader caps the up-front reservation (see
+    // MAX_PREALLOC) and grows in bounded windows as bytes arrive.
+    let mut buf = Vec::new();
+    crate::sql_read_bytes::read_bytes_into(src, &mut buf, len, super::MAX_PREALLOC).await?;
 
     Ok(ColumnData::Binary(Some(buf.into())))
 }

@@ -1,10 +1,7 @@
-use std::{
-    borrow::{BorrowMut, Cow},
-    fmt::Display,
-};
+use std::{borrow::Cow, fmt::Display};
 
 use crate::{
-    tds::codec::{Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
+    tds::codec::{encode_b_varchar, Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
     Column, ColumnData, ColumnType, Error, SqlReadBytes,
 };
 use asynchronous_codec::BytesMut;
@@ -318,18 +315,9 @@ impl<'a> Encode<BytesMut> for MetaDataColumn<'a> {
         dst.put_u32_le(0);
         self.base.encode(dst)?;
 
-        let len_pos = dst.len();
-        let mut length = 0u8;
-
-        dst.put_u8(length);
-
-        for chr in self.col_name.encode_utf16() {
-            length += 1;
-            dst.put_u16_le(chr);
-        }
-
-        let dst: &mut [u8] = dst.borrow_mut();
-        dst[len_pos] = length;
+        // ColName is a B_VARCHAR (u8 code-unit count); reject an over-long name
+        // rather than wrap the counter and desync the wire.
+        encode_b_varchar(dst, &self.col_name)?;
 
         Ok(())
     }
@@ -813,6 +801,44 @@ mod tests {
         assert!(!flags.contains(ColumnFlag::Nullable));
         assert!(!flags.contains(ColumnFlag::Identity));
         assert!(!flags.contains(ColumnFlag::Computed));
+    }
+
+    // ColName is a B_VARCHAR (u8 length); a name longer than 255 UTF-16 code
+    // units must error rather than wrap the counter and desync the wire.
+    #[test]
+    fn metadata_column_rejects_over_long_col_name() {
+        let col = MetaDataColumn {
+            base: BaseMetaDataColumn {
+                flags: BitFlags::empty(),
+                ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                table_name: None,
+            },
+            col_name: Cow::Owned("a".repeat(256)),
+        };
+
+        let mut buf = BytesMut::new();
+        let err = col.encode(&mut buf).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A col_name of exactly 255 units is the boundary and must still encode with
+    // the correct u8 length prefix following the u32 user-type and TYPE_INFO.
+    #[test]
+    fn metadata_column_accepts_max_length_col_name() {
+        let col = MetaDataColumn {
+            base: BaseMetaDataColumn {
+                flags: BitFlags::empty(),
+                ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                table_name: None,
+            },
+            col_name: Cow::Owned("a".repeat(255)),
+        };
+
+        let mut buf = BytesMut::new();
+        col.encode(&mut buf).expect("255-unit col_name must encode");
+        // Layout: u32 user-type (4) + flags u16 (2) + FixedLen TYPE_INFO (1) +
+        // B_VARCHAR length prefix.
+        assert_eq!(buf[7], 255);
     }
 
     #[test]

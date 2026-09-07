@@ -211,6 +211,17 @@ impl<'a> Command<'a> {
 
     /// The same as [`bind_table`](Self::bind_table), but overrides the database
     /// type name used for the TVP.
+    ///
+    /// # Security
+    ///
+    /// `db_type` is interpolated directly into a SQL batch when the command is
+    /// executed (`DECLARE @P AS {db_type};SELECT TOP 0 * FROM @P`), because
+    /// T-SQL does not allow a type name to be parameterized. It must therefore
+    /// be a trusted identifier (a compile-time constant or a value from a
+    /// vetted allow-list), never untrusted or user-influenced input. A cheap
+    /// defense-in-depth guard rejects obviously-malformed identifiers (NUL/ASCII
+    /// control characters or an unbalanced `]` bracket) at [`exec`](Self::exec)
+    /// time, but that guard is not a substitute for passing a trusted value.
     pub fn bind_table_with_dbtype(
         &mut self,
         name: impl Into<Cow<'a, str>>,
@@ -285,6 +296,10 @@ impl<'a> Command<'a> {
             let rpc_val = match p.data {
                 CommandParamData::Scalar(col) => RpcValue::Scalar(col),
                 CommandParamData::Table(t) => {
+                    // `db_type` is interpolated raw into the batch below (T-SQL
+                    // cannot parameterize a type name), so reject obviously
+                    // dangerous identifiers before building the SQL.
+                    validate_db_type_identifier(t.db_type)?;
                     let type_info_tvp = TypeInfoTvp::new(
                         t.db_type,
                         t.rows.into_iter().map(|r| r.col_data).collect(),
@@ -316,6 +331,36 @@ impl<'a> Command<'a> {
         }
         Ok(rpc_params)
     }
+}
+
+/// Reject an obviously-malformed or dangerous TVP `db_type` identifier.
+///
+/// The `db_type` of a table-valued parameter is interpolated directly into a
+/// SQL batch (`DECLARE @P AS {db_type};SELECT TOP 0 * FROM @P`) because T-SQL
+/// does not allow a type name to be parameterized. This guard is cheap
+/// defense-in-depth — it does NOT make untrusted input safe. It rejects input
+/// that cannot be a legitimate type identifier:
+///
+/// - a NUL byte or any ASCII control character;
+/// - **outside** a `[...]` bracket-quoted segment, any character that is not
+///   identifier-safe. Only alphanumerics and the punctuation needed for real
+///   type names are allowed — `_`, `.` (multi-part names like `dbo.MyType`),
+///   `@`/`#` (variable/temp-style names), a plain space, and `(`, `)`, `,`
+///   (parameterized types such as `decimal(10,2)` / `varchar(max)`). This
+///   rejects statement-breaking characters such as `;`, quotes and `-`, so a
+///   value like `int; DROP TABLE x--` cannot slip through; and
+/// - **inside** a `[...]` bracket-quoted segment anything is allowed except an
+///   unescaped `]` (per the T-SQL bracket-escaping rule a literal `]` must be
+///   doubled as `]]`). A `]` seen outside any bracket is unbalanced and
+///   rejected.
+///
+/// It deliberately does NOT try to quote or rewrite the identifier, so
+/// multi-part names (`dbo.MyType`) and already-bracketed names (`[my type]`)
+/// keep working unchanged. This delegates to the shared
+/// [`crate::client::validate_sql_identifier`], which the bulk-insert guards in
+/// `src/client.rs` use too.
+fn validate_db_type_identifier(db_type: &str) -> crate::Result<()> {
+    crate::client::validate_sql_identifier("TVP db_type", db_type)
 }
 
 #[cfg(test)]
@@ -357,5 +402,68 @@ mod tests {
             CommandParamData::Table(t) => assert_eq!(t.db_type, "default.Type"),
             other => panic!("expected a table parameter, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn validate_db_type_accepts_normal_type_names() {
+        for db_type in [
+            "int",
+            "dbo.MyType",
+            "[my type]",
+            "[dbo].[my type]",
+            "[weird]]type]",
+            "decimal(18,4)",
+            "decimal(10,2)",
+            "varchar(max)",
+        ] {
+            assert!(
+                validate_db_type_identifier(db_type).is_ok(),
+                "expected {db_type:?} to be accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_db_type_rejects_statement_breaking_characters() {
+        // An injected statement terminator / comment must not pass the guard.
+        for db_type in [
+            "int; DROP TABLE x",
+            "int; DROP TABLE x--",
+            "int' OR '1'='1",
+            "int\" ",
+            "foo-- bar",
+        ] {
+            assert!(
+                matches!(
+                    validate_db_type_identifier(db_type),
+                    Err(crate::Error::BulkInput(_))
+                ),
+                "expected {db_type:?} to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_db_type_rejects_control_characters() {
+        assert!(matches!(
+            validate_db_type_identifier("int\0"),
+            Err(crate::Error::BulkInput(_))
+        ));
+        assert!(matches!(
+            validate_db_type_identifier("dbo.\nMyType"),
+            Err(crate::Error::BulkInput(_))
+        ));
+    }
+
+    #[test]
+    fn validate_db_type_rejects_unbalanced_closing_bracket() {
+        assert!(matches!(
+            validate_db_type_identifier("MyType]"),
+            Err(crate::Error::BulkInput(_))
+        ));
+        assert!(matches!(
+            validate_db_type_identifier("a]b"),
+            Err(crate::Error::BulkInput(_))
+        ));
     }
 }

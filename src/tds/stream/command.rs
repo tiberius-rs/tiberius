@@ -120,12 +120,16 @@ impl<'a> CommandStream<'a> {
                     result = Some(vec![row]);
                 }
                 (CommandItem::Row(row), Some(ref mut result)) => result.push(row),
-                (CommandItem::Metadata(_), None) => {
-                    result = Some(Vec::new());
-                }
-                (CommandItem::Metadata(_), ref mut previous_result) => {
-                    results.push(previous_result.take().unwrap());
-                    result = None;
+                (CommandItem::Metadata(_), previous_result) => {
+                    // A new result set begins. Flush the previous one (if any)
+                    // and open a fresh, empty set so a trailing zero-row result
+                    // still produces an (empty) `Vec` at the correct position
+                    // rather than being silently dropped (matching the sibling
+                    // `stream::query::collect_results`).
+                    if let Some(previous) = previous_result.take() {
+                        results.push(previous);
+                    }
+                    *previous_result = Some(Vec::new());
                 }
                 (CommandItem::ReturnStatus(rs), _) => return_status = rs,
                 (CommandItem::ReturnValue(rv), _) => return_values.push(rv),
@@ -338,5 +342,57 @@ impl<'a> Stream for CommandStream<'a> {
                 _ => continue,
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::codec::{
+        BaseMetaDataColumn, FixedLenType, MetaDataColumn, TokenColMetaData, TokenDone, TypeInfo,
+    };
+    use crate::tds::stream::ReceivedToken;
+    use futures_util::stream::{self, StreamExt};
+    use std::borrow::Cow;
+
+    fn token_meta(name: &'static str) -> ReceivedToken {
+        let col = MetaDataColumn {
+            base: BaseMetaDataColumn {
+                flags: enumflags2::BitFlags::empty(),
+                ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                table_name: None,
+            },
+            col_name: Cow::Borrowed(name),
+        };
+        ReceivedToken::NewResultset(Arc::new(TokenColMetaData { columns: vec![col] }))
+    }
+
+    fn token_row() -> ReceivedToken {
+        ReceivedToken::Row(crate::tds::codec::TokenRow::new())
+    }
+
+    fn command_stream(tokens: Vec<ReceivedToken>) -> CommandStream<'static> {
+        let s = stream::iter(tokens.into_iter().map(Ok::<_, crate::Error>));
+        CommandStream::new(s.boxed())
+    }
+
+    #[tokio::test]
+    async fn trailing_empty_result_set_is_preserved() {
+        // `SELECT 1; SELECT TOP 0 * FROM t` shape: a first set with one row,
+        // then a second metadata token with no rows before DONE. The trailing
+        // empty result set must survive as an empty `Vec`, not be dropped.
+        let result = command_stream(vec![
+            token_meta("first"),
+            token_row(),
+            token_meta("second"),
+            ReceivedToken::Done(TokenDone::default()),
+        ])
+        .into_command_result()
+        .await
+        .expect("into_command_result");
+
+        assert_eq!(result.query_results.len(), 2);
+        assert_eq!(result.query_results[0].len(), 1);
+        assert!(result.query_results[1].is_empty());
     }
 }
