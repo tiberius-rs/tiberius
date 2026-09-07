@@ -1,4 +1,4 @@
-use super::{AllHeaderTy, Encode, ALL_HEADERS_LEN_TX};
+use super::{encode_all_headers_tx, Encode};
 use bytes::{BufMut, BytesMut};
 use std::borrow::Cow;
 
@@ -18,16 +18,37 @@ impl<'a> BatchRequest<'a> {
 
 impl<'a> Encode<BytesMut> for BatchRequest<'a> {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
-        dst.put_u32_le(ALL_HEADERS_LEN_TX as u32);
-        dst.put_u32_le(ALL_HEADERS_LEN_TX as u32 - 4);
-        dst.put_u16_le(AllHeaderTy::TransactionDescriptor as u16);
-        dst.put_slice(&self.transaction_descriptor);
-        dst.put_u32_le(1);
+        encode_all_headers_tx(dst, self.transaction_descriptor);
 
         for c in self.queries.encode_utf16() {
             dst.put_u16_le(c);
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_is_byte_exact() {
+        let td = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let req = BatchRequest::new("Hi", td);
+
+        let mut dst = BytesMut::new();
+        req.encode(&mut dst).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&22u32.to_le_bytes()); // ALL_HEADERS_LEN_TX
+        expected.extend_from_slice(&18u32.to_le_bytes()); // header length (len - 4)
+        expected.extend_from_slice(&2u16.to_le_bytes()); // TransactionDescriptor type
+        expected.extend_from_slice(&td); // transaction descriptor
+        expected.extend_from_slice(&1u32.to_le_bytes()); // outstanding request count
+        expected.extend_from_slice(&('H' as u16).to_le_bytes());
+        expected.extend_from_slice(&('i' as u16).to_le_bytes());
+
+        assert_eq!(&dst[..], &expected[..]);
     }
 }

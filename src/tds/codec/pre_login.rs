@@ -10,7 +10,6 @@ use uuid::Uuid;
 
 /// Client application activity id token used for debugging purposes introduced
 /// in TDS 7.4.
-#[allow(unused)]
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct ActivityId {
@@ -108,6 +107,14 @@ impl PreloginMessage {
             (EncryptionLevel::Off, EncryptionLevel::Off) => EncryptionLevel::Off,
             (EncryptionLevel::On, EncryptionLevel::Off)
             | (EncryptionLevel::On, EncryptionLevel::NotSupported) => {
+                return Err(Error::Protocol(
+                    "Server does not allow the requested encryption level.".into(),
+                ))
+            }
+            // The client required encryption but the server declined it: this is
+            // a hard failure, not a silent downgrade to `On`.
+            (EncryptionLevel::Required, EncryptionLevel::Off)
+            | (EncryptionLevel::Required, EncryptionLevel::NotSupported) => {
                 return Err(Error::Protocol(
                     "Server does not allow the requested encryption level.".into(),
                 ))
@@ -224,7 +231,7 @@ impl Decode<BytesMut> for PreloginMessage {
             let token = cursor.read_u8()?;
 
             // read until terminator
-            if token == 0xff {
+            if token == PRELOGIN_TERMINATOR {
                 break;
             }
 
@@ -636,5 +643,25 @@ mod tests {
             prelogin.negotiated_encryption(EncryptionLevel::On).unwrap(),
             EncryptionLevel::On
         );
+    }
+
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    #[test]
+    fn negotiated_encryption_required_rejects_declined_level() {
+        // The client required encryption; a server that responds `Off` or
+        // `NotSupported` must be a hard protocol error, not a silent downgrade.
+        for server in [EncryptionLevel::Off, EncryptionLevel::NotSupported] {
+            let mut prelogin = PreloginMessage::new();
+            prelogin.encryption = server;
+
+            match prelogin.negotiated_encryption(EncryptionLevel::Required) {
+                Err(Error::Protocol(_)) => {}
+                other => panic!("expected Err(Error::Protocol) for {server:?}, got {other:?}"),
+            }
+        }
     }
 }
