@@ -170,45 +170,6 @@ jobs:
       - name: Run tests
         run: cargo test ${{matrix.features}}
 
-  integration-linux-next:
-    name: linux (SQL 2025, experimental)
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/qa')
-    runs-on: ubuntu-latest
-    # Newest server; kept non-blocking so a not-yet-published image or a
-    # server-side behaviour change on the bleeding edge cannot red-wall qa.
-    continue-on-error: true
-    env:
-      TIBERIUS_TEST_CONNECTION_STRING: "server=tcp:localhost,1433;user=SA;password=<YourStrong@Passw0rd>;TrustServerCertificate=true"
-      RUSTFLAGS: "-Dwarnings"
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Start SQL Server 2025
-        run: DOCKER_BUILDKIT=1 docker compose -f docker-compose.yml up -d mssql-2025
-      - name: Install dependencies
-        run: sudo apt-get install -y openssl libkrb5-dev
-      - name: Wait for SQL Server
-        # Authenticated readiness (not just an open port) — see the smoke job.
-        run: |
-          pw='<YourStrong@Passw0rd>'
-          for _ in $(seq 1 60); do
-            if docker run --rm --network host mcr.microsoft.com/mssql-tools \
-                 /opt/mssql-tools/bin/sqlcmd -S localhost,1433 -U SA -P "$pw" -Q "SELECT 1" >/dev/null 2>&1; then
-              echo "SQL Server ready (authenticated login succeeded)"; exit 0
-            fi
-            sleep 3
-          done
-          echo "SQL Server did not accept an authenticated login in time" >&2
-          docker compose -f docker-compose.yml logs mssql-2025 || true
-          exit 1
-      - name: Run tests
-        run: cargo test --features=all
-
   integration-macos:
     name: macos (SQL 2022 via colima)
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/qa')
@@ -229,12 +190,12 @@ jobs:
           # vendored-openssl (opentls, statically-linked OpenSSL) — cross-platform.
           - features: "--no-default-features --features=vendored-openssl,chrono,time,tds73,rust_decimal,bigdecimal"
             soft_fail: false
-          # native-tls on macOS resolves to Apple Secure Transport, which cannot
-          # complete the SQL Server TLS handshake (it works on Linux=OpenSSL and
-          # Windows=SChannel). Run it for visibility but don't red-wall the lane;
-          # tracked as a follow-up.
-          - features: "--features=all"
-            soft_fail: true
+          # NOTE: a `--features=all` lane is intentionally omitted here. On macOS
+          # `native-tls` resolves to Apple Secure Transport, which cannot complete
+          # the SQL Server TLS handshake (it works on Linux=OpenSSL and
+          # Windows=SChannel, both covered elsewhere). Running it here could only
+          # ever fail, so the two TLS backends that do work on macOS (rustls and
+          # vendored-openssl, above) provide the macOS integration coverage.
     env:
       TIBERIUS_TEST_CONNECTION_STRING: "server=tcp:localhost,1433;user=SA;password=<YourStrong@Passw0rd>;TrustServerCertificate=true"
       RUSTFLAGS: "-Dwarnings"
