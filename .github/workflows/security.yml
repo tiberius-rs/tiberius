@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   cargo-deny:
-    name: cargo-deny (advisories, bans, sources)
+    name: cargo-deny (advisories, bans, sources, licenses)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -25,5 +25,5 @@ jobs:
       # Run cargo-deny on the runner directly (the musl container action conflicts with the repo's rust-toolchain file).
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
-      - name: Check advisories, bans, sources
-        run: cargo deny check advisories bans sources
+      - name: Check advisories, bans, sources, licenses
+        run: cargo deny check advisories bans sources licenses
