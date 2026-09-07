@@ -4,7 +4,7 @@ use bytes::BufMut;
 use crate::{tds::Collation, xml::XmlSchema, Error, SqlReadBytes};
 use std::{convert::TryFrom, sync::Arc};
 
-use super::Encode;
+use super::{encode_b_varchar, Encode};
 
 /// A length of a column in bytes or characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,23 +283,14 @@ impl Encode<BytesMut> for TypeInfo {
                 if let Some(xs) = schema {
                     dst.put_u8(1);
 
-                    let db_name_encoded: Vec<u16> = xs.db_name().encode_utf16().collect();
-                    dst.put_u8(db_name_encoded.len() as u8);
-                    for chr in db_name_encoded {
-                        dst.put_u16_le(chr);
-                    }
-
-                    let owner_encoded: Vec<u16> = xs.owner().encode_utf16().collect();
-                    dst.put_u8(owner_encoded.len() as u8);
-                    for chr in owner_encoded {
-                        dst.put_u16_le(chr);
-                    }
-
-                    let collection_encoded: Vec<u16> = xs.collection().encode_utf16().collect();
-                    dst.put_u16_le(collection_encoded.len() as u16);
-                    for chr in collection_encoded {
-                        dst.put_u16_le(chr);
-                    }
+                    // db_name and owner are B_VARCHARs (u8 code-unit count); the
+                    // collection name is a US_VARCHAR (u16). Each length prefix
+                    // must bound-check rather than truncate with `as`, which would
+                    // write the full payload behind a wrong length and desync the
+                    // wire.
+                    encode_b_varchar(dst, xs.db_name())?;
+                    encode_b_varchar(dst, xs.owner())?;
+                    encode_us_varchar(dst, xs.collection())?;
                 } else {
                     dst.put_u8(0);
                 }
@@ -308,34 +299,47 @@ impl Encode<BytesMut> for TypeInfo {
                 dst.put_u8(VarLenType::Udt as u8);
                 dst.put_u16_le(info.max_byte_size);
 
-                let db_name: Vec<u16> = info.db_name.encode_utf16().collect();
-                dst.put_u8(db_name.len() as u8);
-                for chr in db_name {
-                    dst.put_u16_le(chr);
-                }
-
-                let schema_name: Vec<u16> = info.schema_name.encode_utf16().collect();
-                dst.put_u8(schema_name.len() as u8);
-                for chr in schema_name {
-                    dst.put_u16_le(chr);
-                }
-
-                let type_name: Vec<u16> = info.type_name.encode_utf16().collect();
-                dst.put_u8(type_name.len() as u8);
-                for chr in type_name {
-                    dst.put_u16_le(chr);
-                }
-
-                let aqn: Vec<u16> = info.assembly_qualified_name.encode_utf16().collect();
-                dst.put_u16_le(aqn.len() as u16);
-                for chr in aqn {
-                    dst.put_u16_le(chr);
-                }
+                // db_name, schema_name and type_name are B_VARCHARs (u8 count);
+                // the assembly-qualified name is a US_VARCHAR (u16). Bound-check
+                // each length prefix rather than truncating with `as`.
+                encode_b_varchar(dst, &info.db_name)?;
+                encode_b_varchar(dst, &info.schema_name)?;
+                encode_b_varchar(dst, &info.type_name)?;
+                encode_us_varchar(dst, &info.assembly_qualified_name)?;
             }
         }
 
         Ok(())
     }
+}
+
+/// Encodes a `US_VARCHAR` (MS-TDS 2.2.5.1.4): a `u16` code-unit count followed
+/// by that many little-endian UTF-16 code units.
+///
+/// The length prefix is a `u16`, so a string longer than 65535 UTF-16 code
+/// units cannot be represented. Truncating the count with `as u16` while still
+/// writing every unit would desync the wire, so an over-long string is rejected
+/// with an [`Error::Protocol`] instead.
+fn encode_us_varchar(dst: &mut BytesMut, s: &str) -> crate::Result<()> {
+    let units: Vec<u16> = s.encode_utf16().collect();
+
+    if units.len() > u16::MAX as usize {
+        return Err(Error::Protocol(
+            format!(
+                "string is too long for a US_VARCHAR ({} UTF-16 code units, max 65535)",
+                units.len()
+            )
+            .into(),
+        ));
+    }
+
+    dst.put_u16_le(units.len() as u16);
+
+    for unit in units {
+        dst.put_u16_le(unit);
+    }
+
+    Ok(())
 }
 
 impl TypeInfo {
@@ -518,6 +522,95 @@ mod tests {
 
             assert_eq!(nti, ti)
         }
+    }
+
+    // The XML schema db_name/owner length prefixes are B_VARCHARs (u8). The
+    // length prefix and the payload must agree: encode writes an exact u8 count
+    // then that many UTF-16 code units, and the collection name a u16 count.
+    #[test]
+    fn xml_schema_encodes_byte_exact_length_prefixes() {
+        let ti = TypeInfo::Xml {
+            schema: Some(XmlSchema::new("ab", "c", "de").into()),
+            size: 0,
+        };
+
+        let mut buf = BytesMut::new();
+        ti.encode(&mut buf).unwrap();
+
+        let mut expected = Vec::new();
+        expected.push(VarLenType::Xml as u8);
+        expected.push(1u8); // has_schema
+        expected.push(2u8); // db_name B_VARCHAR length
+        expected.extend_from_slice(&('a' as u16).to_le_bytes());
+        expected.extend_from_slice(&('b' as u16).to_le_bytes());
+        expected.push(1u8); // owner B_VARCHAR length
+        expected.extend_from_slice(&('c' as u16).to_le_bytes());
+        expected.extend_from_slice(&2u16.to_le_bytes()); // collection US_VARCHAR length
+        expected.extend_from_slice(&('d' as u16).to_le_bytes());
+        expected.extend_from_slice(&('e' as u16).to_le_bytes());
+
+        assert_eq!(&buf[..], &expected[..]);
+    }
+
+    // db_name/owner are B_VARCHARs (u8); a name over 255 code units must error
+    // rather than truncate the length prefix while writing the full payload.
+    #[test]
+    fn xml_schema_rejects_over_long_db_name() {
+        let ti = TypeInfo::Xml {
+            schema: Some(XmlSchema::new("a".repeat(256), "owner", "coll").into()),
+            size: 0,
+        };
+
+        let mut buf = BytesMut::new();
+        let err = ti.encode(&mut buf).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // The collection name is a US_VARCHAR (u16); over 65535 code units must error.
+    #[test]
+    fn xml_schema_rejects_over_long_collection() {
+        let ti = TypeInfo::Xml {
+            schema: Some(XmlSchema::new("db", "owner", "a".repeat(u16::MAX as usize + 1)).into()),
+            size: 0,
+        };
+
+        let mut buf = BytesMut::new();
+        let err = ti.encode(&mut buf).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // The UDT db_name/schema_name/type_name are B_VARCHARs (u8); an over-long one
+    // must error rather than truncate its length prefix.
+    #[test]
+    fn udt_rejects_over_long_type_name() {
+        let ti = TypeInfo::Udt(UdtInfo {
+            max_byte_size: 0xffff,
+            db_name: "db".to_string(),
+            schema_name: "dbo".to_string(),
+            type_name: "a".repeat(256),
+            assembly_qualified_name: "asm".to_string(),
+        });
+
+        let mut buf = BytesMut::new();
+        let err = ti.encode(&mut buf).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // The UDT assembly-qualified name is a US_VARCHAR (u16); over 65535 code
+    // units must error.
+    #[test]
+    fn udt_rejects_over_long_assembly_qualified_name() {
+        let ti = TypeInfo::Udt(UdtInfo {
+            max_byte_size: 0xffff,
+            db_name: "db".to_string(),
+            schema_name: "dbo".to_string(),
+            type_name: "T".to_string(),
+            assembly_qualified_name: "a".repeat(u16::MAX as usize + 1),
+        });
+
+        let mut buf = BytesMut::new();
+        let err = ti.encode(&mut buf).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
     }
 
     #[cfg(feature = "tds73")]
