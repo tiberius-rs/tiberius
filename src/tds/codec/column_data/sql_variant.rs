@@ -33,17 +33,18 @@ use crate::{
 
 /// Reads exactly `len` raw bytes from the stream.
 ///
-/// Uses the packet-aware `read_u8` (a `sql_variant` value can span TDS packet
+/// Uses the packet-aware bulk reader (a `sql_variant` value can span TDS packet
 /// boundaries; `AsyncReadExt::read_exact` would treat a boundary as EOF). `len`
-/// is bounded by the caller to `MAX_VARIANT_PAYLOAD`.
+/// is bounded by the caller to `MAX_VARIANT_PAYLOAD`; the up-front reservation
+/// is additionally capped at `MAX_PREALLOC` (matching the sibling decoders) so a
+/// wrong-but-within-bounds `len` cannot force an outsized allocation before the
+/// bytes arrive.
 async fn read_bytes<R>(src: &mut R, len: usize) -> crate::Result<Vec<u8>>
 where
     R: SqlReadBytes + Unpin,
 {
-    let mut buf = Vec::with_capacity(len);
-    for _ in 0..len {
-        buf.push(src.read_u8().await?);
-    }
+    let mut buf = Vec::new();
+    crate::sql_read_bytes::read_bytes_into(src, &mut buf, len, super::MAX_PREALLOC).await?;
     Ok(buf)
 }
 
@@ -289,18 +290,29 @@ where
 
     let magnitude = read_bytes(src, data_len - 1).await?;
 
+    // Reconstruct the magnitude as `low + high * 2^64`. A 16-byte magnitude has
+    // a full 64-bit `high` word, so `high * 2^64` (and the final `+ low`) can
+    // exceed `i128::MAX` for a value a malicious server crafts. Use checked
+    // arithmetic and surface a protocol error rather than overflow-panicking in
+    // debug builds or silently wrapping in release.
+    let overflow = || Error::Protocol("sql_variant: numeric magnitude out of range".into());
+
     let value = match magnitude.len() {
         4 => LittleEndian::read_u32(&magnitude) as i128,
         8 => LittleEndian::read_u64(&magnitude) as i128,
         12 => {
             let low = LittleEndian::read_u64(&magnitude[0..8]) as i128;
             let high = LittleEndian::read_u32(&magnitude[8..12]) as i128;
-            low + high * (1i128 << 64)
+            high.checked_mul(1i128 << 64)
+                .and_then(|hi| hi.checked_add(low))
+                .ok_or_else(overflow)?
         }
         16 => {
             let low = LittleEndian::read_u64(&magnitude[0..8]) as i128;
             let high = LittleEndian::read_u64(&magnitude[8..16]) as i128;
-            low + high * (1i128 << 64)
+            high.checked_mul(1i128 << 64)
+                .and_then(|hi| hi.checked_add(low))
+                .ok_or_else(overflow)?
         }
         n => {
             return Err(Error::Protocol(
@@ -309,9 +321,10 @@ where
         }
     };
 
+    let value = value.checked_mul(sign).ok_or_else(overflow)?;
+
     Ok(ColumnData::Numeric(Some(Numeric::new_with_scale(
-        value * sign,
-        scale,
+        value, scale,
     ))))
 }
 
@@ -977,6 +990,38 @@ mod tests {
 
         let err = decode(&mut variant_reader(&payload)).await.unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A 16-byte magnitude whose reconstructed value (`low + high * 2^64`)
+    // exceeds `i128::MAX` must return a protocol error instead of overflowing
+    // (panic in debug / silent wraparound in release). Here `high` is
+    // `u64::MAX`, so `high * 2^64` alone is ~2^128, well past `i128::MAX`.
+    #[tokio::test]
+    async fn decode_numeric_sixteen_byte_magnitude_overflow_errors() {
+        let mut payload = vec![VarLenType::Numericn as u8, 2, 38, 0];
+        payload.push(1); // positive sign
+        payload.extend_from_slice(&0u64.to_le_bytes()); // low 8 bytes
+        payload.extend_from_slice(&u64::MAX.to_le_bytes()); // high 8 bytes
+
+        let err = decode(&mut variant_reader(&payload)).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A 16-byte magnitude that fits in `i128` still decodes successfully, so the
+    // overflow guard does not reject valid large values.
+    #[tokio::test]
+    async fn decode_numeric_sixteen_byte_magnitude_in_range() {
+        let mut payload = vec![VarLenType::Numericn as u8, 2, 38, 0];
+        payload.push(1); // positive sign
+        payload.extend_from_slice(&7u64.to_le_bytes()); // low 8 bytes
+        payload.extend_from_slice(&3u64.to_le_bytes()); // high 8 bytes
+
+        let expected = 7i128 + 3i128 * (1i128 << 64);
+        let data = decode(&mut variant_reader(&payload)).await.unwrap();
+        assert_eq!(
+            data,
+            ColumnData::Numeric(Some(Numeric::new_with_scale(expected, 0)))
+        );
     }
 
     // A string whose UTF-16 encoding exceeds MAX_VARIANT_PAYLOAD is rejected.
