@@ -117,6 +117,7 @@ jobs:
           - "--no-default-features --features=time"
           - "--no-default-features --features=rustls"
           - "--no-default-features --features=vendored-openssl"
+          - "--no-default-features --features=rustls,chrono,time,tds73,rust_decimal,bigdecimal"
 
     env:
       TIBERIUS_TEST_CONNECTION_STRING: "server=tcp:localhost,1433;user=SA;password=<YourStrong@Passw0rd>;TrustServerCertificate=true"
