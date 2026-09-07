@@ -257,7 +257,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// interrupted (e.g. the query/execute future was cancelled), which would
     /// have left a partial message on the wire. The connection cannot be safely
     /// reused in that state and should be dropped.
-    fn ensure_not_poisoned(&self) -> crate::Result<()> {
+    pub(crate) fn ensure_not_poisoned(&self) -> crate::Result<()> {
         if self.poisoned {
             return Err(crate::Error::Protocol(
                 "connection was left in an inconsistent state by a cancelled write and can no longer be used; open a new connection"
@@ -265,6 +265,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             ));
         }
         Ok(())
+    }
+
+    /// Marks the connection poisoned for the duration of a multi-packet write.
+    ///
+    /// Exposed to the bulk-load write path (`BulkLoadRequest`), which writes its
+    /// messages by calling [`write_to_wire`] directly rather than through
+    /// [`send`]. It must bracket those write loops with `poison`/[`unpoison`] so
+    /// that a dropped future (cancelled bulk insert, `select!`, `timeout`) leaves
+    /// the connection unusable instead of silently reused after a half-sent
+    /// message — the same guarantee `send`/`cancel_request` get from their inline
+    /// bracketing. This is deliberately *not* folded into `write_to_wire`: that
+    /// method is called once per packet inside `send`'s loop, so clearing the
+    /// flag there would drop the poison between packets of a multi-packet send
+    /// and destroy the very protection `send` relies on.
+    ///
+    /// [`write_to_wire`]: Self::write_to_wire
+    /// [`send`]: Self::send
+    /// [`unpoison`]: Self::unpoison
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// Clears the poisoned flag after a multi-packet write completes cleanly.
+    /// The counterpart to [`poison`](Self::poison); see its docs.
+    pub(crate) fn unpoison(&mut self) {
+        self.poisoned = false;
     }
 
     async fn send_sensitive_login(
@@ -281,6 +307,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         // source `payload` are `Zeroizing`, so any sensitive bytes are cleared.
         let frames = frame_sensitive_login(header, &payload, packet_size)?;
         payload.zeroize();
+
+        // Mark the connection poisoned across the multi-frame write, exactly
+        // like `send`/`cancel_request`: if the writing future is dropped
+        // mid-loop the login is only partly on the wire and the connection must
+        // not be silently reused. A clean flush clears it below.
+        self.poisoned = true;
 
         for mut frame in frames {
             event!(Level::TRACE, "Sending a packet ({} bytes)", frame.len(),);
@@ -328,11 +360,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// as a single end-of-message packet. Draining the acknowledgement leaves
     /// the connection clean and ready to be reused for further queries.
     pub(crate) async fn cancel_request(&mut self) -> crate::Result<TokenDone> {
+        // Consistency with the other write paths (`send`,
+        // `send_sensitive_login`, `flush_stream`): if a previous multi-packet
+        // write was interrupted, the connection is already desynced with a
+        // partial message sitting on the wire. Appending an Attention packet
+        // after that half-sent message would corrupt the stream further and the
+        // acknowledging DONE could never be matched, so fail fast instead. A
+        // legitimate cancel targets an in-flight request, which means the prior
+        // `send` completed and cleared the flag, so this guard never rejects a
+        // valid cancellation.
+        self.ensure_not_poisoned()?;
+
         let id = self.context.next_packet_id();
         let header = PacketHeader::attention(id);
 
+        // Mark the connection poisoned across the write, exactly like `send`:
+        // the Attention is a single end-of-message packet, but if the writing
+        // future is dropped mid-flight the header is only partly on the wire and
+        // the connection must not be silently reused. A clean flush clears it.
+        self.poisoned = true;
+
+        // Attention has an empty payload; send just the 8-byte header.
         self.write_to_wire(header, BytesMut::new()).await?;
         self.flush_sink().await?;
+        self.poisoned = false;
 
         TokenStream::new(self).flush_done_attention().await
     }
@@ -509,9 +560,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                     None,
                 );
 
-                let init_token = ctx.step(None, None)?;
+                let init_token = ctx.step(None, None)?.ok_or_else(|| {
+                    crate::Error::Protocol("GSSAPI produced no initial token".into())
+                })?;
 
-                login_message.integrated_security(Some(Vec::from(init_token.unwrap().deref())));
+                login_message.integrated_security(Some(Vec::from(init_token.deref())));
 
                 let id = self.context.next_packet_id();
                 self.send(PacketHeader::login(id), login_message).await?;
@@ -543,6 +596,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 let username =
                     Username::new(&auth.user, auth.domain.as_deref()).map_err(sspi::Error::from)?;
 
+                // `auth.password` is a `Zeroizing<String>`. We must hand sspi a
+                // plaintext `String`, but that single copy is *moved* (not
+                // cloned again) into `AuthIdentity.password`, which is
+                // `sspi::Secret<String>` — a `#[derive(ZeroizeOnDrop)]` wrapper.
+                // The plaintext is therefore wiped when `identity` (and the
+                // credentials handle derived from it) is dropped; no
+                // un-zeroized copy is left behind. Keep this a single
+                // `to_string()` so no extra plaintext allocation is created.
                 let identity = AuthIdentity {
                     username,
                     password: auth.password.to_string().into(),
@@ -618,6 +679,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             AuthMethod::Windows(auth) => {
                 let spn = self.context.spn().to_string();
                 let builder = winauth::NtlmV2ClientBuilder::new().target_spn(spn);
+                // `auth.password` is a `Zeroizing<String>`, but `winauth`
+                // 0.0.5's `build` takes the password by value as a plain
+                // `String` and neither zeroizes it nor exposes it afterwards, so
+                // we cannot wipe it once handed over. We pass a single
+                // `to_string()` copy (no additional retained plaintext on our
+                // side) and accept a residual: the plaintext lives inside the
+                // `NtlmV2Client` until that value is dropped, un-zeroized.
+                // Closing this fully requires zeroize support upstream in
+                // `winauth`.
                 let mut client = builder.build(auth.domain, auth.user, auth.password.to_string());
 
                 login_message.integrated_security(client.next_bytes(None)?);
@@ -665,7 +735,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 self = self.post_login_encryption(encryption);
             }
             AuthMethod::AADToken(token) => {
-                login_message.aad_token(token, prelogin.fed_auth_required, prelogin.nonce);
+                // Borrow the token so the `Zeroizing<String>` is wiped on drop at
+                // the end of this arm rather than being moved out un-zeroized.
+                login_message.aad_token(token.as_str(), prelogin.fed_auth_required, prelogin.nonce);
                 // Encode into a zeroizing buffer and use the sensitive-login
                 // path so the bearer token does not linger in freed heap memory.
                 let payload = login_message.encode_to_vec()?;
@@ -757,6 +829,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
 
     pub(crate) async fn close(mut self) -> crate::Result<()> {
         self.transport.close().await
+    }
+}
+
+#[cfg(test)]
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
+    /// Builds a `Connection` over a caller-supplied mock `AsyncRead + AsyncWrite`
+    /// stream for server-free unit tests, bypassing the prelogin/login handshake.
+    ///
+    /// The buffer starts empty and `flushed` starts `false`, so the first read
+    /// pulls a packet from the mock transport; a default [`Context`] is used and
+    /// the `poisoned` flag is caller-controlled. This mirrors the real field
+    /// initialization in [`Connection::connect`] and is `#[cfg(test)]` only, so
+    /// it never ships. Shared by the poison-guard tests and the `TokenStream`
+    /// state-machine tests, which feed it canned TDS-framed bytes.
+    pub(crate) fn test_over(io: S, poisoned: bool) -> Connection<S> {
+        Connection {
+            transport: Framed::new(MaybeTlsStream::Raw(io), PacketCodec),
+            flushed: false,
+            context: Context::new(),
+            buf: BytesMut::new(),
+            poisoned,
+        }
     }
 }
 
@@ -1014,5 +1108,197 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SqlReadBytes for Connection<S> {
     /// A mutable reference to the current execution context.
     fn context_mut(&mut self) -> &mut Context {
         &mut self.context
+    }
+}
+
+// Server-free tests for the poisoned-connection guard shared by every write
+// path, including the Attention/cancel path (see `cancel_request`). These build
+// a `Connection` over an in-memory stream that is never actually driven: the
+// guard must reject before any I/O happens.
+#[cfg(test)]
+mod poison_tests {
+    use super::*;
+    use crate::tds::codec::{BulkLoadRequest, TokenRow};
+    use std::pin::Pin;
+
+    /// A stream that swallows writes and reports clean EOF on read. If the
+    /// poisoned guard is ever bypassed, `cancel_request` would reach here and
+    /// fail with an EOF/IO error instead of the poison `Protocol` error, which
+    /// is exactly what the assertions below distinguish.
+    struct NullIo;
+
+    impl AsyncRead for NullIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut task::Context<'_>,
+            _: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    impl AsyncWrite for NullIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A stream whose writes always fail, simulating a wire error / interrupted
+    /// write. Reads report clean EOF.
+    struct FailingIo;
+
+    impl AsyncRead for FailingIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut task::Context<'_>,
+            _: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    impl AsyncWrite for FailingIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut task::Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::other("wire down")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("wire down")))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn connection_over<S>(io: S, poisoned: bool) -> Connection<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        Connection::test_over(io, poisoned)
+    }
+
+    fn poisoned_connection() -> Connection<NullIo> {
+        connection_over(NullIo, true)
+    }
+
+    fn is_poison_error(err: &crate::Error) -> bool {
+        matches!(err, crate::Error::Protocol(msg) if msg.contains("inconsistent state"))
+    }
+
+    #[test]
+    fn ensure_not_poisoned_reports_poison() {
+        let conn = poisoned_connection();
+        assert!(is_poison_error(&conn.ensure_not_poisoned().unwrap_err()));
+    }
+
+    #[test]
+    fn ensure_not_poisoned_ok_when_clean() {
+        let mut conn = poisoned_connection();
+        conn.poisoned = false;
+        assert!(conn.ensure_not_poisoned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_request_rejects_poisoned_connection() {
+        let mut conn = poisoned_connection();
+        let err = conn
+            .cancel_request()
+            .await
+            .expect_err("cancel on a poisoned connection must fail");
+        // Must be the poison guard specifically, not an incidental IO/EOF error
+        // from reaching the wire — that is what proves the guard is in effect.
+        assert!(
+            is_poison_error(&err),
+            "expected poison Protocol error, got: {err:?}"
+        );
+        // The guard rejected before touching the wire, so the flag is untouched.
+        assert!(conn.poisoned);
+    }
+
+    // --- Bulk-load write path (`BulkLoadRequest`) ---------------------------
+    // The bulk path writes multi-packet messages via `write_to_wire` directly,
+    // so it must get the same poison guarantee as `send`. Empty columns + empty
+    // rows keep these server-free: each `send` appends a single Row-token byte
+    // to the buffer and a tiny `packet_size` forces the write loop to fire.
+
+    #[tokio::test]
+    async fn bulk_send_rejects_poisoned_connection() {
+        let mut conn = poisoned_connection();
+        let mut bulk = BulkLoadRequest::new(&mut conn, Vec::new()).unwrap();
+        let err = bulk
+            .send(TokenRow::new())
+            .await
+            .expect_err("a bulk send on a poisoned connection must fail");
+        // Must be the poison guard specifically — not an incidental IO error
+        // from reaching the (swallowing) wire — which proves the guard is in
+        // effect before any bytes are buffered or written.
+        assert!(is_poison_error(&err), "expected poison error, got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn bulk_write_clears_poison_on_success() {
+        let mut conn = connection_over(NullIo, false);
+        // One usable payload byte per packet so buffered Row-token bytes spill
+        // into the multi-packet write loop.
+        conn.context.set_packet_size(HEADER_BYTES as u32 + 1);
+
+        {
+            let mut bulk = BulkLoadRequest::new(&mut conn, Vec::new()).unwrap();
+            for _ in 0..8 {
+                bulk.send(TokenRow::new())
+                    .await
+                    .expect("bulk send over a clean wire must succeed");
+            }
+        }
+
+        // After the bulk writes complete cleanly the connection must be usable.
+        assert!(!conn.poisoned);
+        assert!(conn.ensure_not_poisoned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn bulk_write_failure_leaves_connection_poisoned() {
+        let mut conn = connection_over(FailingIo, false);
+        conn.context.set_packet_size(HEADER_BYTES as u32 + 1);
+
+        {
+            let mut bulk = BulkLoadRequest::new(&mut conn, Vec::new()).unwrap();
+            let mut result = Ok(());
+            for _ in 0..8 {
+                result = bulk.send(TokenRow::new()).await;
+                if result.is_err() {
+                    break;
+                }
+            }
+            assert!(
+                result.is_err(),
+                "a failing wire must surface an error from the bulk write"
+            );
+        }
+
+        // The interrupted write must leave the connection poisoned so the next
+        // op fails cleanly instead of appending onto a half-sent message.
+        assert!(
+            conn.poisoned,
+            "a failed bulk write must poison the connection"
+        );
+        assert!(is_poison_error(&conn.ensure_not_poisoned().unwrap_err()));
     }
 }
