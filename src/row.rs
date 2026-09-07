@@ -418,6 +418,11 @@ impl Row {
     }
 
     /// Retrieve a column's value for a given column index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the given index does not name a column in the row, or
+    /// if the stored value cannot be converted into the requested Rust type `R`.
     #[track_caller]
     pub fn try_get<'a, R, I>(&'a self, idx: I) -> crate::Result<Option<R>>
     where
@@ -430,6 +435,11 @@ impl Row {
     }
 
     /// Retrieve a column's data for a given column index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the given index does not name a column in the row, or
+    /// if the row carries fewer cells than columns (a malformed `ROW`/`NBCROW`).
     #[track_caller]
     pub fn get_column_data<I>(&self, idx: I) -> crate::Result<&ColumnData<'static>>
     where
