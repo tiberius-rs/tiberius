@@ -382,6 +382,94 @@ mod tests {
         }
     }
 
+    // An in-memory stream that captures every byte written to it, so the
+    // framing produced by `poll_write` + `poll_flush` can be inspected. Reads
+    // report clean EOF; they are not exercised by the write-side tests.
+    struct CapturingStream {
+        written: Vec<u8>,
+    }
+
+    impl AsyncRead for CapturingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut task::Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    impl AsyncWrite for CapturingStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // During the handshake, `poll_write` buffers the payload behind an 8-byte
+    // header placeholder and `poll_flush` back-fills that header and writes the
+    // whole frame to the wire. The result must be exactly one TDS packet:
+    // PreLogin type, EndOfMessage status, a total length covering header +
+    // payload, followed by the verbatim payload. This locks the wrapper's
+    // outbound framing (previously only the read side was tested).
+    #[test]
+    fn poll_write_then_flush_frames_a_prelogin_packet() {
+        let stream = CapturingStream {
+            written: Vec::new(),
+        };
+        let mut wrapper = TlsPreloginWrapper::new(stream);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        // A payload longer than the header, so the `wr_buf.len() > HEADER_BYTES`
+        // flush guard fires. Distinctive bytes make an off-by-one obvious.
+        let payload: Vec<u8> = (0u8..20).map(|i| 0xA0 ^ i).collect();
+        assert!(payload.len() > HEADER_BYTES);
+
+        match Pin::new(&mut wrapper).poll_write(&mut cx, &payload) {
+            Poll::Ready(Ok(n)) => assert_eq!(n, payload.len()),
+            other => panic!("expected the payload to be accepted, got {other:?}"),
+        }
+
+        match Pin::new(&mut wrapper).poll_flush(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("expected a clean flush, got {other:?}"),
+        }
+
+        let written = &wrapper.stream.as_ref().unwrap().written;
+
+        // The frame is header + payload and nothing else.
+        assert_eq!(
+            written.len(),
+            HEADER_BYTES + payload.len(),
+            "framed packet must be exactly header + payload bytes"
+        );
+
+        // The 8-byte header decodes to a PreLogin end-of-message packet whose
+        // declared length matches the whole frame.
+        let header = PacketHeader::decode(&mut BytesMut::from(&written[..HEADER_BYTES])).unwrap();
+        assert_eq!(header.r#type(), PacketType::PreLogin);
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+        assert_eq!(
+            header.length() as usize,
+            HEADER_BYTES + payload.len(),
+            "header length field must cover header + payload"
+        );
+
+        // The payload follows the header verbatim.
+        assert_eq!(&written[HEADER_BYTES..], &payload[..]);
+    }
+
     // Drive one `poll_read` over a wrapper fed the given 8-byte header.
     fn poll_header(header: [u8; HEADER_BYTES]) -> Poll<io::Result<usize>> {
         let stream = MockStream {

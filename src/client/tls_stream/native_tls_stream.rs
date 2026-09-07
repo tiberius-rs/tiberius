@@ -15,14 +15,25 @@ use tracing::{event, Level};
 fn load_identity(cert: &ClientCertificate) -> crate::Result<Identity> {
     match &cert.source {
         ClientCertSource::CertAndKey { cert, key } => {
-            let is_pem = |p: &std::path::Path| {
+            // Accept only the extensions valid for each role: a certificate is
+            // `.pem`/`.crt`, a private key is `.pem`/`.key`. Sharing a single
+            // set previously let a `.key` file pass as the certificate (and a
+            // `.crt` as the key).
+            //
+            // `.pem` is legitimately ambiguous — it is valid for BOTH the cert
+            // and the key role — so it is accepted for either slot. A swapped
+            // `.pem`/`.pem` pair therefore passes this extension check and is
+            // only caught later by `Identity::from_pkcs8`, which fails to parse
+            // mismatched content. Rejecting `.pem` for either role would break
+            // valid usage, so it is intentionally left accepted for both.
+            let has_ext = |p: &std::path::Path, exts: &[&str]| {
                 matches!(
                     p.extension().and_then(|e| e.to_str()),
-                    Some(ext) if ext.eq_ignore_ascii_case("pem") || ext.eq_ignore_ascii_case("crt") || ext.eq_ignore_ascii_case("key")
+                    Some(ext) if exts.iter().any(|e| ext.eq_ignore_ascii_case(e))
                 )
             };
 
-            if !is_pem(cert) || !is_pem(key) {
+            if !has_ext(cert, &["pem", "crt"]) || !has_ext(key, &["pem", "key"]) {
                 return Err(Error::Tls(
                     "The native-tls backend requires PEM certificate and key files; \
                      for a DER-bundled identity use `Config::client_certificate_pkcs12`."
@@ -123,4 +134,60 @@ pub(crate) async fn create_tls_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
     Ok(builder
         .connect(config.get_hostname_in_certificate(), stream)
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::config::ClientCertSource;
+    use std::path::PathBuf;
+
+    fn identity(cert: &str, key: &str) -> crate::Result<Identity> {
+        load_identity(&ClientCertificate {
+            source: ClientCertSource::CertAndKey {
+                cert: PathBuf::from(cert),
+                key: PathBuf::from(key),
+            },
+        })
+    }
+
+    // A `.key` file must not be accepted in the certificate role, nor a `.crt`
+    // in the key role. The extension check runs before any file read, so these
+    // paths need not exist.
+    #[test]
+    fn key_extension_rejected_as_certificate() {
+        assert!(matches!(
+            identity("client.key", "client.key"),
+            Err(Error::Tls(_))
+        ));
+    }
+
+    #[test]
+    fn crt_extension_rejected_as_key() {
+        assert!(matches!(
+            identity("client.crt", "client.crt"),
+            Err(Error::Tls(_))
+        ));
+    }
+
+    // The valid role combinations pass the extension check and fail only later,
+    // when the nonexistent files are read (an `Io` error, not a `Tls` one).
+    #[test]
+    fn valid_extensions_pass_extension_check() {
+        for (cert, key) in [
+            ("client.crt", "client.key"),
+            ("client.pem", "client.pem"),
+            ("client.crt", "client.pem"),
+            ("client.pem", "client.key"),
+        ] {
+            match identity(cert, key) {
+                Err(Error::Tls(_)) => {
+                    panic!("valid extensions {cert}/{key} were wrongly rejected by the check")
+                }
+                Err(Error::Io { .. }) => {}
+                Err(e) => panic!("expected an Io error from the missing file, got {e:?}"),
+                Ok(_) => panic!("nonexistent files should not yield an identity"),
+            }
+        }
+    }
 }
