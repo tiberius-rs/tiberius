@@ -20,7 +20,7 @@ use asynchronous_codec::Framed;
 use bytes::BytesMut;
 #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
 use codec::TokenSspi;
-use futures_util::io::{AsyncRead, AsyncWrite};
+use futures_util::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use futures_util::ready;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{Stream, TryStream, TryStreamExt};
@@ -39,6 +39,7 @@ use task::Poll;
 use tracing::{event, Level};
 #[cfg(all(windows, feature = "winauth"))]
 use winauth::{windows::NtlmSspiBuilder, NextBytes};
+use zeroize::{Zeroize, Zeroizing};
 
 /// A `Connection` is an abstraction between the [`Client`] and the server. It
 /// can be used as a `Stream` to fetch [`Packet`]s from and to `send` packets
@@ -106,6 +107,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 config.host,
                 config.application_name,
                 config.readonly,
+                config.packet_size,
                 prelogin,
             )
             .await?;
@@ -192,6 +194,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         }
 
         self.flush_sink().await?;
+
+        Ok(())
+    }
+
+    async fn send_sensitive_login(
+        &mut self,
+        header: PacketHeader,
+        mut payload: Zeroizing<Vec<u8>>,
+    ) -> crate::Result<()> {
+        self.flushed = false;
+        let packet_size = (self.context.packet_size() as usize) - HEADER_BYTES;
+
+        // Frame the login into zeroizable packets off the shared `BytesMut`
+        // path, then write each and wipe it immediately. Both the frames and the
+        // source `payload` are `Zeroizing`, so any sensitive bytes are cleared.
+        let frames = frame_sensitive_login(header, &payload, packet_size)?;
+        payload.zeroize();
+
+        for mut frame in frames {
+            event!(Level::TRACE, "Sending a packet ({} bytes)", frame.len(),);
+
+            self.transport.write_all(frame.as_slice()).await?;
+            frame.zeroize();
+        }
+
+        self.transport.flush().await?;
 
         Ok(())
     }
@@ -293,6 +321,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         server_name: Option<String>,
         application_name: Option<String>,
         readonly: bool,
+        packet_size: Option<u32>,
         prelogin: PreloginMessage,
     ) -> crate::Result<Self> {
         let mut login_message = LoginMessage::new();
@@ -310,6 +339,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         }
 
         login_message.readonly(readonly);
+
+        if let Some(size) = packet_size {
+            login_message.packet_size(size);
+        }
 
         match auth {
             #[cfg(all(windows, feature = "winauth"))]
@@ -332,7 +365,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                         event!(Level::TRACE, sspi_response_len = sspi_response.len());
 
                         let id = self.context.next_packet_id();
-                        let header = PacketHeader::login(id);
+                        let header = PacketHeader::sspi(id);
 
                         let token = TokenSspi::new(sspi_response);
                         self.send(header, token).await?;
@@ -415,11 +448,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 self = self.post_login_encryption(encryption);
             }
             AuthMethod::SqlServer(auth) => {
-                login_message.user_name(auth.user());
-                login_message.password(auth.password());
+                let (user, mut password) = auth.into_credentials();
+
+                login_message.user_name(user);
+                login_message.password(password.as_str());
+                let payload = login_message.encode_to_vec()?;
+                password.zeroize();
 
                 let id = self.context.next_packet_id();
-                self.send(PacketHeader::login(id), login_message).await?;
+                self.send_sensitive_login(PacketHeader::login(id), payload)
+                    .await?;
                 self = self.post_login_encryption(encryption);
             }
             AuthMethod::AADToken(token) => {
@@ -518,6 +556,141 @@ fn check_tls_backend_available(encryption: EncryptionLevel) -> crate::Result<()>
     }
 
     Ok(())
+}
+
+/// Frame a login message into one or more login packets, each no larger than
+/// `packet_size` payload bytes, ready to write to the wire.
+///
+/// This is the packetization core of [`Connection::send_sensitive_login`],
+/// factored out so it can be unit-tested without a live server. Every packet is
+/// an 8-byte header (see [`PacketHeader::encode`]) followed by up to
+/// `packet_size` payload bytes, with the big-endian total length written into
+/// header bytes `[2..4]` — matching [`Packet::encode`]. All but the final packet
+/// carry `NormalMessage`; the final one carries `EndOfMessage`.
+///
+/// The returned frames are `Zeroizing` so the sensitive login bytes they contain
+/// are wiped on drop, keeping them off the shared (non-zeroizing) `BytesMut`
+/// path used by the ordinary `send`.
+fn frame_sensitive_login(
+    mut header: PacketHeader,
+    payload: &[u8],
+    packet_size: usize,
+) -> crate::Result<Vec<Zeroizing<Vec<u8>>>> {
+    let mut frames = Vec::new();
+    let mut offset = 0;
+
+    while offset < payload.len() {
+        let end = cmp::min(payload.len(), offset + packet_size);
+
+        if end == payload.len() {
+            header.set_status(PacketStatus::EndOfMessage);
+        } else {
+            header.set_status(PacketStatus::NormalMessage);
+        }
+
+        let mut frame = Zeroizing::new(Vec::with_capacity(HEADER_BYTES + end - offset));
+        header.encode(&mut *frame)?;
+        frame.extend_from_slice(&payload[offset..end]);
+
+        let size = (frame.len() as u16).to_be_bytes();
+        frame[2] = size[0];
+        frame[3] = size[1];
+
+        frames.push(frame);
+        offset = end;
+    }
+
+    Ok(frames)
+}
+
+#[cfg(test)]
+mod sensitive_login_tests {
+    use super::frame_sensitive_login;
+    use crate::tds::codec::{Decode, Packet, PacketHeader, PacketStatus};
+    use crate::tds::HEADER_BYTES;
+    use bytes::BytesMut;
+
+    // An oversized login payload must be split into >=2 packets, each framed
+    // exactly like `Packet::encode`: an 8-byte header whose `[2..4]` bytes hold
+    // the big-endian total length, contiguous payload chunks covering the whole
+    // input, `NormalMessage` on every packet but the last and `EndOfMessage` on
+    // the final one.
+    #[test]
+    fn oversized_login_is_split_into_multiple_framed_packets() {
+        let packet_size = 16; // payload bytes per packet (excludes the 8-byte header)
+        let payload: Vec<u8> = (0..50u16).map(|i| i as u8).collect(); // 50 bytes -> ceil(50/16)=4
+        let header = PacketHeader::login(3);
+
+        let frames = frame_sensitive_login(header, &payload, packet_size).unwrap();
+
+        assert!(
+            frames.len() >= 2,
+            "expected the oversized login to split into >=2 packets, got {}",
+            frames.len()
+        );
+        assert_eq!(
+            frames.len(),
+            4,
+            "50 bytes / 16 per packet should be 4 packets"
+        );
+
+        let mut reassembled = Vec::new();
+        for (i, frame) in frames.iter().enumerate() {
+            let is_last = i == frames.len() - 1;
+
+            // Decode the header back off the wire bytes and check framing.
+            let mut buf = BytesMut::from(&frame[..]);
+            let decoded = PacketHeader::decode(&mut buf).unwrap();
+
+            // Length field ([2..4], big-endian) must equal the whole frame length.
+            assert_eq!(
+                decoded.length() as usize,
+                frame.len(),
+                "packet {i} length field must match the framed size"
+            );
+            // And the raw bytes must match `Packet::encode`'s placement exactly.
+            let expected_len = (frame.len() as u16).to_be_bytes();
+            assert_eq!([frame[2], frame[3]], expected_len);
+
+            // Payload chunk size: every packet but the last is full.
+            let payload_len = frame.len() - HEADER_BYTES;
+            if is_last {
+                assert_eq!(decoded.status(), PacketStatus::EndOfMessage);
+                assert!(payload_len <= packet_size && payload_len > 0);
+            } else {
+                assert_eq!(decoded.status(), PacketStatus::NormalMessage);
+                assert_eq!(payload_len, packet_size);
+            }
+
+            reassembled.extend_from_slice(&frame[HEADER_BYTES..]);
+        }
+
+        // The concatenated payloads must reconstruct the original login bytes.
+        assert_eq!(reassembled, payload);
+    }
+
+    // A cross-check that a single frame produced by `frame_sensitive_login`
+    // matches byte-for-byte what `Packet::encode` produces for the same
+    // header + payload, when it fits in one packet.
+    #[test]
+    fn single_packet_frame_matches_packet_encode() {
+        use crate::tds::codec::Encode;
+
+        let payload = vec![0xABu8; 10];
+        let header = PacketHeader::login(7);
+
+        let frames = frame_sensitive_login(header, &payload, 100).unwrap();
+        assert_eq!(frames.len(), 1);
+
+        let mut expected = BytesMut::new();
+        let mut eom_header = header;
+        eom_header.set_status(PacketStatus::EndOfMessage);
+        Packet::new(eom_header, BytesMut::from(&payload[..]))
+            .encode(&mut expected)
+            .unwrap();
+
+        assert_eq!(&frames[0][..], &expected[..]);
+    }
 }
 
 #[cfg(all(

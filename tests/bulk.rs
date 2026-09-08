@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::env;
 use std::sync::Once;
+use tiberius::ColumnData;
 use tiberius::{IntoSql, Result, TokenRow};
 
 #[cfg(all(feature = "tds73", feature = "chrono"))]
@@ -394,4 +395,135 @@ test_bulk_type!(datetime2_7(
     "DATETIME2(7)",
     100,
     vec![DateTime::from_timestamp(1658524194, 123456789); 100].into_iter()
+));
+
+#[test_on_runtimes]
+async fn read_and_write_to_keyword_columns<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+
+    conn.simple_query(format!("CREATE TABLE {} ([End] INT)", table))
+        .await?;
+
+    let mut req = conn.bulk_insert(&table).await.unwrap();
+    for num in [6, 7, 8] {
+        let mut row = TokenRow::new();
+        row.push(ColumnData::I32(Some(num)));
+        req.send(row).await.unwrap();
+    }
+    let result = req.finalize().await.unwrap();
+    assert_eq!(result.rows_affected(), &[3]);
+
+    let rows = conn
+        .query(format!("SELECT [End] FROM {}", table), &[])
+        .await?
+        .into_first_result()
+        .await?;
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(Some(6), rows[0].get(0));
+    assert_eq!(Some(7), rows[1].get(0));
+    assert_eq!(Some(8), rows[2].get(0));
+
+    Ok(())
+}
+
+macro_rules! test_bulk_columns {
+    ($name:ident($total_generated:literal $(, $sql_type:literal)+ $(, ($cols:expr, $generator:expr ))+ $(,)?)) => {
+        paste::item! {
+            #[test_on_runtimes]
+            async fn [< bulk_load_optional_ $name >]<S>(mut conn: tiberius::Client<S>) -> Result<()>
+            where
+                S: AsyncRead + AsyncWrite + Unpin + Send,
+            {
+                use tiberius::IntoRow;
+
+                let table = format!("##{}", random_table().await);
+                let column_defs = &[$($sql_type,)+];
+
+                conn.execute(
+                    &format!(
+                        "CREATE TABLE {} (id INT IDENTITY PRIMARY KEY, {})",
+                        table,
+                        column_defs.join(", "),
+                    ),
+                    &[],
+                )
+                    .await?;
+
+                let mut count = 0;
+
+                $(
+                    let mut req = conn.bulk_insert_columns(&table, $cols).await?;
+                    for i in $generator {
+                        let row = i.into_row();
+                        req.send(row).await?;
+                    }
+
+                    let res = req.finalize().await?;
+                    count += res.total();
+                )+
+                assert_eq!($total_generated, count);
+
+                Ok(())
+            }
+
+            #[test_on_runtimes]
+            async fn [< bulk_load_required_ $name >]<S>(mut conn: tiberius::Client<S>) -> Result<()>
+            where
+                S: AsyncRead + AsyncWrite + Unpin + Send,
+            {
+                use tiberius::IntoRow;
+                let table = format!("##{}", random_table().await);
+                let column_defs = &[$(format!("{} NOT NULL", $sql_type),)+];
+
+                conn.execute(
+                    &format!(
+                        "CREATE TABLE {} (id INT IDENTITY PRIMARY KEY, {})",
+                        table,
+                        column_defs.join(", "),
+                    ),
+                    &[],
+                )
+                    .await?;
+
+                let mut count = 0;
+
+                $(
+                    let mut req = conn.bulk_insert_columns(&table, $cols).await?;
+                    for i in $generator {
+                        let row = i.into_row();
+                        req.send(row).await?;
+                    }
+
+                    let res = req.finalize().await?;
+                    count += res.total();
+                )+
+                assert_eq!($total_generated, count);
+
+                Ok(())
+            }
+
+        }
+    };
+}
+
+test_bulk_columns!(ab_ba_default_columns(
+    200,
+    "a INT",
+    "b FLOAT",
+    "c INT DEFAULT 0",
+    (&["a", "b"], vec![(1i32, 1f64); 100]),
+    (&["b", "a"], vec![(2f64, 2i32); 100]),
+));
+
+test_bulk_columns!(ab_ba_override_default_columns(
+    200,
+    "a INT",
+    "b FLOAT",
+    "c INT DEFAULT 0",
+    (&["a", "b", "c"], vec![(1i32, 1f64, 10i32); 100]),
+    (&["b", "c", "a"], vec![(2f64, 20i32, 2i32); 100]),
 ));

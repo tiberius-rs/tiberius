@@ -92,6 +92,16 @@ impl PacketHeader {
         }
     }
 
+    // Used only on winauth / integrated-auth-gssapi builds.
+    #[allow(dead_code)]
+    pub fn sspi(id: u8) -> Self {
+        Self {
+            ty: PacketType::Sspi,
+            status: PacketStatus::EndOfMessage,
+            ..Self::new(0, id)
+        }
+    }
+
     pub fn batch(id: u8) -> Self {
         Self {
             ty: PacketType::SQLBatch,

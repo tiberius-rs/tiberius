@@ -251,9 +251,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         Ok(result)
     }
 
-    /// Execute a `BULK INSERT` statement, efficiantly storing a large number of
+    /// Execute a `BULK INSERT` statement, efficiently storing a large number of
     /// rows to a specified table. Note: make sure the input row follows the same
     /// schema as the table, otherwise calling `send()` will return an error.
+    ///
+    /// This is equivalent to `bulk_insert_columns(table, &["*"])`, inserting into
+    /// all of a table's columns.
+    ///
+    /// # Security
+    ///
+    /// `table` is interpolated **directly** into the SQL batch sent to the
+    /// server. SQL Server does not allow table (or column) identifiers to be
+    /// supplied as bound parameters, so this value cannot be parameterized — it
+    /// becomes part of the SQL text verbatim. The caller MUST therefore pass a
+    /// **trusted, hard-coded or otherwise validated** identifier and MUST NOT
+    /// pass untrusted or user-supplied input, which would open a SQL injection
+    /// vector. As cheap defense-in-depth this method rejects obviously-malformed
+    /// identifiers (NUL/ASCII control characters or an unbalanced `]` bracket),
+    /// but that guard is not a substitute for passing trusted input.
     ///
     /// # Example
     ///
@@ -300,11 +315,92 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         &'a mut self,
         table: &'a str,
     ) -> crate::Result<BulkLoadRequest<'a, S>> {
+        self.bulk_insert_columns(table, &["*"]).await
+    }
+
+    /// Execute a `BULK INSERT` statement, efficiently storing a large number of
+    /// rows to a specified table. Note: make sure the input row follows the same
+    /// schema as the column list, otherwise calling `send()` will return an error.
+    ///
+    /// # Security
+    ///
+    /// Both `table` and the entries of `columns` are interpolated **directly**
+    /// into the SQL batches sent to the server (the `SELECT` used to fetch
+    /// column metadata and the `INSERT BULK` statement). SQL Server does not
+    /// allow identifiers to be supplied as bound parameters, so these values
+    /// cannot be parameterized — they become part of the SQL text verbatim. The
+    /// caller MUST therefore pass **trusted, hard-coded or otherwise validated**
+    /// identifiers and MUST NOT pass untrusted or user-supplied input, which
+    /// would open a SQL injection vector. As cheap defense-in-depth this method
+    /// rejects an obviously-malformed `table` (NUL/ASCII control characters or an
+    /// unbalanced `]` bracket), but that guard is not a substitute for passing
+    /// trusted input.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tiberius::{Config, IntoRow};
+    /// # use tokio_util::compat::TokioAsyncWriteCompatExt;
+    /// # use std::env;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let c_str = env::var("TIBERIUS_TEST_CONNECTION_STRING").unwrap_or(
+    /// #     "server=tcp:localhost,1433;integratedSecurity=true;TrustServerCertificate=true".to_owned(),
+    /// # );
+    /// # let config = Config::from_ado_string(&c_str)?;
+    /// # let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+    /// # tcp.set_nodelay(true)?;
+    /// # let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+    /// let create_table = r#"
+    ///     CREATE TABLE ##bulk_test_columns (
+    ///         id INT IDENTITY PRIMARY KEY,
+    ///         foo INT NOT NULL,
+    ///         bar FLOAT NOT NULL
+    ///     )
+    /// "#;
+    ///
+    /// client.simple_query(create_table).await?;
+    ///
+    /// // Start the bulk insert with the client.
+    /// let mut req = client.bulk_insert_columns("##bulk_test_columns", &["foo", "bar"]).await?;
+    ///
+    /// for (i, j) in [(0i32, 0f64), (1i32, 1f64), (2i32, 2f64)] {
+    ///     let row = (i, j).into_row();
+    ///
+    ///     // The request will handle flushing to the wire in an optimal way,
+    ///     // balancing between memory usage and IO performance.
+    ///     req.send(row).await?;
+    /// }
+    ///
+    /// // The request must be finalized.
+    /// let res = req.finalize().await?;
+    /// assert_eq!(3, res.total());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn bulk_insert_columns<'a>(
+        &'a mut self,
+        table: &'a str,
+        columns: &'a [&'a str],
+    ) -> crate::Result<BulkLoadRequest<'a, S>> {
+        // `table` is interpolated directly into the SQL batch (identifiers cannot
+        // be parameterized in T-SQL). Reject obviously-malformed/dangerous input
+        // as cheap defense-in-depth; see the `# Security` note above.
+        validate_bulk_table_identifier(table)?;
+
+        // Each `columns` entry is likewise interpolated directly into the SQL
+        // (both the metadata `SELECT` and the `INSERT BULK` column list), so it
+        // gets the same cheap defense-in-depth guard as `table`.
+        for column in columns {
+            validate_bulk_column_identifier(column)?;
+        }
+
         // Start the bulk request
         self.connection.flush_stream().await?;
 
         // retrieve column metadata from server
-        let query = format!("SELECT TOP 0 * FROM {}", table);
+        let columns = columns.join(", ");
+        let query = format!("SELECT TOP 0 {columns} FROM {table}");
 
         let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
 
@@ -414,5 +510,134 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         self.connection.send(PacketHeader::rpc(id), req).await?;
 
         Ok(())
+    }
+}
+
+/// Reject an obviously-malformed or dangerous bulk-insert table identifier.
+///
+/// The `table` argument of [`Client::bulk_insert`] / [`Client::bulk_insert_columns`]
+/// is interpolated directly into the SQL batch because T-SQL does not allow
+/// identifiers to be parameterized. This guard is cheap defense-in-depth — it
+/// does NOT make untrusted input safe. It only rejects input that cannot be a
+/// legitimate identifier:
+///
+/// - a NUL byte or any ASCII control character, and
+/// - an unbalanced closing bracket `]` (per the T-SQL bracket-escaping rule a
+///   literal `]` inside a `[...]` quoted identifier must be doubled as `]]`).
+///
+/// It deliberately does NOT try to quote or rewrite the identifier, so
+/// multi-part names (`schema.table`), already-bracketed names (`[my table]`) and
+/// temp tables (`##bulk_test`) keep working unchanged.
+fn validate_bulk_table_identifier(table: &str) -> crate::Result<()> {
+    validate_bulk_identifier("table", table)
+}
+
+/// Reject an obviously-malformed or dangerous bulk-insert `column` identifier.
+///
+/// Column names are interpolated into the metadata `SELECT` and `INSERT BULK`
+/// column list exactly like `table`, so they get the same cheap
+/// defense-in-depth check. See [`validate_bulk_table_identifier`].
+fn validate_bulk_column_identifier(column: &str) -> crate::Result<()> {
+    validate_bulk_identifier("column", column)
+}
+
+/// Shared implementation for the bulk `table`/`column` identifier guards.
+/// `what` names the kind of identifier for the error message.
+fn validate_bulk_identifier(what: &str, ident: &str) -> crate::Result<()> {
+    if ident.chars().any(|c| c.is_ascii_control()) {
+        return Err(crate::Error::BulkInput(
+            format!("bulk insert {what} identifier must not contain NUL or control characters")
+                .into(),
+        ));
+    }
+
+    // Apply the T-SQL bracket rule: inside a `[...]` quoted identifier a literal
+    // `]` must be doubled (`]]`); a single `]` closes the bracket. A `]` seen
+    // outside of any bracket is unbalanced and rejected. Tracking bracket state
+    // keeps legitimate names like `[dbo].[my table]` and `[weird]]name]`
+    // working while catching stray closing brackets such as `Foo]`.
+    let bytes = ident.as_bytes();
+    let mut in_bracket = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' if !in_bracket => in_bracket = true,
+            b']' if in_bracket => {
+                if bytes.get(i + 1) == Some(&b']') {
+                    // doubled `]]` escape: consume the pair, stay in the bracket
+                    i += 2;
+                    continue;
+                }
+                // single `]` closes the quoted identifier
+                in_bracket = false;
+            }
+            b']' => {
+                return Err(crate::Error::BulkInput(
+                    format!("bulk insert {what} identifier contains an unbalanced `]` bracket")
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_bulk_column_identifier, validate_bulk_table_identifier};
+
+    #[test]
+    fn accepts_normal_column_identifiers() {
+        for column in ["foo", "bar", "*", "[my col]", "[weird]]col]"] {
+            assert!(
+                validate_bulk_column_identifier(column).is_ok(),
+                "expected column {column:?} to be accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bad_column_identifiers() {
+        // control character
+        assert!(validate_bulk_column_identifier("foo\0bar").is_err());
+        assert!(validate_bulk_column_identifier("foo\nbar").is_err());
+        // lone / unbalanced closing bracket
+        assert!(validate_bulk_column_identifier("foo]").is_err());
+        assert!(validate_bulk_column_identifier("a]b").is_err());
+    }
+
+    #[test]
+    fn accepts_normal_identifiers() {
+        for table in [
+            "Foo",
+            "dbo.Foo",
+            "##bulk_test",
+            "#temp",
+            "[my table]",
+            "[dbo].[my table]",
+            "[weird]]name]", // doubled `]]` escape inside brackets
+        ] {
+            assert!(
+                validate_bulk_table_identifier(table).is_ok(),
+                "expected {table:?} to be accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        assert!(validate_bulk_table_identifier("Foo\0bar").is_err());
+        assert!(validate_bulk_table_identifier("Foo\nbar").is_err());
+        assert!(validate_bulk_table_identifier("Foo\tbar").is_err());
+    }
+
+    #[test]
+    fn rejects_unbalanced_closing_bracket() {
+        assert!(validate_bulk_table_identifier("Foo]").is_err());
+        assert!(validate_bulk_table_identifier("[my] table]").is_err());
+        assert!(validate_bulk_table_identifier("a]b").is_err());
     }
 }
