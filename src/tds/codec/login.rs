@@ -8,7 +8,7 @@ use std::{borrow::Cow, io};
 
 uint_enum! {
     #[repr(u32)]
-    #[derive(PartialOrd)]
+    #[derive(PartialOrd, Default)]
     pub enum FeatureLevel {
         SqlServerV7 = 0x70000000,
         SqlServer2000 = 0x71000000,
@@ -17,13 +17,8 @@ uint_enum! {
         SqlServer2008 = 0x730A0003,
         SqlServer2008R2 = 0x730B0003,
         /// 2012, 2014, 2016
+        #[default]
         SqlServerN = 0x74000004,
-    }
-}
-
-impl Default for FeatureLevel {
-    fn default() -> Self {
-        Self::SqlServerN
     }
 }
 
@@ -556,6 +551,44 @@ mod tests {
 
             Ok(ret)
         }
+    }
+
+    #[test]
+    fn readonly_intent_sets_type_flag_bit() {
+        // The TypeFlags byte is the third of the four flag bytes, which follow
+        // the length + five u32 header fields:
+        //   4 (length) + 5 * 4 (header) = 24, then OptionFlags1, OptionFlags2,
+        //   TypeFlags at byte offset 26.
+        const TYPE_FLAGS_OFFSET: usize = 26;
+
+        let mut payload = BytesMut::new();
+        let mut login = LoginMessage::new();
+        login.readonly(true);
+        login
+            .clone()
+            .encode(&mut payload)
+            .expect("encode should succeed");
+
+        assert_eq!(
+            payload[TYPE_FLAGS_OFFSET] & LoginTypeFlag::ReadOnlyIntent as u8,
+            LoginTypeFlag::ReadOnlyIntent as u8,
+            "fReadOnlyIntent bit must be set in the encoded LOGIN7 TypeFlags byte"
+        );
+
+        // Round-trips back into the decoded message.
+        let decoded = LoginMessage::decode(&mut payload).expect("decode should succeed");
+        assert!(decoded.type_flags.contains(LoginTypeFlag::ReadOnlyIntent));
+
+        // And when not requested, the bit stays clear.
+        let mut payload = BytesMut::new();
+        let mut login = LoginMessage::new();
+        login.readonly(false);
+        login.encode(&mut payload).expect("encode should succeed");
+        assert_eq!(
+            payload[TYPE_FLAGS_OFFSET] & LoginTypeFlag::ReadOnlyIntent as u8,
+            0,
+            "fReadOnlyIntent bit must be clear when read-only intent is not requested"
+        );
     }
 
     #[test]

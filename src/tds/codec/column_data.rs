@@ -275,6 +275,29 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 dst.extend_from_slice(&header);
                 dst.put_f64_le(val);
             }
+            (ColumnData::F64(opt), Some(TypeInfo::VarLenSized(vlc)))
+                if vlc.r#type() == VarLenType::Money =>
+            {
+                if let Some(val) = opt {
+                    money::encode(dst, vlc.len(), val)?;
+                } else {
+                    dst.put_u8(0);
+                }
+            }
+            // A NOT-NULL `money` column arrives as `FixedLen(Money)` (8-byte) and
+            // a NOT-NULL `smallmoney` as `FixedLen(Money4)` (4-byte). These are
+            // FIXEDLENTYPEs: the row value is the raw fixed-width scaled bytes
+            // with NO length prefix (unlike the `MONEYN`/`VarLenSized` path
+            // above), matching `fixed_len::decode` and the sibling `FixedLen`
+            // arms (e.g. `Float8`, `Datetime`). A `None` here would mean a null
+            // into a NOT-NULL column, so — like the other `FixedLen` arms — only
+            // `Some` matches and a null falls through to the `BulkInput` error.
+            (ColumnData::F64(Some(val)), Some(TypeInfo::FixedLen(FixedLenType::Money))) => {
+                money::encode_fixed(dst, 8, val)?;
+            }
+            (ColumnData::F64(Some(val)), Some(TypeInfo::FixedLen(FixedLenType::Money4))) => {
+                money::encode_fixed(dst, 4, val)?;
+            }
             (ColumnData::Guid(opt), Some(TypeInfo::VarLenSized(vlc)))
                 if vlc.r#type() == VarLenType::Guid =>
             {
@@ -422,6 +445,57 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst.put_u16_le(0xffff);
                 } else {
                     dst.put_u64_le(0xffffffffffffffff)
+                }
+            }
+            (ColumnData::String(opt), Some(TypeInfo::VarLenSized(vlc)))
+                if vlc.r#type() == VarLenType::Text || vlc.r#type() == VarLenType::NText =>
+            {
+                if let Some(str) = opt {
+                    // TEXT/NTEXT row values carry a text pointer and a timestamp
+                    // ahead of the payload. The server ignores the values we
+                    // supply on bulk-load, so send a fixed-size dummy pointer
+                    // and timestamp.
+                    dst.put_u8(16); // text pointer length
+                    dst.extend_from_slice(&[0u8; 16]); // text pointer
+                    dst.extend_from_slice(&[0u8; 8]); // timestamp
+
+                    if vlc.r#type() == VarLenType::Text {
+                        // single-byte character data, encoded with the column collation
+                        let mut encoder =
+                            vlc.collation().as_ref().unwrap().encoding()?.new_encoder();
+                        let len = encoder
+                            .max_buffer_length_from_utf8_without_replacement(str.len())
+                            .unwrap();
+                        let mut bytes = Vec::with_capacity(len);
+                        let (res, _) = encoder.encode_from_utf8_to_vec_without_replacement(
+                            str.as_ref(),
+                            &mut bytes,
+                            true,
+                        );
+                        if let encoding_rs::EncoderResult::Unmappable(_) = res {
+                            return Err(crate::Error::Encoding("unrepresentable character".into()));
+                        }
+
+                        dst.put_u32_le(bytes.len() as u32);
+                        dst.extend_from_slice(bytes.as_slice());
+                    } else {
+                        // NTEXT: UCS-2/UTF-16LE data
+                        let len_pos = dst.len();
+                        dst.put_u32_le(0u32);
+
+                        let mut length = 0u32;
+                        for chr in str.encode_utf16() {
+                            length += 2;
+                            dst.put_u16_le(chr);
+                        }
+
+                        let dst: &mut [u8] = dst.borrow_mut();
+                        let bytes = length.to_le_bytes();
+                        dst[len_pos..len_pos + 4].copy_from_slice(&bytes);
+                    }
+                } else {
+                    // NULL: zero-length text pointer
+                    dst.put_u8(0);
                 }
             }
             (ColumnData::String(Some(ref s)), None) if s.len() <= 4000 => {
@@ -662,6 +736,24 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 dst.put_u8(VarLenType::Xml as u8);
                 dst.put_u8(0);
                 xml.into_owned().encode(&mut *dst)?;
+            }
+            (ColumnData::Numeric(opt), Some(TypeInfo::VarLenSized(vlc)))
+                if vlc.r#type() == VarLenType::Money =>
+            {
+                if let Some(num) = opt {
+                    money::encode_numeric(dst, vlc.len(), &num)?;
+                } else {
+                    dst.put_u8(0);
+                }
+            }
+            // NOT-NULL `money`/`smallmoney` supplied as a `Numeric`: encoded as
+            // the raw fixed-width bytes (no length prefix), same framing rationale
+            // as the `F64` `FixedLen` money arms above.
+            (ColumnData::Numeric(Some(num)), Some(TypeInfo::FixedLen(FixedLenType::Money))) => {
+                money::encode_numeric_fixed(dst, 8, &num)?;
+            }
+            (ColumnData::Numeric(Some(num)), Some(TypeInfo::FixedLen(FixedLenType::Money4))) => {
+                money::encode_numeric_fixed(dst, 4, &num)?;
             }
             (ColumnData::Numeric(opt), Some(TypeInfo::VarLenSizedPrecision { ty, scale, .. }))
                 if ty == &VarLenType::Numericn || ty == &VarLenType::Decimaln =>
@@ -1407,5 +1499,23 @@ mod tests {
                 panic!("Expected: Error::BulkInput, got: {:?}", err);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn f64_with_fixedlen_money() {
+        test_round_trip(
+            TypeInfo::FixedLen(FixedLenType::Money),
+            ColumnData::F64(Some(3.5)),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn f64_with_fixedlen_smallmoney() {
+        test_round_trip(
+            TypeInfo::FixedLen(FixedLenType::Money4),
+            ColumnData::F64(Some(3.5)),
+        )
+        .await;
     }
 }

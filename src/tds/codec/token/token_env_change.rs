@@ -63,8 +63,14 @@ impl fmt::Display for EnvChangeTy {
 
 #[derive(Debug)]
 pub enum TokenEnvChange {
-    Database(String, String),
-    PacketSize(u32, u32),
+    Database {
+        old: String,
+        new: String,
+    },
+    PacketSize {
+        old: u32,
+        new: u32,
+    },
     SqlCollation {
         old: Option<Collation>,
         new: Option<Collation>,
@@ -84,10 +90,10 @@ pub enum TokenEnvChange {
 impl fmt::Display for TokenEnvChange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Database(ref old, ref new) => {
+            Self::Database { old, new } => {
                 write!(f, "Database change from '{}' to '{}'", old, new)
             }
-            Self::PacketSize(old, new) => {
+            Self::PacketSize { old, new } => {
                 write!(f, "Packet size change from '{}' to '{}'", old, new)
             }
             Self::SqlCollation { old, new } => match (old, new) {
@@ -149,7 +155,10 @@ impl TokenEnvChange {
 
                 let old_value = String::from_utf16(&bytes[..])?;
 
-                TokenEnvChange::Database(new_value, old_value)
+                TokenEnvChange::Database {
+                    new: new_value,
+                    old: old_value,
+                }
             }
             EnvChangeTy::PacketSize => {
                 let len = buf.read_u8()? as usize;
@@ -170,7 +179,10 @@ impl TokenEnvChange {
 
                 let old_value = String::from_utf16(&bytes[..])?;
 
-                TokenEnvChange::PacketSize(new_value.parse()?, old_value.parse()?)
+                TokenEnvChange::PacketSize {
+                    new: new_value.parse()?,
+                    old: old_value.parse()?,
+                }
             }
             EnvChangeTy::SqlCollation => {
                 let len = buf.read_u8()? as usize;
@@ -258,5 +270,36 @@ impl TokenEnvChange {
         };
 
         Ok(token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenEnvChange;
+
+    #[test]
+    fn database_display_uses_old_then_new() {
+        // Fields are stored (new, old); Display must print "from old to new".
+        let change = TokenEnvChange::Database {
+            new: "newdb".to_string(),
+            old: "olddb".to_string(),
+        };
+        assert_eq!(
+            format!("{}", change),
+            "Database change from 'olddb' to 'newdb'"
+        );
+    }
+
+    #[test]
+    fn packet_size_display_uses_old_then_new() {
+        // Fields are stored (new, old); Display must print "from old to new".
+        let change = TokenEnvChange::PacketSize {
+            new: 8192,
+            old: 4096,
+        };
+        assert_eq!(
+            format!("{}", change),
+            "Packet size change from '4096' to '8192'"
+        );
     }
 }

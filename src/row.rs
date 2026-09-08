@@ -260,14 +260,22 @@ where
 }
 
 impl QueryIdx for usize {
-    fn idx(&self, _row: &Row) -> Option<usize> {
-        Some(*self)
+    fn idx(&self, row: &Row) -> Option<usize> {
+        (*self < row.columns.len()).then_some(*self)
     }
 }
 
 impl QueryIdx for &str {
     fn idx(&self, row: &Row) -> Option<usize> {
-        row.columns.iter().position(|c| c.name() == *self)
+        // Prefer an exact column-name match so a column literally named `r#...`
+        // (or `type`) resolves to itself.
+        if let Some(p) = row.columns.iter().position(|c| c.name() == *self) {
+            return Some(p);
+        }
+        // Fallback: allow a Rust raw identifier (`r#type`) to match the plain SQL
+        // name (`type`) when no exact column exists.
+        self.strip_prefix("r#")
+            .and_then(|n| row.columns.iter().position(|c| c.name() == n))
     }
 }
 
@@ -421,5 +429,99 @@ impl IntoIterator for Row {
 
     fn into_iter(self) -> Self::IntoIter {
         self.data.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_row() -> Row {
+        let columns = Arc::new(vec![
+            Column::new("foo".to_string(), ColumnType::Int4),
+            Column::new("type".to_string(), ColumnType::Int4),
+        ]);
+
+        let mut data = TokenRow::new();
+        data.push(ColumnData::I32(Some(1)));
+        data.push(ColumnData::I32(Some(2)));
+
+        Row {
+            columns,
+            data,
+            result_index: 0,
+        }
+    }
+
+    // Regression test for #211: an out-of-range usize index must not panic.
+    #[test]
+    fn try_get_out_of_range_index_returns_none() {
+        let row = make_row();
+
+        assert_eq!(None, 2usize.idx(&row));
+        assert_eq!(Some(0), 0usize.idx(&row));
+
+        let value: crate::Result<Option<i32>> = row.try_get(5usize);
+        assert!(value.is_err());
+    }
+
+    // Regression test for #382: a raw-identifier column name (`r#type`) must
+    // match the plain SQL column name (`type`).
+    #[test]
+    fn raw_identifier_column_name_matches() {
+        let row = make_row();
+
+        assert_eq!(Some(1), "type".idx(&row));
+        assert_eq!(Some(1), "r#type".idx(&row));
+        assert_eq!(Some(0), "r#foo".idx(&row));
+        assert_eq!(None, "r#missing".idx(&row));
+
+        assert_eq!(Some(2i32), row.get::<i32, _>("r#type"));
+    }
+
+    // A column literally named `r#type` alongside a `type` column must each
+    // resolve to themselves: the exact match wins before the r# fallback.
+    #[test]
+    fn literal_raw_prefixed_column_wins_over_fallback() {
+        let columns = Arc::new(vec![
+            Column::new("type".to_string(), ColumnType::Int4),
+            Column::new("r#type".to_string(), ColumnType::Int4),
+        ]);
+
+        let mut data = TokenRow::new();
+        data.push(ColumnData::I32(Some(1)));
+        data.push(ColumnData::I32(Some(2)));
+
+        let row = Row {
+            columns,
+            data,
+            result_index: 0,
+        };
+
+        // Exact match: `type` -> the "type" column (index 0).
+        assert_eq!(Some(0), "type".idx(&row));
+        // Exact match: `r#type` -> the literal "r#type" column (index 1),
+        // NOT the "type" column via the strip fallback.
+        assert_eq!(Some(1), "r#type".idx(&row));
+    }
+
+    // A column literally named `r#foo` (with no plain `foo` column) resolves to
+    // itself via the exact match; the fallback is never needed.
+    #[test]
+    fn literal_raw_prefixed_column_exact_match() {
+        let columns = Arc::new(vec![Column::new("r#foo".to_string(), ColumnType::Int4)]);
+
+        let mut data = TokenRow::new();
+        data.push(ColumnData::I32(Some(1)));
+
+        let row = Row {
+            columns,
+            data,
+            result_index: 0,
+        };
+
+        assert_eq!(Some(0), "r#foo".idx(&row));
+        // No plain "foo" column exists, so the fallback finds nothing.
+        assert_eq!(None, "foo".idx(&row));
     }
 }

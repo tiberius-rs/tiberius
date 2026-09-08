@@ -156,11 +156,11 @@
 //! Tiberius supports different [ways of authentication] to the SQL Server:
 //!
 //! - SQL Server authentication uses the facilities of the database to
-//! authenticate the user.
+//!   authenticate the user.
 //! - On Windows, you can authenticate using the currently logged in user or
-//! specified Windows credentials.
+//!   specified Windows credentials.
 //! - If enabling the `integrated-auth-gssapi` feature, it is possible to login
-//! with the currently active Kerberos credentials.
+//!   with the currently active Kerberos credentials.
 //!
 //! ## AAD(Azure Active Directory) Authentication
 //!

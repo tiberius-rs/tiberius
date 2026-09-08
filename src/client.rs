@@ -324,13 +324,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .await?;
 
         // now start bulk upload
-        let columns: Vec<_> = columns
+        let mut columns: Vec<_> = columns
             .ok_or_else(|| {
                 crate::Error::Protocol("expecting column metadata from query but not found".into())
             })?
             .into_iter()
             .filter(|column| column.base.flags.contains(ColumnFlag::Updateable))
             .collect();
+
+        // `text`/`ntext`/`image` columns must carry the destination TableName in
+        // the COLMETADATA we emit for the bulk load (MS-TDS §2.2.7.4). Record the
+        // target table on every column; the encoder only emits it for those
+        // types, so this is a no-op on the wire for all other columns.
+        for column in columns.iter_mut() {
+            column.base.table_name = Some(table.to_string());
+        }
 
         self.connection.flush_stream().await?;
         let col_data = columns.iter().map(|c| format!("{}", c)).join(", ");

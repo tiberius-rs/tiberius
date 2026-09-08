@@ -177,7 +177,7 @@ impl RowBitmap {
     where
         R: SqlReadBytes + Unpin,
     {
-        let size = (columns + 8 - 1) / 8;
+        let size = columns.div_ceil(8);
         let mut data = vec![0; size];
         src.read_exact(&mut data[0..size]).await?;
 
@@ -198,6 +198,7 @@ mod tests {
             base: BaseMetaDataColumn {
                 flags: ColumnFlag::Nullable.into(),
                 ty: TypeInfo::FixedLen(FixedLenType::Bit),
+                table_name: None,
             },
             col_name: Default::default(),
         }];
@@ -206,5 +207,54 @@ mod tests {
 
         row.encode(&mut buf_with_columns)
             .expect_err("wrong number of columns");
+    }
+
+    // A row whose encoding fails partway (here: an out-of-range money value in
+    // the second column, after the Row token byte and first column are already
+    // written) must be rolled back by the caller so the bulk stream stays in
+    // sync. This mirrors `BulkLoadRequest::send`'s snapshot-and-truncate logic.
+    #[tokio::test]
+    async fn partial_row_can_be_rolled_back_on_encode_error() {
+        use crate::tds::codec::type_info::VarLenContext;
+        use crate::{ColumnData, VarLenType};
+
+        let columns = vec![
+            MetaDataColumn {
+                base: BaseMetaDataColumn {
+                    flags: ColumnFlag::Nullable.into(),
+                    ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                    table_name: None,
+                },
+                col_name: Default::default(),
+            },
+            MetaDataColumn {
+                base: BaseMetaDataColumn {
+                    flags: ColumnFlag::Nullable.into(),
+                    ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 8, None)),
+                    table_name: None,
+                },
+                col_name: Default::default(),
+            },
+        ];
+
+        // Pretend some earlier, fully-encoded rows already sit in the buffer.
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let snapshot = buf.to_vec();
+        let start = buf.len();
+
+        let mut row = TokenRow::new();
+        row.push(ColumnData::I32(Some(1)));
+        row.push(ColumnData::F64(Some(1e18))); // out of range for money
+
+        let mut buf_with_columns = BytesMutWithDataColumns::new(&mut buf, &columns);
+        let err = row.encode(&mut buf_with_columns).unwrap_err();
+        assert!(matches!(err, crate::Error::BulkInput(_)), "got {err:?}");
+
+        // Partial bytes (Row token + first column) were written...
+        assert!(buf.len() > start, "expected a partial row to be present");
+        // ...and truncating back to the snapshot restores the buffer exactly.
+        buf.truncate(start);
+        assert_eq!(buf.to_vec(), snapshot);
     }
 }

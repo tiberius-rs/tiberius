@@ -148,6 +148,183 @@ test_bulk_type!(varchar_limited(
     vec!["aaaaaaaaaaaaaaaaaaaaaaa"; 1000].into_iter()
 ));
 
+// Column types added by 97bbbfd (bulk support for #352/#358) that previously
+// had no bulk coverage. `text`/`ntext` exercise the COLMETADATA TableName path
+// (MS-TDS §2.2.7.4): without emitting TableName for these types the server
+// rejects the bulk COLMETADATA, so these tests only pass with that fix in place.
+test_bulk_type!(text(
+    "TEXT",
+    1000,
+    vec!["some text value"; 1000].into_iter()
+));
+test_bulk_type!(ntext(
+    "NTEXT",
+    1000,
+    vec!["some ntext välue"; 1000].into_iter()
+));
+
+// `money`/`smallmoney` exercise the f64 money encoder.
+test_bulk_type!(money("MONEY", 1000, vec![1234.5678f64; 1000].into_iter()));
+test_bulk_type!(smallmoney(
+    "SMALLMONEY",
+    1000,
+    vec![12.3456f64; 1000].into_iter()
+));
+
+// `numeric(p,s)` exercises the exact Numeric->wire path.
+test_bulk_type!(numeric_28_4(
+    "NUMERIC(28,4)",
+    1000,
+    vec![tiberius::numeric::Numeric::new_with_scale(12345, 4); 1000].into_iter()
+));
+
+// The `test_bulk_type!` cases above only assert the inserted row count. The
+// following tests bulk-insert a known value and read it back, asserting the
+// exact value survived the round-trip through our bulk encoders. (Requires a
+// live SQL Server; compiles locally but only runs in CI.)
+
+#[test_on_runtimes]
+async fn bulk_money_value_roundtrips<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+
+    conn.execute(
+        &format!("CREATE TABLE {} (content MONEY NOT NULL)", table),
+        &[],
+    )
+    .await?;
+
+    let mut req = conn.bulk_insert(&table).await?;
+    let mut row = TokenRow::new();
+    row.push(1234.5678f64.into_sql());
+    req.send(row).await?;
+    let res = req.finalize().await?;
+    assert_eq!(1, res.total());
+
+    let value: f64 = conn
+        .query(&format!("SELECT content FROM {}", table), &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap()
+        .get(0)
+        .unwrap();
+
+    assert!((value - 1234.5678).abs() < 1e-6, "got {value}");
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn bulk_numeric_value_roundtrips<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    use tiberius::numeric::Numeric;
+
+    let table = format!("##{}", random_table().await);
+
+    conn.execute(
+        &format!("CREATE TABLE {} (content NUMERIC(28,4) NOT NULL)", table),
+        &[],
+    )
+    .await?;
+
+    // A magnitude whose scaled form exceeds 2^53, so an f64 detour would lose
+    // precision but the exact integer path must not.
+    let num = Numeric::new_with_scale(123_456_789_012_345_678, 4);
+
+    let mut req = conn.bulk_insert(&table).await?;
+    let mut row = TokenRow::new();
+    row.push(num.into_sql());
+    req.send(row).await?;
+    let res = req.finalize().await?;
+    assert_eq!(1, res.total());
+
+    let value: Numeric = conn
+        .query(&format!("SELECT content FROM {}", table), &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap()
+        .get(0)
+        .unwrap();
+
+    assert_eq!(value, num);
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn bulk_text_value_roundtrips<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+
+    conn.execute(
+        &format!("CREATE TABLE {} (content TEXT NOT NULL)", table),
+        &[],
+    )
+    .await?;
+
+    let expected = "hello bulk text";
+    let mut req = conn.bulk_insert(&table).await?;
+    let mut row = TokenRow::new();
+    row.push(expected.into_sql());
+    req.send(row).await?;
+    let res = req.finalize().await?;
+    assert_eq!(1, res.total());
+
+    let row = conn
+        .query(&format!("SELECT content FROM {}", table), &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    let value: &str = row.get(0).unwrap();
+
+    assert_eq!(value, expected);
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn bulk_ntext_value_roundtrips<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+
+    conn.execute(
+        &format!("CREATE TABLE {} (content NTEXT NOT NULL)", table),
+        &[],
+    )
+    .await?;
+
+    let expected = "héllo bulk ñtext";
+    let mut req = conn.bulk_insert(&table).await?;
+    let mut row = TokenRow::new();
+    row.push(expected.into_sql());
+    req.send(row).await?;
+    let res = req.finalize().await?;
+    assert_eq!(1, res.total());
+
+    let row = conn
+        .query(&format!("SELECT content FROM {}", table), &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    let value: &str = row.get(0).unwrap();
+
+    assert_eq!(value, expected);
+
+    Ok(())
+}
+
 #[cfg(all(feature = "tds73", feature = "chrono"))]
 test_bulk_type!(datetime2(
     "DATETIME2",

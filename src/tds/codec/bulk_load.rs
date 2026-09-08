@@ -59,9 +59,19 @@ where
     ///
     /// [`finalize`]: #method.finalize
     pub async fn send(&mut self, row: TokenRow<'a>) -> crate::Result<()> {
-        let mut buf_with_columns = BytesMutWithDataColumns::new(&mut self.buf, &self.columns);
+        // `row.encode` can now fail mid-row (e.g. an out-of-range money value).
+        // A failure would leave the Row-token byte plus any already-encoded
+        // columns in `self.buf`; those partial bytes would be flushed on the next
+        // successful `send`/`finalize` and desync the bulk stream. Snapshot the
+        // buffer length and roll back on error so the stream stays in sync.
+        let start = self.buf.len();
 
-        row.encode(&mut buf_with_columns)?;
+        let mut buf_with_columns = BytesMutWithDataColumns::new(&mut self.buf, &self.columns);
+        if let Err(e) = row.encode(&mut buf_with_columns) {
+            self.buf.truncate(start);
+            return Err(e);
+        }
+
         self.write_packets().await?;
 
         Ok(())

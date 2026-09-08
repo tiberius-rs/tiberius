@@ -27,6 +27,8 @@ pub mod chrono;
 
 #[cfg(feature = "time")]
 #[cfg_attr(feature = "docs", doc(cfg(feature = "time")))]
+// Submodule intentionally shares the name of the `time` feature/crate it wraps.
+#[allow(clippy::module_inception)]
 pub mod time;
 
 use crate::{tds::codec::Encode, SqlReadBytes};

@@ -1,0 +1,29 @@
+name: Security audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Re-run weekly so newly-published advisories are caught even without a push.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      # Run cargo-deny on the runner directly (the musl container action conflicts with the repo's rust-toolchain file).
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - name: Check advisories, bans, sources
+        run: cargo deny check advisories bans sources

@@ -52,7 +52,7 @@ pub(crate) async fn create_tls_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
             builder = builder.use_sni(false);
         }
         TrustConfig::Default => {
-            event!(Level::INFO, "Using default trust configuration.");
+            event!(Level::DEBUG, "Using default trust configuration.");
         }
     }
 
