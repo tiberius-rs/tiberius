@@ -64,7 +64,13 @@ impl TokenAltMetaData<'static> {
             by_columns.push(src.read_u16_le().await?);
         }
 
-        let mut columns = Vec::with_capacity(column_count as usize);
+        // `column_count` is an untrusted u16 (up to 65535); cap the up-front
+        // reservation so a hostile ALTMETADATA token can't force a large
+        // transient allocation before the column data has arrived. The Vec
+        // still grows as real columns are decoded.
+        let mut columns = Vec::with_capacity(
+            (column_count as usize).min(crate::tds::codec::column_data::MAX_PREALLOC),
+        );
         for _ in 0..column_count {
             let op = src.read_u8().await?;
             let operand = src.read_u16_le().await?;

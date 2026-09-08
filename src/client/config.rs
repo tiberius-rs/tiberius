@@ -880,9 +880,17 @@ pub(crate) trait ConfigString {
                 Err(_) if val.eq_ignore_ascii_case("strict") && cfg!(feature = "tds80") => {
                     Ok(EncryptionLevel::Strict)
                 }
+                Err(_) if val.eq_ignore_ascii_case("strict") => Err(crate::Error::Conversion(
+                    "encrypt=strict requires the crate's `tds80` feature to be enabled".into(),
+                )),
                 Err(e) => Err(e),
             })
-            .unwrap_or(Ok(EncryptionLevel::Off))
+            // When the `encrypt` keyword is omitted, default to requiring
+            // encryption — matching `Config::default()` and modern ADO.NET
+            // (`Encrypt=Mandatory`). Callers who want an unencrypted connection
+            // must opt out explicitly with `encrypt=false` (or
+            // `encrypt=DANGER_PLAINTEXT`).
+            .unwrap_or(Ok(EncryptionLevel::Required))
     }
 
     #[cfg(not(any(
@@ -952,6 +960,46 @@ mod tests {
 
         assert_eq!("localhost:1433", config.get_addr());
         assert_eq!(Some("master"), config.database.as_deref());
+    }
+
+    #[test]
+    fn config_from_builder_carries_builder_settings() {
+        // `From<ConfigBuilder>` must return the built inner config, not a default.
+        let config: Config = Config::builder().host("db.internal").port(2020).into();
+        assert_eq!("db.internal", config.get_host());
+        assert_eq!(2020, config.get_port());
+    }
+
+    #[test]
+    fn get_packet_size_reflects_the_set_value() {
+        let mut config = Config::new();
+        assert_eq!(config.get_packet_size(), None);
+        config.packet_size(8192);
+        assert_eq!(config.get_packet_size(), Some(8192));
+    }
+
+    #[test]
+    fn from_jdbc_string_parses_host_and_port() {
+        let config =
+            Config::from_jdbc_string("jdbc:sqlserver://db.example.com:2345").expect("valid jdbc");
+        assert_eq!("db.example.com", config.get_host());
+        assert_eq!(2345, config.get_port());
+    }
+
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    #[test]
+    fn get_hostname_in_certificate_falls_back_to_host() {
+        let mut config = Config::new();
+        config.host("real.host");
+        // Unset: falls back to the connection host.
+        assert_eq!(config.get_hostname_in_certificate(), "real.host");
+        // Set: returns the explicit certificate hostname.
+        config.hostname_in_certificate("cert.host");
+        assert_eq!(config.get_hostname_in_certificate(), "cert.host");
     }
 
     #[cfg(any(
@@ -1053,57 +1101,158 @@ mod tests {
     }
 
     #[test]
-    fn ado_conflicting_trust_cert_settings_return_err_not_panic() {
-        let result = Config::from_ado_string(
-            "server=tcp:localhost,1433;TrustServerCertificate=true;\
-             TrustServerCertificateCA=/tmp/ca.pem",
-        );
+    fn config_direct_setters_populate_fields() {
+        let mut config = Config::new();
+        config.database("northwind");
+        config.instance_name("SQLEXPRESS");
+        config.client_name("workstation-7");
 
-        match result {
-            Err(crate::Error::Conversion(msg)) => {
-                assert!(
-                    msg.contains("mutually exclusive"),
-                    "unexpected message: {msg}"
-                );
-            }
-            other => panic!("expected Conversion error, got {other:?}"),
-        }
+        assert_eq!(Some("northwind"), config.database.as_deref());
+        assert_eq!(Some("SQLEXPRESS"), config.instance_name.as_deref());
+        assert_eq!(Some("workstation-7"), config.client_name.as_deref());
     }
 
     #[test]
-    fn jdbc_conflicting_trust_cert_settings_return_err_not_panic() {
-        let result = Config::from_jdbc_string(
-            "jdbc:sqlserver://localhost:1433;trustServerCertificate=true;\
-             trustServerCertificateCA=/tmp/ca.pem",
-        );
-
-        assert!(
-            matches!(result, Err(crate::Error::Conversion(_))),
-            "expected Conversion error, got {result:?}"
-        );
+    fn get_port_defaults_without_port_or_instance() {
+        // No explicit port and no instance -> default SQL Server port.
+        let config = Config::new();
+        assert_eq!(1433, config.get_port());
     }
 
     #[test]
-    fn ado_trust_cert_alone_trusts_all() {
-        let config =
-            Config::from_ado_string("server=tcp:localhost,1433;TrustServerCertificate=true")
-                .unwrap();
+    fn get_port_uses_sql_browser_port_for_named_instance() {
+        // A named instance without an explicit port -> SQL Browser port.
+        let mut config = Config::new();
+        config.instance_name("SQLEXPRESS");
+        assert_eq!(1434, config.get_port());
+    }
 
+    #[test]
+    #[should_panic(expected = "mutual exclusive")]
+    fn trust_cert_after_trust_cert_ca_panics() {
+        let mut config = Config::new();
+        config.trust_cert_ca("/tmp/ca.crt");
+        config.trust_cert();
+    }
+
+    #[test]
+    #[should_panic(expected = "mutual exclusive")]
+    fn trust_cert_ca_after_trust_cert_panics() {
+        let mut config = Config::new();
+        config.trust_cert();
+        config.trust_cert_ca("/tmp/ca.crt");
+    }
+
+    #[test]
+    fn trust_cert_ca_sets_ca_location() {
+        let mut config = Config::new();
+        config.trust_cert_ca("/tmp/ca.crt");
+        assert!(matches!(
+            config.trust,
+            TrustConfig::CaCertificateLocation(_)
+        ));
+    }
+
+    #[test]
+    fn config_builder_covers_all_setters() {
+        let config = Config::builder()
+            .host("localhost")
+            .instance_name("SQLEXPRESS")
+            .encryption(EncryptionLevel::Off)
+            .trust_cert_ca("/tmp/ca.crt")
+            .build();
+
+        assert_eq!(Some("SQLEXPRESS"), config.instance_name.as_deref());
+        assert!(matches!(config.encryption, EncryptionLevel::Off));
+        assert!(matches!(
+            config.trust,
+            TrustConfig::CaCertificateLocation(_)
+        ));
+    }
+
+    #[test]
+    fn config_builder_trust_cert_sets_trust_all() {
+        let config = Config::builder().trust_cert().build();
         assert!(matches!(config.trust, TrustConfig::TrustAll));
     }
 
     #[test]
-    fn ado_trust_cert_ca_alone_sets_ca_location() {
+    #[should_panic(expected = "mutual exclusive")]
+    fn config_builder_trust_cert_after_ca_panics() {
+        Config::builder().trust_cert_ca("/tmp/ca.crt").trust_cert();
+    }
+
+    #[test]
+    #[should_panic(expected = "mutual exclusive")]
+    fn config_builder_trust_cert_ca_after_trust_cert_panics() {
+        Config::builder().trust_cert().trust_cert_ca("/tmp/ca.crt");
+    }
+
+    #[test]
+    fn from_ado_string_populates_optional_fields() {
         let config = Config::from_ado_string(
-            "server=tcp:localhost,1433;TrustServerCertificateCA=/tmp/ca.pem",
+            "server=tcp:my-server.com\\SQLEXPRESS;database=northwind;\
+             HostNameInCertificate=cert.host;WorkstationID=ws-1",
+        )
+        .expect("valid ado string");
+
+        assert_eq!("my-server.com", config.get_host());
+        assert_eq!(Some("SQLEXPRESS"), config.instance_name.as_deref());
+        assert_eq!(Some("northwind"), config.database.as_deref());
+        assert_eq!(Some("cert.host"), config.hostname_in_certificate.as_deref());
+        assert_eq!(Some("ws-1"), config.client_name.as_deref());
+    }
+
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    #[test]
+    fn client_cert_source_debug_formats_cert_and_key() {
+        let mut config = Config::new();
+        config.client_certificate("/tmp/client.pem", "/tmp/client.key");
+
+        let dbg = format!("{:?}", config.get_client_certificate().unwrap().source);
+        assert!(dbg.contains("CertAndKey"));
+        assert!(dbg.contains("client.pem"));
+        assert!(dbg.contains("client.key"));
+    }
+
+    #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
+    #[test]
+    fn config_builder_sets_pkcs12_client_certificate() {
+        let config = Config::builder()
+            .client_certificate_pkcs12("/tmp/identity.pfx", "s3cr3t")
+            .build();
+
+        match &config
+            .get_client_certificate()
+            .expect("client certificate should be set")
+            .source
+        {
+            ClientCertSource::Pkcs12 { path, password } => {
+                assert_eq!(path, &PathBuf::from("/tmp/identity.pfx"));
+                assert_eq!(password.as_str(), "s3cr3t");
+            }
+            other => panic!("expected Pkcs12 source, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(unix, feature = "sspi-rs"))]
+    #[test]
+    fn ado_integrated_security_sspi_with_partial_credentials_uses_windows() {
+        // Only a username (no password) -> falls into the catch-all NTLM arm.
+        let config = Config::from_ado_string(
+            "server=tcp:localhost,1433;IntegratedSecurity=SSPI;uid=onlyuser",
         )
         .unwrap();
 
-        match &config.trust {
-            TrustConfig::CaCertificateLocation(path) => {
-                assert_eq!(path, &PathBuf::from("/tmp/ca.pem"));
+        match config.auth {
+            AuthMethod::Windows(auth) => {
+                assert_eq!("onlyuser", auth.user);
             }
-            other => panic!("expected CaCertificateLocation, got {other:?}"),
+            other => panic!("expected Windows auth, got {other:?}"),
         }
     }
 }
