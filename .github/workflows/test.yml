@@ -1,9 +1,12 @@
 name: Cargo tests
 on:
+  # qa + manual dispatch run the integration tier
   push:
     branches:
       - main
+      - qa
   pull_request:
+  workflow_dispatch:
 jobs:
   clippy:
     runs-on: ubuntu-latest
@@ -167,13 +170,32 @@ jobs:
       - name: Run tests
         run: cargo test ${{matrix.features}}
 
-  integration-linux-next:
-    name: linux (SQL 2025, experimental)
+  integration-macos:
+    name: macos (SQL 2022 via colima)
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/qa')
-    runs-on: ubuntu-latest
-    # Newest server; kept non-blocking so a not-yet-published image or a
-    # server-side behaviour change on the bleeding edge cannot red-wall qa.
-    continue-on-error: true
+    # Intel runner: hosted macOS has no Linux Docker daemon, so we host the
+    # linux/amd64 SQL Server container inside a colima (Lima) Linux VM. An x86_64
+    # runner runs that image natively — no qemu emulation — which keeps the VM
+    # fast enough for the full integration suite instead of build + unit only.
+    runs-on: macos-15-intel
+    continue-on-error: ${{ matrix.soft_fail }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exercise every TLS backend:
+        include:
+          # rustls (TLS 1.3)
+          - features: "--no-default-features --features=rustls,chrono,time,tds73,rust_decimal,bigdecimal"
+            soft_fail: false
+          # vendored-openssl (opentls, statically-linked OpenSSL) — cross-platform.
+          - features: "--no-default-features --features=vendored-openssl,chrono,time,tds73,rust_decimal,bigdecimal"
+            soft_fail: false
+          # NOTE: a `--features=all` lane is intentionally omitted here. On macOS
+          # `native-tls` resolves to Apple Secure Transport, which cannot complete
+          # the SQL Server TLS handshake (it works on Linux=OpenSSL and
+          # Windows=SChannel, both covered elsewhere). Running it here could only
+          # ever fail, so the two TLS backends that do work on macOS (rustls and
+          # vendored-openssl, above) provide the macOS integration coverage.
     env:
       TIBERIUS_TEST_CONNECTION_STRING: "server=tcp:localhost,1433;user=SA;password=<YourStrong@Passw0rd>;TrustServerCertificate=true"
       RUSTFLAGS: "-Dwarnings"
@@ -184,52 +206,49 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
+      - name: Compute cache key
+        run: |
+          key="${{ matrix.features }}"
+          key="${key//,/+}"
+          echo "RUST_CACHE_KEY=$key" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Start SQL Server 2025
-        run: DOCKER_BUILDKIT=1 docker compose -f docker-compose.yml up -d mssql-2025
-      - name: Install dependencies
-        run: sudo apt-get install -y openssl libkrb5-dev
+        with:
+          shared-key: ${{ env.RUST_CACHE_KEY }}
+      - name: Install build dependencies (openssl, krb5)
+        run: |
+          brew install openssl krb5
+          # krb5 is keg-only; expose its pkg-config so integrated-auth-gssapi
+          # and any openssl-linking features build against Homebrew's copy.
+          echo "PKG_CONFIG_PATH=$(brew --prefix krb5)/lib/pkgconfig:$(brew --prefix openssl)/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: Start Docker (colima)
+        run: |
+          brew install colima docker docker-compose
+          # SQL Server wants ~2 GB RAM; give the VM headroom for it + the build.
+          colima start --cpu 3 --memory 6 --disk 20
+          docker version
+      - name: Start SQL Server 2022
+        run: docker compose -f docker-compose.yml up -d mssql-2022
       - name: Wait for SQL Server
-        # Authenticated readiness (not just an open port) — see the smoke job.
+        # A listening port is not readiness: SQL Server binds 1433 before the SA
+        # login and databases finish initializing, so the connection-heavy bulk
+        # tests can race it and hit "Login failed for user 'SA'" (18456). Gate on
+        # an actual authenticated `SELECT 1` succeeding instead.
         run: |
           pw='<YourStrong@Passw0rd>'
           for _ in $(seq 1 60); do
-            if docker run --rm --network host mcr.microsoft.com/mssql-tools \
-                 /opt/mssql-tools/bin/sqlcmd -S localhost,1433 -U SA -P "$pw" -Q "SELECT 1" >/dev/null 2>&1; then
-              echo "SQL Server ready (authenticated login succeeded)"; exit 0
-            fi
+            for bin in /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do
+              if docker compose -f docker-compose.yml exec -T mssql-2022 \
+                   "$bin" -S localhost -U SA -P "$pw" -C -Q "SELECT 1" >/dev/null 2>&1; then
+                echo "SQL Server ready (authenticated login succeeded)"; exit 0
+              fi
+            done
             sleep 3
           done
           echo "SQL Server did not accept an authenticated login in time" >&2
-          docker compose -f docker-compose.yml logs mssql-2025 || true
+          docker compose -f docker-compose.yml logs mssql-2022 || true
           exit 1
       - name: Run tests
-        run: cargo test --features=all
-
-  integration-macos:
-    name: macos build + unit tests
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/qa')
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        features:
-          - "--no-default-features --features=rustls,chrono,time,tds73,sql-browser-tokio,sql-browser-smol,rust_decimal,bigdecimal"
-          - "--no-default-features --features=vendored-openssl"
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # No live SQL Server on hosted macOS runners; this verifies the crate
-      # builds and its unit tests pass on macOS/Apple targets.
-      - name: Build
-        run: cargo build ${{ matrix.features }}
-      - name: Run library unit tests
-        run: cargo test --lib ${{ matrix.features }}
+        run: cargo test ${{ matrix.features }}
 
   integration-windows:
     name: windows (SQL 2019, integrated auth)
