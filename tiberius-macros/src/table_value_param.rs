@@ -1,0 +1,188 @@
+use proc_macro2::TokenStream;
+use syn::punctuated::Punctuated;
+
+use crate::attr::FieldAttr;
+
+pub(crate) fn for_struct(ast: &syn::DeriveInput, fields: &syn::Fields) -> syn::Result<TokenStream> {
+    match *fields {
+        syn::Fields::Named(ref fields) => table_value_param_impl(ast, Some(&fields.named)),
+        _ => Err(syn::Error::new_spanned(
+            &ast.ident,
+            "TableValueRow can only be derived for structs with named fields \
+             (tuple and unit structs are not supported)",
+        )),
+    }
+}
+
+fn table_value_param_impl(
+    ast: &syn::DeriveInput,
+    fields: Option<&Punctuated<syn::Field, Token![,]>>,
+) -> syn::Result<TokenStream> {
+    let name = &ast.ident;
+    let (lt_impl, lt_struct) = {
+        let mut lifetimes: Vec<&syn::Ident> = Vec::new();
+        for gp in ast.generics.params.iter() {
+            if let syn::GenericParam::Lifetime(ltp) = gp {
+                lifetimes.push(&ltp.lifetime.ident);
+            }
+        }
+        if lifetimes.len() > 1 {
+            return Err(syn::Error::new_spanned(
+                &ast.generics,
+                format!(
+                    "TableValueRow supports at most one lifetime parameter, found: {}",
+                    lifetimes
+                        .iter()
+                        .map(|lt| lt.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        if lifetimes.is_empty() {
+            (sp_quote!(<'query>), sp_quote!())
+        } else {
+            let lt = lifetimes[0];
+            let ts: proc_macro2::TokenStream = format!("< '{} >", lt).parse().unwrap();
+            (ts.clone(), ts)
+        }
+    };
+    let empty = Default::default();
+    let fields: Vec<_> = fields
+        .unwrap_or(&empty)
+        .iter()
+        .map(FieldExt::new)
+        .collect::<syn::Result<_>>()?;
+    let col_names: Vec<_> = fields.iter().map(|f| f.get_col_name()).collect();
+    // Column names are not needed for stored procedures, but will be required
+    // once TVPs are supported for ad-hoc queries.
+    let _col_names = sp_quote!( #(#col_names),* );
+    let col_binds: Vec<_> = fields.iter().map(|f| f.as_bind()).collect();
+    let col_binds = sp_quote!( #(#col_binds);*);
+    Ok(sp_quote! {
+        impl #lt_impl tiberius::TableValueRow #lt_impl for #name #lt_struct {
+            fn get_db_type() -> &'static str {
+                stringify!{ #name }
+            }
+
+            fn bind_fields(&self, data_row: &mut tiberius::SqlTableDataRow #lt_impl) {
+                #col_binds;
+            }
+        }
+    })
+}
+
+struct FieldExt {
+    attr: Option<FieldAttr>,
+    ident: syn::Ident,
+}
+
+impl FieldExt {
+    pub fn new(field: &syn::Field) -> syn::Result<FieldExt> {
+        match field.ident.clone() {
+            Some(ident) => Ok(FieldExt {
+                attr: FieldAttr::parse(&field.attrs),
+                ident,
+            }),
+            None => Err(syn::Error::new_spanned(
+                field,
+                "TableValueRow fields must be named",
+            )),
+        }
+    }
+    pub(crate) fn get_col_name(&self) -> String {
+        if let Some(attr) = self.attr.as_ref() {
+            if let Some(colname) = attr.colname.as_ref() {
+                return colname.to_string();
+            }
+        }
+        self.ident.to_string()
+    }
+    pub(crate) fn as_bind(&self) -> TokenStream {
+        let name = &self.ident;
+        // `bind_fields` receives `&self`, so we cannot move the field out (that
+        // would fail with E0507 for non-`Copy` types such as `String`/`Vec<u8>`).
+        // Borrowing (`&self.#name`) does not work either: the anonymous `&self`
+        // borrow is not guaranteed to outlive the `SqlTableDataRow<'a>` lifetime,
+        // so `&'_ String: IntoSql<'a>` fails to unify. Cloning produces an owned
+        // (or, for reference fields like `&str`, a copied reference) value that
+        // satisfies `IntoSql<'a>` for every documented field type. `.clone()` is
+        // a no-op copy for `Copy` scalars and reference fields.
+        sp_quote!(data_row.add_field(self.#name.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::for_struct;
+
+    #[test]
+    fn basic_nolifetime() {
+        let ast: syn::DeriveInput = syn::parse_str(
+            r#"
+    pub struct SomeGeoList {
+        #[colname = "SomeID"]
+        pub id: i32,
+        #[colname = "LastSyncIPGeoLat"]
+        pub lat: Numeric, // decimal(9,6)
+        #[colname = "LastSyncIPGeoLong"]
+        pub lon: Numeric, // decimal(9,6)
+    }
+            "#,
+        )
+        .unwrap();
+        let result = match ast.data {
+            syn::Data::Enum(_) => panic!("n/a for enums, makes sense for structs only"),
+            syn::Data::Struct(ref s) => for_struct(&ast, &s.fields).unwrap(),
+            syn::Data::Union(_) => panic!("doesn't work with unions"),
+        };
+        let etalon = sp_quote!(
+            impl<'query> tiberius::TableValueRow<'query> for SomeGeoList {
+                fn get_db_type() -> &'static str {
+                    stringify! { SomeGeoList }
+                }
+                fn bind_fields(&self, data_row: &mut tiberius::SqlTableDataRow<'query>) {
+                    data_row.add_field(self.id.clone());
+                    data_row.add_field(self.lat.clone());
+                    data_row.add_field(self.lon.clone());
+                }
+            }
+        );
+
+        assert_eq!(result.to_string(), etalon.to_string());
+    }
+
+    #[test]
+    fn basic_lifetime() {
+        let ast: syn::DeriveInput = syn::parse_str(
+            r#"
+    pub struct AnotherGeoList<'e> {
+        #[colname = "SomeID"]
+        pub id: i32,
+        #[colname = "SomeStr"]
+        pub s: &'e str,
+    }
+            "#,
+        )
+        .unwrap();
+        let result = match ast.data {
+            syn::Data::Enum(_) => panic!("n/a for enums, makes sense for structs only"),
+            syn::Data::Struct(ref s) => for_struct(&ast, &s.fields).unwrap(),
+            syn::Data::Union(_) => panic!("doesn't work with unions"),
+        };
+
+        let etalon = sp_quote!(
+            impl<'e> tiberius::TableValueRow<'e> for AnotherGeoList<'e> {
+                fn get_db_type() -> &'static str {
+                    stringify! { AnotherGeoList }
+                }
+                fn bind_fields(&self, data_row: &mut tiberius::SqlTableDataRow<'e>) {
+                    data_row.add_field(self.id.clone());
+                    data_row.add_field(self.s.clone());
+                }
+            }
+        );
+
+        assert_eq!(result.to_string(), etalon.to_string());
+    }
+}

@@ -305,8 +305,8 @@ where
 /// Info about the following stream of rows.
 #[derive(Debug, Clone)]
 pub struct ResultMetadata {
-    columns: Arc<Vec<Column>>,
-    result_index: usize,
+    pub(crate) columns: Arc<Vec<Column>>,
+    pub(crate) result_index: usize,
 }
 
 impl ResultMetadata {

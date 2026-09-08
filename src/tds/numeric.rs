@@ -3,12 +3,12 @@
 use super::codec::Encode;
 use crate::{sql_read_bytes::SqlReadBytes, Error};
 #[cfg(feature = "bigdecimal")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "bigdecimal")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "bigdecimal")))]
 pub use bigdecimal::{num_bigint::BigInt, BigDecimal};
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{BufMut, BytesMut};
 #[cfg(feature = "rust_decimal")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "rust_decimal")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "rust_decimal")))]
 pub use rust_decimal::Decimal;
 use std::cmp::{Ordering, PartialEq};
 use std::fmt::{self, Debug, Display, Formatter};
@@ -19,6 +19,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 /// A recommended way of dealing with numeric values is by enabling the
 /// `rust_decimal` feature and using its `Decimal` type instead.
 #[derive(Copy, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Numeric {
     value: i128,
     scale: u8,
@@ -28,11 +29,12 @@ impl Numeric {
     /// Creates a new Numeric value.
     ///
     /// # Panic
-    /// It will panic if the scale exceed 37.
+    /// It will panic if the scale exceeds 38.
     pub fn new_with_scale(value: i128, scale: u8) -> Self {
-        // scale cannot exceed 37 since a
-        // max precision of 38 is possible here.
-        assert!(scale < 38);
+        // SQL Server allows a maximum precision of 38, and scale may equal
+        // precision (e.g. `decimal(38, 38)`), so scale 38 is valid; 10^38 still
+        // fits in i128.
+        assert!(scale <= 38);
 
         Numeric { value, scale }
     }

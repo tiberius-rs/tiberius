@@ -471,6 +471,53 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tds80")]
+    fn encryption_parsing_strict() -> crate::Result<()> {
+        let test_str = "encrypt=strict";
+        let ado: AdoNetConfig = test_str.parse()?;
+
+        assert_eq!(EncryptionLevel::Strict, ado.encrypt()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn client_name_parsing() -> crate::Result<()> {
+        let test_str = "workstationid=meow";
+        let ado: AdoNetConfig = test_str.parse()?;
+
+        assert_eq!(Some("meow".into()), ado.client_name());
+
+        let test_str = "Workstation ID=meow";
+        let ado: AdoNetConfig = test_str.parse()?;
+
+        assert_eq!(Some("meow".into()), ado.client_name());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hostname_in_certificate_parsing() -> crate::Result<()> {
+        let test_str = "HostNameInCertificate=foo.example.com";
+        let ado: AdoNetConfig = test_str.parse()?;
+
+        assert_eq!(
+            Some("foo.example.com".into()),
+            ado.hostname_in_certificate()
+        );
+
+        let test_str = "HostName In Certificate=foo.example.com";
+        let ado: AdoNetConfig = test_str.parse()?;
+
+        assert_eq!(
+            Some("foo.example.com".into()),
+            ado.hostname_in_certificate()
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn application_name_parsing() -> crate::Result<()> {
         let test_str = "Application Name=meow";
         let ado: AdoNetConfig = test_str.parse()?;
@@ -502,6 +549,45 @@ mod tests {
         // Absent altogether.
         let ado: AdoNetConfig = "server=tcp:localhost,1433".parse()?;
         assert!(!ado.readonly());
+
+        Ok(())
+    }
+
+    #[test]
+    fn multi_subnet_failover_parsing() -> crate::Result<()> {
+        let test_str = "MultiSubnetFailover=true";
+        let ado: AdoNetConfig = test_str.parse()?;
+        assert!(ado.multi_subnet_failover()?);
+
+        let test_str = "MultiSubnetFailover=yes";
+        let ado: AdoNetConfig = test_str.parse()?;
+        assert!(ado.multi_subnet_failover()?);
+
+        let test_str = "MultiSubnetFailover=false";
+        let ado: AdoNetConfig = test_str.parse()?;
+        assert!(!ado.multi_subnet_failover()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn multi_subnet_failover_parsing_missing() -> crate::Result<()> {
+        let test_str = "";
+        let ado: AdoNetConfig = test_str.parse()?;
+        assert!(!ado.multi_subnet_failover()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn multi_subnet_failover_from_ado_string() -> crate::Result<()> {
+        let config = crate::Config::from_ado_string(
+            "server=tcp:my-server.com,1433;MultiSubnetFailover=true",
+        )?;
+        assert!(config.get_multi_subnet_failover());
+
+        let config = crate::Config::from_ado_string("server=tcp:my-server.com,1433")?;
+        assert!(!config.get_multi_subnet_failover());
 
         Ok(())
     }

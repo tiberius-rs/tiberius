@@ -4,9 +4,8 @@ use std::{
 };
 
 use crate::{
-    error::Error,
     tds::codec::{Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
-    Column, ColumnData, ColumnType, SqlReadBytes,
+    Column, ColumnData, ColumnType, Error, SqlReadBytes,
 };
 use asynchronous_codec::BytesMut;
 use bytes::BufMut;
@@ -17,10 +16,27 @@ pub struct TokenColMetaData<'a> {
     pub columns: Vec<MetaDataColumn<'a>>,
 }
 
+/// Metadata for a single result/table column: its name plus the
+/// [`BaseMetaDataColumn`] describing its type, size and flags.
 #[derive(Debug, Clone)]
 pub struct MetaDataColumn<'a> {
+    /// The type and flag metadata for the column.
     pub base: BaseMetaDataColumn,
+    /// The name of the column.
     pub col_name: Cow<'a, str>,
+}
+
+impl<'a> MetaDataColumn<'a> {
+    /// The name of the column.
+    pub fn col_name(&self) -> &str {
+        self.col_name.as_ref()
+    }
+
+    /// The [`BaseMetaDataColumn`] describing the column's type and flags
+    /// (nullability, identity, etc.).
+    pub fn base(&self) -> &BaseMetaDataColumn {
+        &self.base
+    }
 }
 
 impl<'a> Display for MetaDataColumn<'a> {
@@ -126,15 +142,23 @@ impl<'a> Display for MetaDataColumn<'a> {
                 _ => unreachable!(),
             },
             TypeInfo::Xml { .. } => write!(f, "xml")?,
+            TypeInfo::Udt(info) => write!(f, "{}.{}", info.schema_name, info.type_name)?,
         }
 
         Ok(())
     }
 }
 
+/// Describes the type and flags of a column, exposing metadata such as the
+/// column type (including size, precision and scale), whether the column is
+/// nullable and whether it is an identity column.
 #[derive(Debug, Clone)]
 pub struct BaseMetaDataColumn {
+    /// The set of [`ColumnFlag`]s describing the column (nullability, identity,
+    /// updateability, and so on).
     pub flags: BitFlags<ColumnFlag>,
+    /// The type of the column, including its size, precision and scale where
+    /// applicable.
     pub ty: TypeInfo,
     /// Destination table name, used only on the *encode* (bulk-load) path. Per
     /// MS-TDS §2.2.7.4, `text`/`ntext`/`image` columns carry a `TableName`
@@ -145,6 +169,39 @@ pub struct BaseMetaDataColumn {
 }
 
 impl BaseMetaDataColumn {
+    /// The type of the column, including its size, precision and scale where
+    /// applicable.
+    pub fn ty(&self) -> &TypeInfo {
+        &self.ty
+    }
+
+    /// The set of flags describing the column.
+    pub fn flags(&self) -> BitFlags<ColumnFlag> {
+        self.flags
+    }
+
+    /// `true` if the column accepts `NULL` values.
+    pub fn is_nullable(&self) -> bool {
+        self.flags.contains(ColumnFlag::Nullable)
+    }
+
+    /// `true` if the column is an identity column.
+    pub fn is_identity(&self) -> bool {
+        self.flags.contains(ColumnFlag::Identity)
+    }
+
+    /// `true` if the column is writeable (e.g. usable as a bulk-insert target).
+    ///
+    /// The COLMETADATA `usUpdateable` sub-field (MS-TDS §2.2.7.4) is one of
+    /// read-only (0), read/write (1), or **unknown** (2). SQL Server reports
+    /// `unknown` for many legitimate bulk-target columns rather than an explicit
+    /// read/write, so both read/write and unknown are treated as writeable here;
+    /// only an explicit read-only column (neither flag set) is excluded.
+    pub fn is_updateable(&self) -> bool {
+        self.flags.contains(ColumnFlag::Updateable)
+            || self.flags.contains(ColumnFlag::UpdateableUnknown)
+    }
+
     pub(crate) fn null_value(&self) -> ColumnData<'static> {
         match &self.ty {
             TypeInfo::FixedLen(ty) => match ty {
@@ -197,7 +254,9 @@ impl BaseMetaDataColumn {
                 VarLenType::Text => ColumnData::String(None),
                 VarLenType::Image => ColumnData::Binary(None),
                 VarLenType::NText => ColumnData::String(None),
-                VarLenType::SSVariant => todo!(),
+                // A null `sql_variant` carries no base type, so surface a
+                // generic null value.
+                VarLenType::SSVariant => ColumnData::String(None),
             },
             TypeInfo::VarLenSizedPrecision { ty, .. } => match ty {
                 VarLenType::Guid => ColumnData::Guid(None),
@@ -227,9 +286,12 @@ impl BaseMetaDataColumn {
                 VarLenType::Text => ColumnData::String(None),
                 VarLenType::Image => ColumnData::Binary(None),
                 VarLenType::NText => ColumnData::String(None),
-                VarLenType::SSVariant => todo!(),
+                // A null `sql_variant` carries no base type, so surface a
+                // generic null value.
+                VarLenType::SSVariant => ColumnData::String(None),
             },
             TypeInfo::Xml { .. } => ColumnData::Xml(None),
+            TypeInfo::Udt(_) => ColumnData::Binary(None),
         }
     }
 }
@@ -339,23 +401,33 @@ pub enum ColumnFlag {
     /// Set for string columns with binary collation and always for the XML data
     /// type.
     CaseSensitive = 1 << 1,
-    /// If column is writeable.
-    Updateable = 1 << 3,
-    /// Column modification status unknown.
-    UpdateableUnknown = 1 << 4,
+    /// If column is writeable. This is value 1 (0b01) of the 2-bit
+    /// `usUpdateable` sub-field (MS-TDS §2.2.7.4), i.e. the low bit at position
+    /// 2 (0x04): `0 = read-only, 1 = read/write, 2 = unknown`.
+    Updateable = 1 << 2,
+    /// Column modification status unknown. This is value 2 (0b10) of the 2-bit
+    /// `usUpdateable` sub-field, i.e. the high bit at position 3 (0x08).
+    UpdateableUnknown = 1 << 3,
     /// Column is an identity.
-    Identity = 1 << 5,
-    /// Coulumn is computed.
-    Computed = 1 << 7,
+    Identity = 1 << 4,
+    /// Column is computed. Per MS-TDS §2.2.7.4 `fComputed` is bit 5 (0x0020),
+    /// immediately after `fIdentity` and before the 2-bit `usReservedODBC`
+    /// field (bits 6-7). Introduced in TDS 7.2.
+    Computed = 1 << 5,
     /// Column is a fixed-length common language runtime user-defined type (CLR
-    /// UDT).
-    FixedLenClrType = 1 << 10,
-    /// Column is the special XML column for the sparse column set.
-    SparseColumnSet = 1 << 11,
+    /// UDT). Per MS-TDS §2.2.7.4 `fFixedLenCLRType` is bit 8 (0x0100), directly
+    /// after `usReservedODBC` (bits 6-7). Introduced in TDS 7.2.
+    FixedLenClrType = 1 << 8,
+    /// Column is the special XML column for the sparse column set. Per
+    /// MS-TDS §2.2.7.4 `fSparseColumnSet` is bit 10 (0x0400): bit 9 is a
+    /// reserved bit (`FRESERVEDBIT`). Introduced in TDS 7.3.B.
+    SparseColumnSet = 1 << 10,
     /// Column is encrypted transparently and has to be decrypted to view the
     /// plaintext value. This flag is valid when the column encryption feature
-    /// is negotiated between client and server and is turned on.
-    Encrypted = 1 << 12,
+    /// is negotiated between client and server and is turned on. Per
+    /// MS-TDS §2.2.7.4 `fEncrypted` is bit 11 (0x0800), directly after
+    /// `fSparseColumnSet`. Introduced in TDS 7.4.
+    Encrypted = 1 << 11,
     /// Column is part of a hidden primary key created to support a T-SQL SELECT
     /// statement containing FOR BROWSE.
     Hidden = 1 << 13,
@@ -405,8 +477,11 @@ impl BaseMetaDataColumn {
 
         let _user_ty = src.read_u32_le().await?;
 
-        let flags = BitFlags::from_bits(src.read_u16_le().await?)
-            .map_err(|_| Error::Protocol("column metadata: invalid flags".into()))?;
+        // The COLMETADATA `Flags` field (MS-TDS §2.2.7.4) is a 16-bit field that
+        // includes reserved / ODBC bits the server may set and which future
+        // protocol revisions may extend. Truncate to the flags we model rather
+        // than rejecting the whole token on an unrecognized bit.
+        let flags = BitFlags::from_bits_truncate(src.read_u16_le().await?);
 
         let ty = TypeInfo::decode(src).await?;
 
@@ -593,6 +668,136 @@ mod tests {
             },
             col_name: Cow::Borrowed(name),
         }
+    }
+
+    // Bit-exact layout of the COLMETADATA `Flags` field per MS-TDS §2.2.7.4,
+    // in least-significant-bit order:
+    //   bit 0        fNullable
+    //   bit 1        fCaseSen
+    //   bits 2-3     usUpdateable (0=read-only, 1=read/write, 2=unknown)
+    //   bit 4        fIdentity
+    //   bit 5        fComputed
+    //   bits 6-7     usReservedODBC
+    //   bit 8        fFixedLenCLRType
+    //   ...
+    //   bit 13       fHidden
+    //   bit 14       fKey
+    //   bit 15       fNullableUnknown
+    // The `usUpdateable` sub-field is a 2-bit value, so read/write (value 1) is
+    // the low bit 0x04 and unknown (value 2) is the high bit 0x08. A server
+    // reporting a genuinely writeable column sets 0x04; `is_updateable()` must
+    // therefore key off 0x04, not 0x08.
+    #[test]
+    fn column_flag_bit_positions_match_ms_tds() {
+        assert_eq!(BitFlags::bits(BitFlags::from(ColumnFlag::Nullable)), 0x0001);
+        assert_eq!(
+            BitFlags::bits(BitFlags::from(ColumnFlag::CaseSensitive)),
+            0x0002
+        );
+        // usUpdateable: read/write = 0x04 (bit 2), unknown = 0x08 (bit 3).
+        assert_eq!(
+            BitFlags::bits(BitFlags::from(ColumnFlag::Updateable)),
+            0x0004
+        );
+        assert_eq!(
+            BitFlags::bits(BitFlags::from(ColumnFlag::UpdateableUnknown)),
+            0x0008
+        );
+        assert_eq!(BitFlags::bits(BitFlags::from(ColumnFlag::Identity)), 0x0010);
+    }
+
+    // `is_updateable()` means "not read-only", i.e. a valid bulk-insert target.
+    // usUpdateable read/write (1, wire bit 0x04) and unknown (2, wire bit 0x08)
+    // are both writeable; only explicit read-only (0, neither bit) is excluded.
+    // SQL Server reports `unknown` for many real bulk-target columns, so treating
+    // it as writeable is required (keying off the read/write bit alone drops
+    // every column and breaks bulk insert entirely).
+    #[test]
+    fn is_updateable_true_for_read_write_and_unknown_false_for_read_only() {
+        let read_write = BaseMetaDataColumn {
+            flags: BitFlags::from_bits_truncate(0x0004),
+            ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            table_name: None,
+        };
+        assert!(read_write.is_updateable());
+
+        let unknown = BaseMetaDataColumn {
+            flags: BitFlags::from_bits_truncate(0x0008),
+            ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            table_name: None,
+        };
+        assert!(unknown.is_updateable());
+
+        let read_only = BaseMetaDataColumn {
+            flags: BitFlags::from_bits_truncate(0x0000),
+            ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            table_name: None,
+        };
+        assert!(!read_only.is_updateable());
+    }
+
+    // Byte-exact decode of a COLMETADATA `Flags` USHORT with a known set of
+    // sub-fields, constructed per the MS-TDS §2.2.7.4 LSB-first layout:
+    //   bit 0  fNullable            bit 5  fComputed
+    //   bit 1  fCaseSen             bits 6-7 usReservedODBC
+    //   bits 2-3 usUpdateable       bit 8  fFixedLenCLRType
+    //   bit 4  fIdentity            bit 9  (reserved)
+    //   bit 10 fSparseColumnSet     bit 13 fHidden
+    //   bit 11 fEncrypted           bit 14 fKey
+    //   bit 12 (usReserved3)        bit 15 fNullableUnknown
+    // This locks the wire layout: a regression that shifts any bit changes the
+    // decoded flag set and fails here.
+    #[test]
+    fn column_flags_decode_byte_exact_low_and_mid_bits() {
+        // fNullable(0) | usUpdateable=Read/Write(bit2) | fIdentity(4)
+        //   | fComputed(5) | fFixedLenCLRType(8) | fSparseColumnSet(10)
+        //   | fEncrypted(11)  ==>  0x0D35, little-endian on the wire.
+        let wire: [u8; 2] = [0x35, 0x0D];
+        let flags = BitFlags::<ColumnFlag>::from_bits_truncate(u16::from_le_bytes(wire));
+
+        let col = BaseMetaDataColumn {
+            flags,
+            ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            table_name: None,
+        };
+
+        assert!(col.is_nullable());
+        assert!(col.is_updateable()); // usUpdateable == 1 (Read/Write, bit 2)
+        assert!(col.is_identity());
+        assert!(flags.contains(ColumnFlag::Computed));
+        assert!(flags.contains(ColumnFlag::FixedLenClrType));
+        assert!(flags.contains(ColumnFlag::SparseColumnSet));
+        assert!(flags.contains(ColumnFlag::Encrypted));
+
+        // Bits that were NOT set must not read back as set.
+        assert!(!flags.contains(ColumnFlag::CaseSensitive));
+        assert!(!flags.contains(ColumnFlag::UpdateableUnknown));
+        assert!(!flags.contains(ColumnFlag::Hidden));
+        assert!(!flags.contains(ColumnFlag::Key));
+        assert!(!flags.contains(ColumnFlag::NullableUnknown));
+    }
+
+    // Companion to the above, exercising the CaseSen bit, the *high* bit of
+    // usUpdateable (value 2 = unknown) and the top three flags introduced in
+    // TDS 7.2 (fHidden=13, fKey=14, fNullableUnknown=15).
+    #[test]
+    fn column_flags_decode_byte_exact_high_bits() {
+        // fCaseSen(1) | usUpdateable=Unknown(bit3) | fHidden(13) | fKey(14)
+        //   | fNullableUnknown(15)  ==>  0xE00A, little-endian on the wire.
+        let wire: [u8; 2] = [0x0A, 0xE0];
+        let flags = BitFlags::<ColumnFlag>::from_bits_truncate(u16::from_le_bytes(wire));
+
+        assert!(flags.contains(ColumnFlag::CaseSensitive));
+        assert!(flags.contains(ColumnFlag::UpdateableUnknown));
+        assert!(flags.contains(ColumnFlag::Hidden));
+        assert!(flags.contains(ColumnFlag::Key));
+        assert!(flags.contains(ColumnFlag::NullableUnknown));
+
+        // usUpdateable == 2 (unknown) means NOT read/write.
+        assert!(!flags.contains(ColumnFlag::Updateable));
+        assert!(!flags.contains(ColumnFlag::Nullable));
+        assert!(!flags.contains(ColumnFlag::Identity));
+        assert!(!flags.contains(ColumnFlag::Computed));
     }
 
     #[test]

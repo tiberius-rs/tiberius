@@ -18,10 +18,17 @@ use jdbc::*;
 /// When using an [ADO.NET connection string], it can be
 /// constructed using the [`from_ado_string`] function.
 ///
+/// Alternatively, a [`ConfigBuilder`] can be used for an ergonomic,
+/// chainable construction. Create one via [`builder`], call its
+/// setter methods and finalize it with [`build`].
+///
 /// [`Client`]: struct.Client.html
 /// [ADO.NET connection string]: https://docs.microsoft.com/en-us/dotnet/framework/data/adonet/connection-strings
 /// [`from_ado_string`]: struct.Config.html#method.from_ado_string
 /// [`get_addr`]: struct.Config.html#method.get_addr
+/// [`ConfigBuilder`]: struct.ConfigBuilder.html
+/// [`builder`]: struct.Config.html#method.builder
+/// [`build`]: struct.ConfigBuilder.html#method.build
 pub struct Config {
     pub(crate) host: Option<String>,
     pub(crate) port: Option<u16>,
@@ -33,6 +40,15 @@ pub struct Config {
     pub(crate) auth: AuthMethod,
     pub(crate) readonly: bool,
     pub(crate) packet_size: Option<u32>,
+    pub(crate) hostname_in_certificate: Option<String>,
+    pub(crate) client_name: Option<String>,
+    pub(crate) multi_subnet_failover: bool,
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    pub(crate) client_cert: Option<ClientCertificate>,
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +57,68 @@ pub(crate) enum TrustConfig {
     CaCertificateLocation(PathBuf),
     TrustAll,
     Default,
+}
+
+/// A client certificate and its private key, presented to the server during the
+/// TLS handshake to authenticate the *client* (mutual TLS / TDS 8.0
+/// `ENCRYPT_CLIENT_CERT`).
+///
+/// Construct one indirectly via [`Config::client_certificate`] (PEM/DER
+/// certificate + private-key files) or [`Config::client_certificate_pkcs12`]
+/// (a PKCS#12 / PFX bundle, `native-tls` and `vendored-openssl` only).
+#[cfg(any(
+    feature = "rustls",
+    feature = "native-tls",
+    feature = "vendored-openssl"
+))]
+#[derive(Clone, Debug)]
+pub(crate) struct ClientCertificate {
+    pub(crate) source: ClientCertSource,
+}
+
+#[cfg(any(
+    feature = "rustls",
+    feature = "native-tls",
+    feature = "vendored-openssl"
+))]
+#[derive(Clone)]
+pub(crate) enum ClientCertSource {
+    /// A certificate file and a separate private-key file. Both may be PEM
+    /// (`.pem`/`.crt` for the certificate, `.pem`/`.key` for the key) or DER
+    /// (`.der`); the concrete format is detected from the file extension by the
+    /// active TLS backend.
+    CertAndKey { cert: PathBuf, key: PathBuf },
+    /// A PKCS#12 / PFX bundle path together with its decryption password. Only
+    /// supported by the `native-tls` and `vendored-openssl` backends.
+    #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
+    Pkcs12 {
+        path: PathBuf,
+        password: zeroize::Zeroizing<String>,
+    },
+}
+
+// Manual `Debug` so the PKCS#12 password is never printed.
+#[cfg(any(
+    feature = "rustls",
+    feature = "native-tls",
+    feature = "vendored-openssl"
+))]
+impl std::fmt::Debug for ClientCertSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientCertSource::CertAndKey { cert, key } => f
+                .debug_struct("CertAndKey")
+                .field("cert", cert)
+                .field("key", key)
+                .finish(),
+            #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
+            ClientCertSource::Pkcs12 { path, .. } => f
+                .debug_struct("Pkcs12")
+                .field("path", path)
+                .field("password", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -67,6 +145,15 @@ impl Default for Config {
             auth: AuthMethod::None,
             readonly: false,
             packet_size: None,
+            hostname_in_certificate: None,
+            client_name: None,
+            multi_subnet_failover: false,
+            #[cfg(any(
+                feature = "rustls",
+                feature = "native-tls",
+                feature = "vendored-openssl"
+            ))]
+            client_cert: None,
         }
     }
 }
@@ -75,6 +162,33 @@ impl Config {
     /// Create a new `Config` with the default settings.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a new [`ConfigBuilder`] initialized with the default settings.
+    ///
+    /// This provides an ergonomic, chainable alternative to constructing a
+    /// [`Config`] via its individual setter methods.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tiberius::{Config, AuthMethod};
+    /// let config = Config::builder()
+    ///     .host("localhost")
+    ///     .port(1433)
+    ///     .database("master")
+    ///     .authentication(AuthMethod::sql_server("SA", "<password>"))
+    ///     .build();
+    ///
+    /// assert_eq!("localhost:1433", config.get_addr());
+    /// ```
+    ///
+    /// [`ConfigBuilder`]: struct.ConfigBuilder.html
+    /// [`Config`]: struct.Config.html
+    pub fn builder() -> ConfigBuilder {
+        ConfigBuilder {
+            inner: Self::default(),
+        }
     }
 
     /// A host or ip address to connect to.
@@ -175,6 +289,28 @@ impl Config {
         }
     }
 
+    /// Sets the hostname that the server certificate is validated against,
+    /// instead of the value given to [`host`].
+    ///
+    /// This is useful when connecting through an IP address, a tunnel, or a
+    /// load balancer whose certificate carries a different subject/SAN than the
+    /// address used to reach it (see issue #340).
+    ///
+    /// - Defaults to the value of [`host`].
+    ///
+    /// [`host`]: Config::host
+    pub fn hostname_in_certificate(&mut self, hostname: impl ToString) {
+        self.hostname_in_certificate = Some(hostname.to_string());
+    }
+
+    /// Sets the client / workstation name reported to the server in the login
+    /// record (queryable with `HOST_NAME()`).
+    ///
+    /// - Defaults to the local workstation id (the machine hostname).
+    pub fn client_name(&mut self, name: impl ToString) {
+        self.client_name = Some(name.to_string());
+    }
+
     /// Sets the authentication method.
     ///
     /// - Defaults to `None`.
@@ -189,11 +325,126 @@ impl Config {
         self.readonly = readnoly;
     }
 
+    /// Enable multi-subnet failover.
+    ///
+    /// When enabled and the server host name resolves to more than one IP
+    /// address (for example, an Always On availability group listener spread
+    /// across subnets), connections are attempted to all resolved addresses in
+    /// parallel and the first one to succeed is used. This mirrors the ADO.NET
+    /// `MultiSubnetFailover` connection-string keyword.
+    ///
+    /// - Defaults to `false`.
+    pub fn multi_subnet_failover(&mut self, multi_subnet_failover: bool) {
+        self.multi_subnet_failover = multi_subnet_failover;
+    }
+
+    /// Returns whether multi-subnet failover is enabled.
+    pub fn get_multi_subnet_failover(&self) -> bool {
+        self.multi_subnet_failover
+    }
+
+    /// Supplies a client certificate and private key used to authenticate the
+    /// client to the server during the TLS handshake (mutual TLS). This is
+    /// required for TDS 8.0 "strict" connections that use client-certificate
+    /// authentication (`ENCRYPT_CLIENT_CERT`), and may also be used with the
+    /// classic (pre-8.0) TLS handshake when the server requests a client
+    /// certificate.
+    ///
+    /// Both arguments are paths to files:
+    ///
+    /// - `cert`: the client certificate, PEM (`.pem`/`.crt`) or DER (`.der`).
+    /// - `key`: the matching private key, PEM (`.pem`/`.key`) or DER (`.der`,
+    ///   PKCS#8).
+    ///
+    /// Backend support:
+    ///
+    /// - `rustls`: PEM and DER certificate/key files.
+    /// - `native-tls`: PEM certificate + PEM PKCS#8 key only (DER files are
+    ///   rejected at connect time; use [`client_certificate_pkcs12`] for a
+    ///   bundled DER identity).
+    /// - `vendored-openssl` (opentls): does not support separate certificate/key
+    ///   files; use [`client_certificate_pkcs12`] instead.
+    ///
+    /// - Defaults to no client certificate.
+    ///
+    /// [`client_certificate_pkcs12`]: Config::client_certificate_pkcs12
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(
+            feature = "rustls",
+            feature = "native-tls",
+            feature = "vendored-openssl"
+        )))
+    )]
+    pub fn client_certificate(&mut self, cert: impl Into<PathBuf>, key: impl Into<PathBuf>) {
+        self.client_cert = Some(ClientCertificate {
+            source: ClientCertSource::CertAndKey {
+                cert: cert.into(),
+                key: key.into(),
+            },
+        });
+    }
+
+    /// Supplies a client identity from a PKCS#12 / PFX bundle (certificate,
+    /// private key and any chain, encrypted with `password`) used to
+    /// authenticate the client to the server during the TLS handshake (mutual
+    /// TLS).
+    ///
+    /// Only supported by the `native-tls` and `vendored-openssl` backends; the
+    /// `rustls` backend rejects PKCS#12 identities at connect time (supply
+    /// separate PEM/DER files via [`client_certificate`] instead).
+    ///
+    /// - Defaults to no client certificate.
+    ///
+    /// [`client_certificate`]: Config::client_certificate
+    #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "native-tls", feature = "vendored-openssl")))
+    )]
+    pub fn client_certificate_pkcs12(
+        &mut self,
+        path: impl Into<PathBuf>,
+        password: impl Into<String>,
+    ) {
+        self.client_cert = Some(ClientCertificate {
+            source: ClientCertSource::Pkcs12 {
+                path: path.into(),
+                password: zeroize::Zeroizing::new(password.into()),
+            },
+        });
+    }
+
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    pub(crate) fn get_client_certificate(&self) -> Option<&ClientCertificate> {
+        self.client_cert.as_ref()
+    }
+
     pub(crate) fn get_host(&self) -> &str {
         self.host
             .as_deref()
             .filter(|v| v != &".")
             .unwrap_or("localhost")
+    }
+
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    pub(crate) fn get_hostname_in_certificate(&self) -> &str {
+        self.hostname_in_certificate
+            .as_deref()
+            .unwrap_or_else(|| self.get_host())
     }
 
     pub(crate) fn get_port(&self) -> u16 {
@@ -228,8 +479,11 @@ impl Config {
     /// |`database`|`<string>`|The name of the database.|
     /// |`TrustServerCertificate`|`true`,`false`,`yes`,`no`|Specifies whether the driver trusts the server certificate when connecting using TLS. Cannot be used toghether with `TrustServerCertificateCA`|
     /// |`TrustServerCertificateCA`|`<path>`|Path to a `pem`, `crt` or `der` certificate file. Cannot be used together with `TrustServerCertificate`|
-    /// |`encrypt`|`true`,`false`,`yes`,`no`,`DANGER_PLAINTEXT`|Specifies whether the driver uses TLS to encrypt communication.|
+    /// |`encrypt`|`strict`,`true`,`false`,`yes`,`no`,`DANGER_PLAINTEXT`|Specifies whether the driver uses TLS to encrypt communication. `strict` (TDS 8.0) requires the `tds80` feature.|
     /// |`Application Name`, `ApplicationName`|`<string>`|Sets the application name for the connection.|
+    /// |`HostNameInCertificate`, `HostName In Certificate`|`<string>`|The hostname the server certificate is validated against. Defaults to the value of the `Server` keyword (host).|
+    /// |`WorkstationID`, `Workstation ID`|`<string>`|The client / workstation name reported to the server.|
+    /// |`MultiSubnetFailover`|`true`,`false`,`yes`,`no`|When enabled, connections are attempted in parallel to all IP addresses the server resolves to, and the first to succeed is used.|
     ///
     /// [ADO.NET connection string]: https://docs.microsoft.com/en-us/dotnet/framework/data/adonet/connection-strings
     pub fn from_ado_string(s: &str) -> crate::Result<Self> {
@@ -275,19 +529,236 @@ impl Config {
             builder.application_name(name);
         }
 
-        if s.trust_cert()? {
+        let trust_cert = s.trust_cert()?;
+        let trust_cert_ca = s.trust_cert_ca();
+
+        // `TrustServerCertificate` and `TrustServerCertificateCA` are mutually
+        // exclusive. Detect the conflict here and return an error instead of
+        // letting `trust_cert`/`trust_cert_ca` panic on external input.
+        if trust_cert && trust_cert_ca.is_some() {
+            return Err(crate::Error::Conversion(
+                "'TrustServerCertificate' and 'TrustServerCertificateCA' are \
+                 mutually exclusive; specify only one"
+                    .into(),
+            ));
+        }
+
+        if trust_cert {
             builder.trust_cert();
         }
 
-        if let Some(ca) = s.trust_cert_ca() {
+        if let Some(ca) = trust_cert_ca {
             builder.trust_cert_ca(ca);
+        }
+
+        if let Some(hostname_in_cert) = s.hostname_in_certificate() {
+            builder.hostname_in_certificate(hostname_in_cert);
         }
 
         builder.encryption(s.encrypt()?);
 
         builder.readonly(s.readonly());
 
+        if let Some(client_name) = s.client_name() {
+            builder.client_name(client_name);
+        }
+        builder.multi_subnet_failover(s.multi_subnet_failover()?);
+
         Ok(builder)
+    }
+}
+
+/// A builder for [`Config`], providing an ergonomic, chainable way to
+/// construct a connection configuration.
+///
+/// Create a builder with [`Config::builder`], set the desired options by
+/// calling its methods (each returns the builder to allow chaining) and
+/// finalize it with [`build`].
+///
+/// # Example
+///
+/// ```
+/// # use tiberius::{Config, AuthMethod, EncryptionLevel};
+/// let config = Config::builder()
+///     .host("localhost")
+///     .port(1433)
+///     .database("master")
+///     .encryption(EncryptionLevel::NotSupported)
+///     .authentication(AuthMethod::sql_server("SA", "<password>"))
+///     .build();
+/// ```
+///
+/// [`Config`]: struct.Config.html
+/// [`Config::builder`]: struct.Config.html#method.builder
+/// [`build`]: struct.ConfigBuilder.html#method.build
+#[derive(Clone, Debug)]
+pub struct ConfigBuilder {
+    inner: Config,
+}
+
+impl ConfigBuilder {
+    /// A host or ip address to connect to.
+    ///
+    /// - Defaults to `localhost`.
+    pub fn host(mut self, host: impl ToString) -> Self {
+        self.inner.host = Some(host.to_string());
+        self
+    }
+
+    /// The server port.
+    ///
+    /// - Defaults to `1433`.
+    pub fn port(mut self, port: u16) -> Self {
+        self.inner.port = Some(port);
+        self
+    }
+
+    /// The database to connect to.
+    ///
+    /// - Defaults to `master`.
+    pub fn database(mut self, database: impl ToString) -> Self {
+        self.inner.database = Some(database.to_string());
+        self
+    }
+
+    /// The instance name as defined in the SQL Browser. Only available on
+    /// Windows platforms.
+    ///
+    /// If specified, the port is replaced with the value returned from the
+    /// browser.
+    ///
+    /// - Defaults to no name specified.
+    pub fn instance_name(mut self, name: impl ToString) -> Self {
+        self.inner.instance_name = Some(name.to_string());
+        self
+    }
+
+    /// Sets the application name to the connection, queryable with the
+    /// `APP_NAME()` command.
+    ///
+    /// - Defaults to no name specified.
+    pub fn application_name(mut self, name: impl ToString) -> Self {
+        self.inner.application_name = Some(name.to_string());
+        self
+    }
+
+    /// Set the preferred encryption level.
+    ///
+    /// - With `tls` feature, defaults to `Required`.
+    /// - Without `tls` feature, defaults to `NotSupported`.
+    pub fn encryption(mut self, encryption: EncryptionLevel) -> Self {
+        self.inner.encryption = encryption;
+        self
+    }
+
+    /// If set, the server certificate will not be validated and it is accepted
+    /// as-is.
+    ///
+    /// On production setting, the certificate should be added to the local key
+    /// storage (or use `trust_cert_ca` instead), using this setting is potentially dangerous.
+    ///
+    /// # Panics
+    /// Will panic in case `trust_cert_ca` was called before.
+    ///
+    /// - Defaults to `default`, meaning server certificate is validated against system-truststore.
+    pub fn trust_cert(mut self) -> Self {
+        if let TrustConfig::CaCertificateLocation(_) = &self.inner.trust {
+            panic!("'trust_cert' and 'trust_cert_ca' are mutual exclusive! Only use one.")
+        }
+        self.inner.trust = TrustConfig::TrustAll;
+        self
+    }
+
+    /// If set, the server certificate will be validated against the given CA certificate in
+    /// in addition to the system-truststore.
+    /// Useful when using self-signed certificates on the server without having to disable the
+    /// trust-chain.
+    ///
+    /// # Panics
+    /// Will panic in case `trust_cert` was called before.
+    ///
+    /// - Defaults to validating the server certificate is validated against system's certificate storage.
+    pub fn trust_cert_ca(mut self, path: impl ToString) -> Self {
+        if let TrustConfig::TrustAll = &self.inner.trust {
+            panic!("'trust_cert' and 'trust_cert_ca' are mutual exclusive! Only use one.")
+        } else {
+            self.inner.trust = TrustConfig::CaCertificateLocation(PathBuf::from(path.to_string()))
+        }
+        self
+    }
+
+    /// Sets the authentication method.
+    ///
+    /// - Defaults to `None`.
+    pub fn authentication(mut self, auth: AuthMethod) -> Self {
+        self.inner.auth = auth;
+        self
+    }
+
+    /// Sets ApplicationIntent readonly.
+    ///
+    /// - Defaults to `false`.
+    pub fn readonly(mut self, readonly: bool) -> Self {
+        self.inner.readonly = readonly;
+        self
+    }
+
+    /// Supplies a client certificate and private key for mutual TLS.
+    ///
+    /// See [`Config::client_certificate`] for details and backend support.
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(
+            feature = "rustls",
+            feature = "native-tls",
+            feature = "vendored-openssl"
+        )))
+    )]
+    pub fn client_certificate(mut self, cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
+        self.inner.client_certificate(cert, key);
+        self
+    }
+
+    /// Supplies a client identity from a PKCS#12 / PFX bundle for mutual TLS.
+    ///
+    /// See [`Config::client_certificate_pkcs12`] for details and backend
+    /// support.
+    #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "native-tls", feature = "vendored-openssl")))
+    )]
+    pub fn client_certificate_pkcs12(
+        mut self,
+        path: impl Into<PathBuf>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.inner.client_certificate_pkcs12(path, password);
+        self
+    }
+
+    /// Produces the finalized [`Config`] from this builder.
+    ///
+    /// [`Config`]: struct.Config.html
+    pub fn build(self) -> Config {
+        self.inner
+    }
+}
+
+impl From<Config> for ConfigBuilder {
+    fn from(config: Config) -> Self {
+        ConfigBuilder { inner: config }
+    }
+}
+
+impl From<ConfigBuilder> for Config {
+    fn from(builder: ConfigBuilder) -> Self {
+        builder.inner
     }
 }
 
@@ -328,7 +799,23 @@ pub(crate) trait ConfigString {
                 (None, None) => Ok(AuthMethod::Integrated),
                 _ => Ok(AuthMethod::windows(user.unwrap_or(""), pw.unwrap_or(""))),
             },
-            #[cfg(feature = "integrated-auth-gssapi")]
+            // On Unix with `sspi-rs`, `IntegratedSecurity=SSPI` (or a truthy
+            // value) uses NTLM when a username/password is supplied, and falls
+            // back to Kerberos (`Integrated`) only if `integrated-auth-gssapi`
+            // is also enabled and no credentials are given.
+            #[cfg(all(unix, feature = "sspi-rs"))]
+            Some(val) if val.to_lowercase() == "sspi" || Self::parse_bool(val)? => {
+                match (user, pw) {
+                    (Some(user), Some(pw)) => Ok(AuthMethod::windows(user, pw)),
+                    #[cfg(feature = "integrated-auth-gssapi")]
+                    (None, None) => Ok(AuthMethod::Integrated),
+                    _ => Ok(AuthMethod::windows(user.unwrap_or(""), pw.unwrap_or(""))),
+                }
+            }
+            #[cfg(all(
+                feature = "integrated-auth-gssapi",
+                not(all(unix, feature = "sspi-rs"))
+            ))]
             Some(val) if val.to_lowercase() == "sspi" || Self::parse_bool(val)? => {
                 Ok(AuthMethod::Integrated)
             }
@@ -364,6 +851,20 @@ pub(crate) trait ConfigString {
             .map(|ca| ca.to_string())
     }
 
+    fn hostname_in_certificate(&self) -> Option<String> {
+        self.dict()
+            .get("hostnameincertificate")
+            .or_else(|| self.dict().get("hostname in certificate"))
+            .map(|host| host.to_string())
+    }
+
+    fn client_name(&self) -> Option<String> {
+        self.dict()
+            .get("workstationid")
+            .or_else(|| self.dict().get("workstation id"))
+            .map(|name| name.to_string())
+    }
+
     #[cfg(any(
         feature = "rustls",
         feature = "native-tls",
@@ -376,6 +877,9 @@ pub(crate) trait ConfigString {
                 Ok(true) => Ok(EncryptionLevel::Required),
                 Ok(false) => Ok(EncryptionLevel::Off),
                 Err(_) if val == "DANGER_PLAINTEXT" => Ok(EncryptionLevel::NotSupported),
+                Err(_) if val.eq_ignore_ascii_case("strict") && cfg!(feature = "tds80") => {
+                    Ok(EncryptionLevel::Strict)
+                }
                 Err(e) => Err(e),
             })
             .unwrap_or(Ok(EncryptionLevel::Off))
@@ -405,5 +909,201 @@ pub(crate) trait ConfigString {
             .get("applicationintent")
             .filter(|val| val.trim().eq_ignore_ascii_case("ReadOnly"))
             .is_some()
+    }
+
+    fn multi_subnet_failover(&self) -> crate::Result<bool> {
+        self.dict()
+            .get("multisubnetfailover")
+            .map(Self::parse_bool)
+            .unwrap_or(Ok(false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_builder_constructs_config() {
+        let config = Config::builder()
+            .host("db.example.com")
+            .port(4433)
+            .database("northwind")
+            .application_name("my-app")
+            .authentication(AuthMethod::sql_server("SA", "secret"))
+            .readonly(true)
+            .build();
+
+        assert_eq!("db.example.com", config.get_host());
+        assert_eq!(4433, config.get_port());
+        assert_eq!("db.example.com:4433", config.get_addr());
+        assert_eq!(Some("northwind"), config.database.as_deref());
+        assert_eq!(Some("my-app"), config.application_name.as_deref());
+        assert!(config.readonly);
+        assert!(matches!(config.auth, AuthMethod::SqlServer(_)));
+        assert!(matches!(config.trust, TrustConfig::Default));
+    }
+
+    #[test]
+    fn config_builder_roundtrips_via_from() {
+        let config = Config::builder().host("localhost").port(1433).build();
+        let builder: ConfigBuilder = config.into();
+        let config = builder.database("master").build();
+
+        assert_eq!("localhost:1433", config.get_addr());
+        assert_eq!(Some("master"), config.database.as_deref());
+    }
+
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    #[test]
+    fn client_certificate_sets_cert_and_key_source() {
+        let mut config = Config::new();
+        assert!(config.get_client_certificate().is_none());
+
+        config.client_certificate("/tmp/client.pem", "/tmp/client.key");
+
+        let cert = config
+            .get_client_certificate()
+            .expect("client certificate should be set");
+        match &cert.source {
+            ClientCertSource::CertAndKey { cert, key } => {
+                assert_eq!(cert, &PathBuf::from("/tmp/client.pem"));
+                assert_eq!(key, &PathBuf::from("/tmp/client.key"));
+            }
+            #[allow(unreachable_patterns)]
+            other => panic!("expected CertAndKey source, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    #[test]
+    fn config_builder_sets_client_certificate() {
+        let config = Config::builder()
+            .host("localhost")
+            .client_certificate("cert.der", "key.der")
+            .build();
+
+        match &config
+            .get_client_certificate()
+            .expect("client certificate should be set")
+            .source
+        {
+            ClientCertSource::CertAndKey { cert, key } => {
+                assert_eq!(cert, &PathBuf::from("cert.der"));
+                assert_eq!(key, &PathBuf::from("key.der"));
+            }
+            #[allow(unreachable_patterns)]
+            other => panic!("expected CertAndKey source, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
+    #[test]
+    fn client_certificate_pkcs12_sets_bundle_source() {
+        let mut config = Config::new();
+        config.client_certificate_pkcs12("/tmp/identity.pfx", "s3cr3t");
+
+        match &config
+            .get_client_certificate()
+            .expect("client certificate should be set")
+            .source
+        {
+            ClientCertSource::Pkcs12 { path, password } => {
+                assert_eq!(path, &PathBuf::from("/tmp/identity.pfx"));
+                assert_eq!(password.as_str(), "s3cr3t");
+            }
+            other => panic!("expected Pkcs12 source, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
+    #[test]
+    fn client_certificate_debug_redacts_pkcs12_password() {
+        let mut config = Config::new();
+        config.client_certificate_pkcs12("/tmp/identity.pfx", "topsecret");
+
+        let dbg = format!("{:?}", config.get_client_certificate().unwrap());
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("topsecret"));
+    }
+
+    #[cfg(all(unix, feature = "sspi-rs"))]
+    #[test]
+    fn ado_integrated_security_sspi_with_credentials_uses_windows_ntlm() {
+        let config = Config::from_ado_string(
+            "server=tcp:localhost,1433;IntegratedSecurity=SSPI;uid=DOMAIN\\user;pwd=secret",
+        )
+        .unwrap();
+
+        match config.auth {
+            AuthMethod::Windows(auth) => {
+                assert_eq!("user", auth.user);
+                assert_eq!(Some("DOMAIN"), auth.domain.as_deref());
+            }
+            other => panic!("expected Windows NTLM auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ado_conflicting_trust_cert_settings_return_err_not_panic() {
+        let result = Config::from_ado_string(
+            "server=tcp:localhost,1433;TrustServerCertificate=true;\
+             TrustServerCertificateCA=/tmp/ca.pem",
+        );
+
+        match result {
+            Err(crate::Error::Conversion(msg)) => {
+                assert!(
+                    msg.contains("mutually exclusive"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jdbc_conflicting_trust_cert_settings_return_err_not_panic() {
+        let result = Config::from_jdbc_string(
+            "jdbc:sqlserver://localhost:1433;trustServerCertificate=true;\
+             trustServerCertificateCA=/tmp/ca.pem",
+        );
+
+        assert!(
+            matches!(result, Err(crate::Error::Conversion(_))),
+            "expected Conversion error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn ado_trust_cert_alone_trusts_all() {
+        let config =
+            Config::from_ado_string("server=tcp:localhost,1433;TrustServerCertificate=true")
+                .unwrap();
+
+        assert!(matches!(config.trust, TrustConfig::TrustAll));
+    }
+
+    #[test]
+    fn ado_trust_cert_ca_alone_sets_ca_location() {
+        let config = Config::from_ado_string(
+            "server=tcp:localhost,1433;TrustServerCertificateCA=/tmp/ca.pem",
+        )
+        .unwrap();
+
+        match &config.trust {
+            TrustConfig::CaCertificateLocation(path) => {
+                assert_eq!(path, &PathBuf::from("/tmp/ca.pem"));
+            }
+            other => panic!("expected CaCertificateLocation, got {other:?}"),
+        }
     }
 }

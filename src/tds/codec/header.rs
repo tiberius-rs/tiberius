@@ -86,7 +86,8 @@ impl PacketHeader {
 
     pub fn login(id: u8) -> Self {
         Self {
-            ty: PacketType::TDSv7Login,
+            // `ty` is inherited from `new()`, which already defaults to
+            // `TDSv7Login`; only the status differs here.
             status: PacketStatus::EndOfMessage,
             ..Self::new(0, id)
         }
@@ -114,6 +115,26 @@ impl PacketHeader {
         Self {
             ty: PacketType::BulkLoad,
             status: PacketStatus::NormalMessage,
+            ..Self::new(0, id)
+        }
+    }
+
+    /// A client-to-server Attention Signal packet (packet type `0x06`,
+    /// MS-TDS section 2.2.1.6). The message carries no payload, so it is
+    /// always a single, end-of-message packet used to request cancellation
+    /// of the request currently in flight on the connection.
+    pub fn attention(id: u8) -> Self {
+        Self {
+            ty: PacketType::AttentionSignal,
+            status: PacketStatus::EndOfMessage,
+            ..Self::new(0, id)
+        }
+    }
+
+    pub fn transaction_manager(id: u8) -> Self {
+        Self {
+            ty: PacketType::TransactionManagerReq,
+            status: PacketStatus::EndOfMessage,
             ..Self::new(0, id)
         }
     }
@@ -184,5 +205,160 @@ impl Decode<BytesMut> for PacketHeader {
         };
 
         Ok(header)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::codec::Packet;
+
+    #[test]
+    fn attention_packet_header_fields() {
+        let header = PacketHeader::attention(42);
+
+        assert_eq!(header.r#type() as u8, PacketType::AttentionSignal as u8);
+        assert_eq!(header.r#type() as u8, 0x06);
+        // An attention message is always a single end-of-message packet.
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+    }
+
+    #[test]
+    fn attention_packet_header_encodes_to_eight_bytes() {
+        let header = PacketHeader::attention(42);
+
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf).unwrap();
+
+        // 8-byte fixed header, no payload.
+        assert_eq!(buf.len(), 8);
+        assert_eq!(
+            &buf[..],
+            &[
+                0x06, // type: attention signal
+                0x01, // status: end of message
+                0x00, 0x00, // length (patched by Packet::encode)
+                0x00, 0x00, // spid
+                42,   // packet id
+                0x00, // window
+            ]
+        );
+    }
+
+    #[test]
+    fn attention_packet_encodes_with_length_of_header() {
+        // A full attention packet has an empty payload, so the wire length
+        // is exactly the 8 header bytes.
+        let packet = Packet::new(PacketHeader::attention(1), BytesMut::new());
+
+        let mut buf = BytesMut::new();
+        packet.encode(&mut buf).unwrap();
+
+        assert_eq!(&buf[..], &[0x06, 0x01, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn new_sets_login_type_and_reset_connection_status() {
+        let header = PacketHeader::new(123, 5);
+
+        assert_eq!(header.r#type() as u8, PacketType::TDSv7Login as u8);
+        assert_eq!(header.status(), PacketStatus::ResetConnection);
+        assert_eq!(header.length(), 123);
+    }
+
+    #[test]
+    #[should_panic]
+    fn new_panics_on_length_overflow() {
+        PacketHeader::new(usize::from(u16::MAX) + 1, 0);
+    }
+
+    #[test]
+    fn rpc_header_type_and_status() {
+        let header = PacketHeader::rpc(7);
+        assert_eq!(header.r#type() as u8, PacketType::Rpc as u8);
+        assert_eq!(header.status(), PacketStatus::NormalMessage);
+    }
+
+    #[test]
+    fn pre_login_header_type_and_status() {
+        let header = PacketHeader::pre_login(7);
+        assert_eq!(header.r#type() as u8, PacketType::PreLogin as u8);
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+    }
+
+    #[test]
+    fn login_header_type_and_status() {
+        let header = PacketHeader::login(7);
+        assert_eq!(header.r#type() as u8, PacketType::TDSv7Login as u8);
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+    }
+
+    #[test]
+    fn sspi_header_type_and_status() {
+        let header = PacketHeader::sspi(7);
+        // Both fields differ from the `PacketHeader::new` defaults
+        // (TDSv7Login / ResetConnection), so a deleted field would be caught.
+        assert_eq!(header.r#type() as u8, PacketType::Sspi as u8);
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+    }
+
+    #[test]
+    fn batch_header_type_and_status() {
+        let header = PacketHeader::batch(7);
+        assert_eq!(header.r#type() as u8, PacketType::SQLBatch as u8);
+        assert_eq!(header.status(), PacketStatus::NormalMessage);
+    }
+
+    #[test]
+    fn bulk_load_header_type_and_status() {
+        let header = PacketHeader::bulk_load(7);
+        assert_eq!(header.r#type() as u8, PacketType::BulkLoad as u8);
+        assert_eq!(header.status(), PacketStatus::NormalMessage);
+    }
+
+    #[test]
+    fn transaction_manager_header_type_and_status() {
+        let header = PacketHeader::transaction_manager(7);
+        assert_eq!(
+            header.r#type() as u8,
+            PacketType::TransactionManagerReq as u8
+        );
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+    }
+
+    #[test]
+    fn set_status_mutates_header() {
+        let mut header = PacketHeader::batch(1);
+        assert_eq!(header.status(), PacketStatus::NormalMessage);
+
+        header.set_status(PacketStatus::IgnoreEvent);
+        assert_eq!(header.status(), PacketStatus::IgnoreEvent);
+    }
+
+    #[test]
+    fn decode_round_trips_header_fields() {
+        let header = PacketHeader::rpc(9);
+
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf).unwrap();
+
+        let decoded = PacketHeader::decode(&mut buf).unwrap();
+        assert_eq!(decoded.r#type() as u8, PacketType::Rpc as u8);
+        assert_eq!(decoded.status(), PacketStatus::NormalMessage);
+        assert_eq!(decoded.length(), 0);
+    }
+
+    #[test]
+    fn decode_invalid_packet_type_errors() {
+        let mut buf = BytesMut::from(&[0xffu8, 0x01, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00][..]);
+        let err = PacketHeader::decode(&mut buf).unwrap_err();
+        assert!(format!("{}", err).contains("invalid packet type"));
+    }
+
+    #[test]
+    fn decode_invalid_packet_status_errors() {
+        let mut buf = BytesMut::from(&[0x01u8, 0xff, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00][..]);
+        let err = PacketHeader::decode(&mut buf).unwrap_err();
+        assert!(format!("{}", err).contains("invalid packet status"));
     }
 }
