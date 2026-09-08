@@ -14,7 +14,7 @@ uint_enum! {
         /// the format of the following `ALTROW` data streams.
         AltMetaData = 0x88,
 
-        /// Describes the result setfor interpretation of following ROW data
+        /// Describes the result set for interpretation of following ROW data
         /// streams
         ColMetaData = 0x81,
 
@@ -35,7 +35,7 @@ uint_enum! {
         /// whose entries reference the tables carried here by index.
         TabName = 0xA4,
 
-        /// Used to send the return value of an RPCto the client. When an RPC is
+        /// Used to send the return value of an RPC to the client. When an RPC is
         /// executed, the associated parameters may be defined as input or
         /// output (or "return") parameters.
         ///
@@ -104,5 +104,52 @@ uint_enum! {
         /// are defined in FeatureExt. The token stream is sent only along with the LOGINACK
         /// in a Login Response message.
         FeatureExtAck = 0xAE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenType;
+    use std::convert::TryFrom;
+
+    #[test]
+    fn known_values_map_to_variants() {
+        let cases: &[(u8, TokenType)] = &[
+            (0x79, TokenType::ReturnStatus),
+            (0x88, TokenType::AltMetaData),
+            (0x81, TokenType::ColMetaData),
+            (0xAA, TokenType::Error),
+            (0xAB, TokenType::Info),
+            (0xA9, TokenType::Order),
+            (0xA5, TokenType::ColInfo),
+            (0xA4, TokenType::TabName),
+            (0xAC, TokenType::ReturnValue),
+            (0xAD, TokenType::LoginAck),
+            (0xD1, TokenType::Row),
+            (0xD2, TokenType::NbcRow),
+            (0xD3, TokenType::AltRow),
+            (0xED, TokenType::Sspi),
+            (0xE4, TokenType::SessionState),
+            (0xEE, TokenType::FedAuthInfo),
+            (0xE3, TokenType::EnvChange),
+            (0xFD, TokenType::Done),
+            (0xFE, TokenType::DoneProc),
+            (0xFF, TokenType::DoneInProc),
+            (0xAE, TokenType::FeatureExtAck),
+        ];
+
+        for &(byte, variant) in cases {
+            // Byte -> variant.
+            assert_eq!(TokenType::try_from(byte).unwrap(), variant);
+            // Round-trip: variant -> byte -> variant.
+            assert_eq!(variant as u8, byte);
+            assert_eq!(TokenType::try_from(variant as u8).unwrap(), variant);
+        }
+    }
+
+    #[test]
+    fn unknown_byte_is_rejected() {
+        // 0x00 is not a defined token type.
+        assert!(TokenType::try_from(0x00u8).is_err());
     }
 }

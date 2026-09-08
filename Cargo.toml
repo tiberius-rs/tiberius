@@ -8,6 +8,7 @@ authors = [
 description = "A TDS (MSSQL) driver"
 documentation = "https://docs.rs/tiberius/"
 edition = "2021"
+rust-version = "1.88"
 keywords = ["tds", "mssql", "sql"]
 license = "MIT/Apache-2.0"
 name = "tiberius"

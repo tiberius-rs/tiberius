@@ -509,4 +509,196 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].len(), 2);
     }
+
+    #[tokio::test]
+    async fn single_metadata_with_rows_yields_one_result_set_of_n_rows() {
+        // One metadata item followed by N rows must collapse into exactly one
+        // result set holding all N rows.
+        let cols = columns();
+        let results = collect(vec![
+            meta(&cols, 0),
+            row(&cols, 0),
+            row(&cols, 0),
+            row(&cols, 0),
+        ])
+        .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].len(), 3);
+    }
+
+    #[tokio::test]
+    async fn collect_propagates_errors() {
+        // An error partway through the stream must surface rather than be
+        // silently swallowed by the collection loop.
+        let cols = columns();
+        let items = vec![
+            Ok(meta(&cols, 0)),
+            Ok(row(&cols, 0)),
+            Err(crate::Error::Protocol("boom".into())),
+        ];
+        let stream = stream::iter(items);
+        let err = collect_results(stream).await.expect_err("expected error");
+        assert!(matches!(err, crate::Error::Protocol(_)));
+    }
+
+    // --- QueryItem accessor helpers -------------------------------------
+
+    #[test]
+    fn query_item_accessors_on_metadata() {
+        let cols = columns();
+        let item = meta(&cols, 7);
+
+        assert!(item.as_metadata().is_some());
+        assert!(item.as_row().is_none());
+        assert_eq!(item.as_metadata().unwrap().result_index(), 7);
+
+        let md = item.into_metadata().expect("metadata");
+        assert_eq!(md.result_index(), 7);
+        assert_eq!(md.columns().len(), 1);
+    }
+
+    #[test]
+    fn query_item_accessors_on_row() {
+        let cols = columns();
+        let item = row(&cols, 3);
+
+        assert!(item.as_row().is_some());
+        assert!(item.as_metadata().is_none());
+        assert_eq!(item.as_row().unwrap().result_index, 3);
+
+        let r = item.into_row().expect("row");
+        assert_eq!(r.result_index, 3);
+    }
+
+    #[test]
+    fn query_item_into_wrong_variant_is_none() {
+        let cols = columns();
+        assert!(meta(&cols, 0).into_row().is_none());
+        assert!(row(&cols, 0).into_metadata().is_none());
+    }
+
+    // --- Full QueryStream state machine (poll_next + into_* helpers) -----
+    //
+    // These build a `QueryStream` from an in-memory stream of `ReceivedToken`s
+    // (no server), exercising `poll_next` (result-set indexing, the
+    // ROW-before-metadata guard) and the `into_results`/`into_first_result`/
+    // `into_row`/`into_row_stream` helpers end to end.
+
+    use crate::tds::codec::{
+        BaseMetaDataColumn, FixedLenType, MetaDataColumn, TokenColMetaData, TypeInfo,
+    };
+    use crate::tds::stream::ReceivedToken;
+    use futures_util::stream::{StreamExt, TryStreamExt};
+    use std::borrow::Cow;
+
+    fn token_meta(name: &'static str) -> ReceivedToken {
+        let col = MetaDataColumn {
+            base: BaseMetaDataColumn {
+                flags: enumflags2::BitFlags::empty(),
+                ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                table_name: None,
+            },
+            col_name: Cow::Borrowed(name),
+        };
+        ReceivedToken::NewResultset(Arc::new(TokenColMetaData { columns: vec![col] }))
+    }
+
+    fn token_row() -> ReceivedToken {
+        ReceivedToken::Row(TokenRow::new())
+    }
+
+    fn query_stream(tokens: Vec<ReceivedToken>) -> QueryStream<'static> {
+        let s = stream::iter(tokens.into_iter().map(Ok::<_, crate::Error>));
+        QueryStream::new(s.boxed())
+    }
+
+    #[tokio::test]
+    async fn query_stream_into_results_groups_and_indexes_result_sets() {
+        let stream = query_stream(vec![
+            token_meta("first"),
+            token_row(),
+            token_row(),
+            token_meta("second"),
+            token_row(),
+        ]);
+
+        let results = stream.into_results().await.expect("into_results");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].len(), 2);
+        assert_eq!(results[1].len(), 1);
+
+        // result_index must increment across result sets.
+        assert!(results[0].iter().all(|r| r.result_index == 0));
+        assert!(results[1].iter().all(|r| r.result_index == 1));
+    }
+
+    #[tokio::test]
+    async fn query_stream_empty_yields_no_results() {
+        let results = query_stream(vec![]).into_results().await.expect("empty");
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_stream_metadata_only_yields_one_empty_result_set() {
+        let results = query_stream(vec![token_meta("first")])
+            .into_results()
+            .await
+            .expect("metadata only");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_stream_row_before_metadata_is_protocol_error() {
+        // The rewritten poll_next must reject a ROW token that arrives before
+        // any column metadata rather than panic or silently drop it.
+        let err = query_stream(vec![token_row()])
+            .into_results()
+            .await
+            .expect_err("expected protocol error");
+        assert!(matches!(err, crate::Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn query_stream_into_first_result_and_into_row() {
+        let first = query_stream(vec![
+            token_meta("first"),
+            token_row(),
+            token_row(),
+            token_meta("second"),
+            token_row(),
+        ])
+        .into_first_result()
+        .await
+        .expect("into_first_result");
+        assert_eq!(first.len(), 2);
+
+        let one = query_stream(vec![token_meta("first"), token_row(), token_row()])
+            .into_row()
+            .await
+            .expect("into_row");
+        assert!(one.is_some());
+
+        let none = query_stream(vec![token_meta("first")])
+            .into_row()
+            .await
+            .expect("into_row empty");
+        assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn query_stream_into_row_stream_skips_metadata() {
+        let rows: Vec<Row> = query_stream(vec![
+            token_meta("first"),
+            token_row(),
+            token_meta("second"),
+            token_row(),
+            token_row(),
+        ])
+        .into_row_stream()
+        .try_collect()
+        .await
+        .expect("into_row_stream");
+        assert_eq!(rows.len(), 3);
+    }
 }

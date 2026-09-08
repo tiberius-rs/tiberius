@@ -1,5 +1,5 @@
 use super::TypeInfoTvp;
-use super::{AllHeaderTy, Encode, ALL_HEADERS_LEN_TX};
+use super::{encode_all_headers_tx, encode_b_varchar, Encode};
 use crate::{tds::codec::ColumnData, BytesMutWithTypeInfo, Result};
 use bytes::{BufMut, BytesMut};
 use enumflags2::{bitflags, BitFlags};
@@ -104,11 +104,7 @@ impl<'a> From<RpcProcId> for RpcProcIdValue<'a> {
 
 impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
     fn encode(self, dst: &mut BytesMut) -> Result<()> {
-        dst.put_u32_le(ALL_HEADERS_LEN_TX as u32);
-        dst.put_u32_le(ALL_HEADERS_LEN_TX as u32 - 4);
-        dst.put_u16_le(AllHeaderTy::TransactionDescriptor as u16);
-        dst.put_slice(&self.transaction_desc);
-        dst.put_u32_le(1);
+        encode_all_headers_tx(dst, self.transaction_desc);
 
         match self.proc_id {
             RpcProcIdValue::Id(ref id) => {
@@ -157,15 +153,9 @@ impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
 
 impl<'a> Encode<BytesMut> for RpcParam<'a> {
     fn encode(self, dst: &mut BytesMut) -> Result<()> {
-        let len_pos = dst.len();
-        let mut length = 0u8;
-
-        dst.put_u8(length);
-
-        for codepoint in self.name.encode_utf16() {
-            length += 1;
-            dst.put_u16_le(codepoint);
-        }
+        // ParamName is a B_VARCHAR (u8 code-unit count); reject an over-long
+        // name rather than wrap the counter and desync the wire.
+        encode_b_varchar(dst, &self.name)?;
 
         dst.put_u8(self.flags.bits());
 
@@ -177,15 +167,13 @@ impl<'a> Encode<BytesMut> for RpcParam<'a> {
             RpcValue::Table(value) => value.encode(dst)?,
         }
 
-        let dst: &mut [u8] = dst.borrow_mut();
-        dst[len_pos] = length;
-
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::ALL_HEADERS_LEN_TX;
     use super::*;
     use crate::tds::codec::ColumnData;
 
@@ -283,5 +271,36 @@ mod tests {
         let mut buf = BytesMut::new();
         let err = req.encode(&mut buf).unwrap_err();
         assert!(matches!(err, crate::Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A param name is a B_VARCHAR (u8 length); a name longer than 255 UTF-16 code
+    // units must error rather than wrap the counter and desync the wire.
+    #[test]
+    fn rejects_over_long_param_name() {
+        let param = RpcParam {
+            name: Cow::Owned("@".to_string() + &"a".repeat(255)),
+            flags: BitFlags::empty(),
+            value: scalar(ColumnData::I32(Some(1))),
+        };
+
+        let mut buf = BytesMut::new();
+        let err = param.encode(&mut buf).unwrap_err();
+        assert!(matches!(err, crate::Error::Protocol(_)), "got {err:?}");
+    }
+
+    // A param name of exactly 255 units is the boundary and must still encode,
+    // writing the correct u8 length prefix.
+    #[test]
+    fn encodes_max_length_param_name() {
+        let name = "a".repeat(255);
+        let param = RpcParam {
+            name: Cow::Owned(name.clone()),
+            flags: BitFlags::empty(),
+            value: scalar(ColumnData::I32(Some(1))),
+        };
+
+        let mut buf = BytesMut::new();
+        param.encode(&mut buf).expect("255-unit name must encode");
+        assert_eq!(buf[0], 255);
     }
 }

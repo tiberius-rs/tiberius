@@ -69,8 +69,18 @@ fn from_sec_fragments(sec_fragments: i64) -> NaiveTime {
 
 #[inline]
 #[cfg(feature = "tds73")]
-fn from_mins(mins: u32) -> NaiveTime {
-    NaiveTime::from_num_seconds_from_midnight_opt(mins, 0).unwrap()
+fn from_mins(mins: u32) -> crate::Result<NaiveTime> {
+    // `mins` is the seconds-from-midnight value derived from a `SmallDateTime`
+    // minute field (`seconds_fragments * 60`). A valid minute field is
+    // 0..=1439, so a valid `mins` is < 86400; a hostile/buggy server can send a
+    // larger `u16` whose seconds overflow the day and make
+    // `from_num_seconds_from_midnight_opt` return `None`. Reject it as a
+    // protocol error rather than panicking on the `unwrap`.
+    NaiveTime::from_num_seconds_from_midnight_opt(mins, 0).ok_or_else(|| {
+        crate::Error::Protocol(
+            format!("smalldatetime seconds-of-day {mins} is out of range").into(),
+        )
+    })
 }
 
 #[inline]
@@ -95,7 +105,7 @@ from_sql!(
         ColumnData::SmallDateTime(ref dt) => match *dt {
             Some(dt) => Some(NaiveDateTime::new(
                 from_days(dt.days as i64, 1900)?,
-                from_mins(dt.seconds_fragments as u32 * 60),
+                from_mins(dt.seconds_fragments as u32 * 60)?,
             )),
             None => None,
         },
@@ -179,7 +189,7 @@ from_sql!(
 
 #[cfg(feature = "tds73")]
 to_sql!(self_,
-        NaiveDate: (ColumnData::Date, Date::new(to_days(*self_, 1) as u32));
+        NaiveDate: (ColumnData::Date, Date::new_unchecked(to_days(*self_, 1) as u32));
         NaiveTime: (ColumnData::Time, {
             use chrono::Timelike;
 
@@ -195,7 +205,7 @@ to_sql!(self_,
             let nanos = time.num_seconds_from_midnight() as u64 * 1e9 as u64 + time.nanosecond() as u64;
             let increments = nanos / 100;
 
-            let date = Date::new(to_days(self_.date(), 1) as u32);
+            let date = Date::new_unchecked(to_days(self_.date(), 1) as u32);
             let time = Time {increments, scale: 7};
 
             DateTime2::new(date, time)
@@ -207,7 +217,7 @@ to_sql!(self_,
             let time = naive.time();
             let nanos = time.num_seconds_from_midnight() as u64 * 1e9 as u64 + time.nanosecond() as u64;
 
-            let date = Date::new(to_days(naive.date(), 1) as u32);
+            let date = Date::new_unchecked(to_days(naive.date(), 1) as u32);
             let time = Time {increments: nanos / 100, scale: 7};
 
             DateTime2::new(date, time)
@@ -219,7 +229,7 @@ to_sql!(self_,
             let time = naive.time();
             let nanos = time.num_seconds_from_midnight() as u64 * 1e9 as u64 + time.nanosecond() as u64;
 
-            let date = Date::new(to_days(naive.date(), 1) as u32);
+            let date = Date::new_unchecked(to_days(naive.date(), 1) as u32);
             let time = Time { increments: nanos / 100, scale: 7 };
 
             let tz = self_.timezone();
@@ -231,7 +241,7 @@ to_sql!(self_,
 
 #[cfg(feature = "tds73")]
 into_sql!(self_,
-        NaiveDate: (ColumnData::Date, Date::new(to_days(self_, 1) as u32));
+        NaiveDate: (ColumnData::Date, Date::new_unchecked(to_days(self_, 1) as u32));
         NaiveTime: (ColumnData::Time, {
             use chrono::Timelike;
 
@@ -247,7 +257,7 @@ into_sql!(self_,
             let nanos = time.num_seconds_from_midnight() as u64 * 1e9 as u64 + time.nanosecond() as u64;
             let increments = nanos / 100;
 
-            let date = Date::new(to_days(self_.date(), 1) as u32);
+            let date = Date::new_unchecked(to_days(self_.date(), 1) as u32);
             let time = Time {increments, scale: 7};
 
             DateTime2::new(date, time)
@@ -259,7 +269,7 @@ into_sql!(self_,
             let time = naive.time();
             let nanos = time.num_seconds_from_midnight() as u64 * 1e9 as u64 + time.nanosecond() as u64;
 
-            let date = Date::new(to_days(naive.date(), 1) as u32);
+            let date = Date::new_unchecked(to_days(naive.date(), 1) as u32);
             let time = Time {increments: nanos / 100, scale: 7};
 
             DateTime2::new(date, time)
@@ -271,7 +281,7 @@ into_sql!(self_,
             let time = naive.time();
             let nanos = time.num_seconds_from_midnight() as u64 * 1e9 as u64 + time.nanosecond() as u64;
 
-            let date = Date::new(to_days(naive.date(), 1) as u32);
+            let date = Date::new_unchecked(to_days(naive.date(), 1) as u32);
             let time = Time { increments: nanos / 100, scale: 7 };
 
             let tz = self_.timezone();
@@ -398,7 +408,36 @@ mod tests {
     #[test]
     fn from_mins_converts() {
         // `from_mins` takes seconds-from-midnight; 3600 s == 01:00:00.
-        assert_eq!(from_mins(3600), NaiveTime::from_hms_opt(1, 0, 0).unwrap());
+        assert_eq!(
+            from_mins(3600).unwrap(),
+            NaiveTime::from_hms_opt(1, 0, 0).unwrap()
+        );
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn smalldatetime_out_of_range_minute_field_errors() {
+        // A `SmallDateTime` minute field is spec'd 0..=1439. A hostile/buggy
+        // server can send a larger `u16`; `seconds_fragments * 60` then
+        // overflows the day and previously panicked on the `unwrap` inside
+        // `from_mins`. It must now surface as a protocol error, and a valid
+        // value must still decode.
+        for minute_field in [1440u16, 65535] {
+            let sdt = crate::tds::time::SmallDateTime::new(0, minute_field);
+            let data = ColumnData::SmallDateTime(Some(sdt));
+            let err = NaiveDateTime::from_sql(&data)
+                .expect_err("out-of-range minute field must error, not panic");
+            assert!(
+                matches!(err, crate::Error::Protocol(_)),
+                "expected a protocol error, got {err:?}"
+            );
+        }
+
+        // 1439 (the maximum valid minute-of-day) still decodes to 23:59:00.
+        let sdt = crate::tds::time::SmallDateTime::new(0, 1439);
+        let data = ColumnData::SmallDateTime(Some(sdt));
+        let decoded = NaiveDateTime::from_sql(&data).unwrap().unwrap();
+        assert_eq!(decoded.time(), NaiveTime::from_hms_opt(23, 59, 0).unwrap());
     }
 
     #[cfg(not(feature = "tds73"))]
@@ -505,6 +544,52 @@ mod tests {
 
         let utc = chrono::DateTime::<Utc>::from_sql(&cd).unwrap();
         assert!(utc.is_some());
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn out_of_range_naivedate_errors_at_encode_not_panic() {
+        use crate::tds::codec::Encode;
+        use bytes::BytesMut;
+
+        // A `NaiveDate` legal for chrono but far outside SQL Server's 3-byte day
+        // range. The conversion (`into_sql`) must not panic; the out-of-range
+        // value must instead surface as a `Result::Err` at encode time.
+        let d = NaiveDate::from_ymd_opt(100_000, 1, 1).unwrap();
+        let cd: ColumnData<'static> = d.into_sql();
+        match cd {
+            ColumnData::Date(Some(date)) => {
+                let mut buf = BytesMut::new();
+                assert!(
+                    date.encode(&mut buf).is_err(),
+                    "out-of-range date must error at encode, not silently truncate"
+                );
+            }
+            other => panic!("expected ColumnData::Date, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn out_of_range_naivedatetime_errors_at_encode_not_panic() {
+        use crate::tds::codec::Encode;
+        use bytes::BytesMut;
+
+        let dt = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(100_000, 1, 1).unwrap(),
+            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        );
+        let cd: ColumnData<'static> = dt.into_sql();
+        match cd {
+            ColumnData::DateTime2(Some(dt2)) => {
+                let mut buf = BytesMut::new();
+                assert!(
+                    dt2.encode(&mut buf).is_err(),
+                    "out-of-range datetime2 must error at encode, not silently truncate"
+                );
+            }
+            other => panic!("expected ColumnData::DateTime2, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "tds73")]

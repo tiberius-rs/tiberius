@@ -64,8 +64,19 @@ fn nanos_from_increments(increments: u64, scale: u8) -> u64 {
 
 #[inline]
 #[cfg(feature = "tds73")]
-fn from_secs(secs: u64) -> Time {
-    Time::from_hms(0, 0, 0).unwrap() + Duration::from_secs(secs)
+fn from_secs(secs: u64) -> crate::Result<Time> {
+    // `secs` is the seconds-from-midnight value derived from a `SmallDateTime`
+    // minute field (`seconds_fragments * 60`). A valid minute field is
+    // 0..=1439, so a valid `secs` is < 86400. `time::Time + Duration` wraps
+    // around midnight, so an out-of-range (hostile/buggy) value would silently
+    // decode to a wrong wall-clock time; reject it as a protocol error instead.
+    if secs >= 86_400 {
+        return Err(crate::Error::Protocol(
+            format!("smalldatetime seconds-of-day {secs} is out of range").into(),
+        ));
+    }
+
+    Ok(Time::from_hms(0, 0, 0).unwrap() + Duration::from_secs(secs))
 }
 
 #[inline]
@@ -95,7 +106,7 @@ from_sql!(
         ColumnData::SmallDateTime(ref dt) => match *dt {
             Some(dt) => Some(PrimitiveDateTime::new(
                 from_days(dt.days as i64, 1900)?,
-                from_secs(dt.seconds_fragments as u64 * 60),
+                from_secs(dt.seconds_fragments as u64 * 60)?,
             )),
             None => None,
         },
@@ -322,7 +333,35 @@ mod tests {
     #[test]
     fn from_secs_converts() {
         // 3600 s past midnight == 01:00:00 (pins the `+` in `from_secs`).
-        assert_eq!(from_secs(3600), Time::from_hms(1, 0, 0).unwrap());
+        assert_eq!(from_secs(3600).unwrap(), Time::from_hms(1, 0, 0).unwrap());
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn smalldatetime_out_of_range_minute_field_errors() {
+        use crate::FromSql;
+
+        // A `SmallDateTime` minute field is spec'd 0..=1439. A hostile/buggy
+        // server can send a larger `u16`; `seconds_fragments * 60` then exceeds
+        // a day. `time::Time + Duration` wraps silently, so without validation
+        // the value would decode to a wrong wall-clock time. It must instead
+        // surface as a protocol error.
+        for minute_field in [1440u16, 65535] {
+            let sdt = crate::tds::time::SmallDateTime::new(0, minute_field);
+            let data = ColumnData::SmallDateTime(Some(sdt));
+            let err = PrimitiveDateTime::from_sql(&data)
+                .expect_err("out-of-range minute field must error, not wrap");
+            assert!(
+                matches!(err, crate::Error::Protocol(_)),
+                "expected a protocol error, got {err:?}"
+            );
+        }
+
+        // 1439 (the maximum valid minute-of-day) still decodes to 23:59:00.
+        let sdt = crate::tds::time::SmallDateTime::new(0, 1439);
+        let data = ColumnData::SmallDateTime(Some(sdt));
+        let decoded = PrimitiveDateTime::from_sql(&data).unwrap().unwrap();
+        assert_eq!(decoded.time(), Time::from_hms(23, 59, 0).unwrap());
     }
 
     #[test]
