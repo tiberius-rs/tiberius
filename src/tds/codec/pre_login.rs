@@ -311,7 +311,7 @@ mod tests {
 
         match result {
             Err(Error::Protocol(_)) => {}
-            other => panic!("expected Err(Error::Protocol), got {:?}", other),
+            other => panic!("expected Err(Error::Protocol), got {other:?}"),
         }
 
         // A matching, valid negotiation still succeeds.

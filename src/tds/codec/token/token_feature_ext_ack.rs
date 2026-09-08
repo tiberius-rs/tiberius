@@ -81,7 +81,7 @@ mod tests {
             Error::Protocol(msg) => {
                 assert!(msg.to_string().contains("invalid data length"));
             }
-            other => panic!("expected Error::Protocol, got {:?}", other),
+            other => panic!("expected Error::Protocol, got {other:?}"),
         }
     }
 
@@ -98,7 +98,7 @@ mod tests {
             Error::Protocol(msg) => {
                 assert!(msg.to_string().contains("unsupported feature"));
             }
-            other => panic!("expected Error::Protocol, got {:?}", other),
+            other => panic!("expected Error::Protocol, got {other:?}"),
         }
     }
 }

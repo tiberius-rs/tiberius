@@ -45,7 +45,7 @@ mod tests {
             Error::Protocol(msg) => {
                 assert!(msg.to_string().contains("invalid integer length"));
             }
-            other => panic!("expected Error::Protocol, got {:?}", other),
+            other => panic!("expected Error::Protocol, got {other:?}"),
         }
     }
 }

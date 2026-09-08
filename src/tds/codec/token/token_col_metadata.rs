@@ -429,6 +429,7 @@ impl BaseMetaDataColumn {
 mod tests {
     use super::*;
     use crate::tds::codec::type_info::VarLenContext;
+    use std::fmt::Write as _;
 
     // Build the on-wire bytes a US_VARCHAR should produce for `s`.
     fn us_varchar_bytes(s: &str) -> Vec<u8> {
@@ -532,8 +533,6 @@ mod tests {
 
     #[test]
     fn display_var_len_unknown_type_yields_err_not_panic() {
-        use std::fmt::Write as _;
-
         // A VarLenSized carrying a type with no valid sized SQL representation
         // (e.g. Decimaln/Numericn without precision/scale) must NOT panic and
         // must NOT emit a bogus SQL type name. Formatting it returns a
