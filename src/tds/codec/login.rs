@@ -425,11 +425,26 @@ impl<'a> LoginMessage<'a> {
 
             cursor.write_u8(FEA_EXT_FEDAUTH)?;
 
-            let mut token = Cursor::new(Vec::new());
+            // SECURITY (fed-auth token): the token is a bearer credential. Like
+            // the password buffer above, reserve its exact final size up front
+            // (one UTF-16 code unit is 2 bytes) so this temporary buffer never
+            // reallocates while holding the token — a realloc would free the old
+            // allocation without zeroizing it, leaking a recoverable copy. It is
+            // wrapped in `Zeroizing` so it is wiped on drop as well.
+            let token_capacity = fed_auth_ext.fed_auth_token.encode_utf16().count() * 2;
+            let mut token = Cursor::new(Vec::with_capacity(token_capacity));
             for codepoint in fed_auth_ext.fed_auth_token.encode_utf16() {
                 token.write_u16::<LittleEndian>(codepoint)?;
             }
-            let mut token = token.into_inner();
+            // Wrap in `Zeroizing` so the finished token buffer is also wiped on
+            // drop. (`Cursor` cannot be built over a `Zeroizing` inner because
+            // `Write` is only implemented for a fixed set of inner types.)
+            let mut token = Zeroizing::new(token.into_inner());
+            debug_assert_eq!(
+                token.capacity(),
+                token_capacity,
+                "fed-auth token buffer reallocated: a copy may remain in freed heap"
+            );
 
             // options (1) + TokenLength(4) + Token.length + nonce.length
             let feature_ext_length =
@@ -796,6 +811,37 @@ mod tests {
         let mut buf = BytesMut::from(&encoded[..]);
         let decoded = LoginMessage::decode(&mut buf).expect("decode should succeed");
         assert_eq!(login, decoded);
+    }
+
+    #[test]
+    fn fed_auth_token_encode_path_produces_correct_output() {
+        // Exercises the fed-auth token buffer specifically: a non-empty token
+        // and nonce force the `encode_to_vec` fed-auth branch to build and copy
+        // the token temp buffer (whose capacity==len invariant is checked by an
+        // internal debug_assert, so this test would panic on realloc). Assert
+        // the encoded bytes decode back to exactly the token/echo/nonce we set.
+        let token = "a-fake-security-token-value";
+        let nonce = [9u8; 32];
+
+        let mut login = LoginMessage::new();
+        login.password("hunter2");
+        login.aad_token(token, true, Some(nonce));
+
+        let expected_len = login.encoded_len();
+        let encoded = login.encode_to_vec().expect("encode should succeed");
+        assert_eq!(
+            encoded.len(),
+            expected_len,
+            "fed-auth login buffer must be exactly encoded_len() bytes (no realloc)"
+        );
+
+        let mut buf = BytesMut::from(&encoded[..]);
+        let decoded = LoginMessage::decode(&mut buf).expect("decode should succeed");
+
+        let ext = decoded.fed_auth_ext.expect("fed_auth_ext must be present");
+        assert_eq!(ext.fed_auth_token, Cow::Borrowed(token));
+        assert!(ext.fed_auth_echo);
+        assert_eq!(ext.nonce, Some(nonce));
     }
 
     #[test]
