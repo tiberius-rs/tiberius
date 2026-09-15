@@ -92,8 +92,10 @@ impl PacketHeader {
         }
     }
 
-    // Used only on winauth / integrated-auth-gssapi builds.
-    #[allow(dead_code)]
+    // Only the Windows integrated-auth (winauth) login path sends a standalone
+    // SSPI packet; every other auth path (including unix GSSAPI) wraps the token
+    // in a login packet. Gate the constructor so it compiles only there.
+    #[cfg(all(windows, feature = "winauth"))]
     pub fn sspi(id: u8) -> Self {
         Self {
             ty: PacketType::Sspi,
@@ -184,5 +186,238 @@ impl Decode<BytesMut> for PacketHeader {
         };
 
         Ok(header)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    // --- constructors -----------------------------------------------------
+
+    #[test]
+    fn new_sets_defaults() {
+        let header = PacketHeader::new(42, 7);
+        assert_eq!(header.ty, PacketType::TDSv7Login);
+        assert_eq!(header.status, PacketStatus::ResetConnection);
+        assert_eq!(header.length, 42);
+        assert_eq!(header.length(), 42);
+        assert_eq!(header.id, 7);
+        assert_eq!(header.spid, 0);
+        assert_eq!(header.window, 0);
+    }
+
+    #[test]
+    fn new_accepts_max_length() {
+        let header = PacketHeader::new(u16::MAX as usize, 0);
+        assert_eq!(header.length, u16::MAX);
+    }
+
+    #[test]
+    #[should_panic]
+    fn new_rejects_oversized_length() {
+        let _ = PacketHeader::new(u16::MAX as usize + 1, 0);
+    }
+
+    #[test]
+    fn pre_login_constructor() {
+        let header = PacketHeader::pre_login(1);
+        assert_eq!(header.r#type(), PacketType::PreLogin);
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+        assert_eq!(header.id, 1);
+    }
+
+    #[test]
+    fn login_constructor() {
+        let header = PacketHeader::login(2);
+        assert_eq!(header.r#type(), PacketType::TDSv7Login);
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+        assert_eq!(header.id, 2);
+    }
+
+    #[test]
+    fn rpc_constructor() {
+        let header = PacketHeader::rpc(3);
+        assert_eq!(header.r#type(), PacketType::Rpc);
+        assert_eq!(header.status(), PacketStatus::NormalMessage);
+        assert_eq!(header.id, 3);
+    }
+
+    #[test]
+    fn batch_constructor() {
+        let header = PacketHeader::batch(4);
+        assert_eq!(header.r#type(), PacketType::SQLBatch);
+        assert_eq!(header.status(), PacketStatus::NormalMessage);
+        assert_eq!(header.id, 4);
+    }
+
+    #[test]
+    fn bulk_load_constructor() {
+        let header = PacketHeader::bulk_load(5);
+        assert_eq!(header.r#type(), PacketType::BulkLoad);
+        assert_eq!(header.status(), PacketStatus::NormalMessage);
+        assert_eq!(header.id, 5);
+    }
+
+    // The `sspi` constructor only exists on the Windows integrated-auth path, so
+    // its test must be gated identically to the constructor itself.
+    #[cfg(all(windows, feature = "winauth"))]
+    #[test]
+    fn sspi_constructor() {
+        let header = PacketHeader::sspi(9);
+        assert_eq!(header.r#type(), PacketType::Sspi);
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+        assert_eq!(header.length(), 0);
+        assert_eq!(header.id, 9);
+    }
+
+    // --- mutators ---------------------------------------------------------
+
+    #[test]
+    fn set_status_updates_status() {
+        let mut header = PacketHeader::batch(0);
+        assert_eq!(header.status(), PacketStatus::NormalMessage);
+        header.set_status(PacketStatus::EndOfMessage);
+        assert_eq!(header.status(), PacketStatus::EndOfMessage);
+    }
+
+    #[cfg(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    ))]
+    #[test]
+    fn set_type_updates_type() {
+        let mut header = PacketHeader::login(0);
+        header.set_type(PacketType::PreLogin);
+        assert_eq!(header.r#type(), PacketType::PreLogin);
+    }
+
+    // --- encode / decode round-trips -------------------------------------
+
+    fn round_trip(header: PacketHeader) -> PacketHeader {
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf).expect("encode");
+        // The header is exactly 8 bytes on the wire [2.2.3.1].
+        assert_eq!(buf.len(), 8);
+        PacketHeader::decode(&mut buf).expect("decode")
+    }
+
+    fn assert_same(a: PacketHeader, b: PacketHeader) {
+        assert_eq!(a.ty, b.ty);
+        assert_eq!(a.status, b.status);
+        assert_eq!(a.length, b.length);
+        assert_eq!(a.spid, b.spid);
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.window, b.window);
+    }
+
+    #[test]
+    fn encode_writes_fields_big_endian() {
+        let mut header = PacketHeader::new(0x0102, 0xAB);
+        header.ty = PacketType::PreLogin;
+        header.status = PacketStatus::EndOfMessage;
+        header.spid = 0x0304;
+        header.window = 0xCD;
+
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf).expect("encode");
+
+        assert_eq!(
+            &buf[..],
+            &[
+                PacketType::PreLogin as u8,
+                PacketStatus::EndOfMessage as u8,
+                0x01,
+                0x02, // length, big-endian
+                0x03,
+                0x04, // spid, big-endian
+                0xAB, // id
+                0xCD, // window
+            ]
+        );
+    }
+
+    #[test]
+    fn round_trip_preserves_all_fields() {
+        let mut header = PacketHeader::new(1234, 200);
+        header.ty = PacketType::TabularResult;
+        header.status = PacketStatus::NormalMessage;
+        header.spid = 4321;
+        header.window = 99;
+
+        assert_same(header, round_trip(header));
+    }
+
+    #[test]
+    fn round_trip_preserves_end_of_message_flag() {
+        let decoded = round_trip(PacketHeader::pre_login(1));
+        assert_eq!(decoded.status(), PacketStatus::EndOfMessage);
+        assert_eq!(decoded.r#type(), PacketType::PreLogin);
+    }
+
+    #[test]
+    fn round_trip_all_packet_types() {
+        for ty in [
+            PacketType::SQLBatch,
+            PacketType::Rpc,
+            PacketType::TabularResult,
+            PacketType::AttentionSignal,
+            PacketType::BulkLoad,
+            PacketType::Fat,
+            PacketType::TransactionManagerReq,
+            PacketType::TDSv7Login,
+            PacketType::Sspi,
+            PacketType::PreLogin,
+        ] {
+            let mut header = PacketHeader::new(64, 1);
+            header.ty = ty;
+            assert_eq!(round_trip(header).ty, ty);
+        }
+    }
+
+    #[test]
+    fn round_trip_all_status_flags() {
+        for status in [
+            PacketStatus::NormalMessage,
+            PacketStatus::EndOfMessage,
+            PacketStatus::IgnoreEvent,
+            PacketStatus::ResetConnection,
+            PacketStatus::ResetConnectionSkipTran,
+        ] {
+            let mut header = PacketHeader::new(8, 0);
+            header.status = status;
+            assert_eq!(round_trip(header).status, status);
+        }
+    }
+
+    #[test]
+    fn round_trip_length_boundaries() {
+        for length in [0usize, 1, 8, 255, 256, u16::MAX as usize] {
+            let header = PacketHeader::new(length, 0);
+            assert_eq!(round_trip(header).length(), length as u16);
+        }
+    }
+
+    #[test]
+    fn round_trip_packet_id_range() {
+        for id in [0u8, 1, 127, 128, 254, 255] {
+            let header = PacketHeader::batch(id);
+            assert_eq!(round_trip(header).id, id);
+        }
+    }
+
+    #[test]
+    fn decode_rejects_invalid_packet_type() {
+        let mut buf = BytesMut::from(&[0xFFu8, 1, 0, 8, 0, 0, 0, 0][..]);
+        assert!(PacketHeader::decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_invalid_status() {
+        // 0x02 is not a valid PacketStatus.
+        let mut buf = BytesMut::from(&[PacketType::SQLBatch as u8, 0x02, 0, 8, 0, 0, 0, 0][..]);
+        assert!(PacketHeader::decode(&mut buf).is_err());
     }
 }
