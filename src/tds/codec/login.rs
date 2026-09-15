@@ -290,7 +290,7 @@ impl<'a> LoginMessage<'a> {
         len
     }
 
-    pub(crate) fn encode_to_vec(self) -> crate::Result<Zeroizing<Vec<u8>>> {
+    pub(crate) fn encode_to_vec(self) -> crate::Result<Zeroizing<Box<[u8]>>> {
         // SECURITY (password zeroization): the password is written into this
         // buffer (only lightly obfuscated with a trivially reversible transform)
         // and the returned `Vec` is wrapped in `Zeroizing` so it is wiped on
@@ -469,15 +469,22 @@ impl<'a> LoginMessage<'a> {
              password copy may have been left in freed heap. `encoded_len()` under-reserved."
         );
 
-        Ok(Zeroizing::new(cursor.into_inner()))
+        // The capacity now provably equals the length (asserted above), so
+        // `into_boxed_slice()` will NOT shrink-reallocate — a shrink realloc
+        // would free the current allocation without zeroizing it, leaking the
+        // very password copy this buffer is protecting. Returning a boxed slice
+        // also means the finished buffer can no longer be grown by a caller.
+        Ok(Zeroizing::new(cursor.into_inner().into_boxed_slice()))
     }
 }
 
 impl<'a> Encode<BytesMut> for LoginMessage<'a> {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
-        let mut encoded = self.encode_to_vec()?;
-        dst.extend_from_slice(encoded.as_slice());
-        encoded.zeroize();
+        // `encoded` is `Zeroizing<Box<[u8]>>`; it is wiped on drop at the end of
+        // this function, immediately after the copy into `dst`, so no explicit
+        // `zeroize()` is needed here.
+        let encoded = self.encode_to_vec()?;
+        dst.extend_from_slice(&encoded[..]);
 
         Ok(())
     }
@@ -761,6 +768,34 @@ mod tests {
         let expected = login.encoded_len();
         let encoded = login.encode_to_vec().expect("encode should succeed");
         assert_eq!(encoded.len(), expected);
+    }
+
+    #[test]
+    fn encode_to_vec_returns_exact_len_boxed_slice_that_round_trips() {
+        // The buffer is now a `Box<[u8]>` produced via `into_boxed_slice()` from
+        // a Vec whose len equals its (reserved) capacity, so the boxed slice
+        // must be exactly `encoded_len()` bytes — no shrink-realloc leak — and it
+        // must still decode back into an equivalent message.
+        let mut login = LoginMessage::new();
+        login.db_name("some-database");
+        login.user_name("some-user");
+        login.password("hunter2");
+        login.server_name("some-server");
+
+        let expected_len = login.encoded_len();
+        let encoded: Zeroizing<Box<[u8]>> = login
+            .clone()
+            .encode_to_vec()
+            .expect("encode should succeed");
+        assert_eq!(
+            encoded.len(),
+            expected_len,
+            "boxed login buffer must be exactly encoded_len() bytes (no shrink-realloc)"
+        );
+
+        let mut buf = BytesMut::from(&encoded[..]);
+        let decoded = LoginMessage::decode(&mut buf).expect("decode should succeed");
+        assert_eq!(login, decoded);
     }
 
     #[test]

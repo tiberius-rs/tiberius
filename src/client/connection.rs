@@ -201,7 +201,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     async fn send_sensitive_login(
         &mut self,
         header: PacketHeader,
-        mut payload: Zeroizing<Vec<u8>>,
+        mut payload: Zeroizing<Box<[u8]>>,
     ) -> crate::Result<()> {
         self.flushed = false;
         let packet_size = (self.context.packet_size() as usize) - HEADER_BYTES;
@@ -211,13 +211,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         // loop iteration, so no explicit call is needed there; `payload` is
         // zeroized right after framing to drop the plaintext copy before the
         // network-write loop's awaits.
-        let frames = frame_sensitive_login(header, &payload, packet_size)?;
+        let frames = frame_sensitive_login(header, &payload[..], packet_size)?;
         payload.zeroize();
 
         for frame in frames {
             event!(Level::TRACE, "Sending a packet ({} bytes)", frame.len(),);
 
-            self.transport.write_all(frame.as_slice()).await?;
+            self.transport.write_all(&frame[..]).await?;
         }
 
         self.transport.flush().await?;
@@ -576,7 +576,7 @@ fn frame_sensitive_login(
     mut header: PacketHeader,
     payload: &[u8],
     packet_size: usize,
-) -> crate::Result<Vec<Zeroizing<Vec<u8>>>> {
+) -> crate::Result<Vec<Zeroizing<Box<[u8]>>>> {
     let mut frames = Vec::new();
     let mut offset = 0;
 
@@ -589,15 +589,28 @@ fn frame_sensitive_login(
             header.set_status(PacketStatus::NormalMessage);
         }
 
-        let mut frame = Zeroizing::new(Vec::with_capacity(HEADER_BYTES + end - offset));
-        header.encode(&mut *frame)?;
+        // Build the frame at its exact final capacity. `header.encode` is the
+        // only fallible (`?`) operation, and it runs BEFORE the sensitive
+        // payload bytes are copied in, so the secret never lives in this plain
+        // `Vec` across a `?`/`.await`. Once the header (`HEADER_BYTES`) and the
+        // chunk (`end - offset`) are written, `len == capacity`, so
+        // `into_boxed_slice()` cannot shrink-reallocate and leak an un-zeroized
+        // copy. Boxing into `Zeroizing` at push means each finished frame is
+        // wiped on drop and can no longer be grown.
+        let mut frame = Vec::with_capacity(HEADER_BYTES + end - offset);
+        header.encode(&mut frame)?;
         frame.extend_from_slice(&payload[offset..end]);
 
         let size = (frame.len() as u16).to_be_bytes();
         frame[2] = size[0];
         frame[3] = size[1];
 
-        frames.push(frame);
+        debug_assert_eq!(
+            frame.len(),
+            frame.capacity(),
+            "login frame buffer would shrink-reallocate when boxed, leaking a copy"
+        );
+        frames.push(Zeroizing::new(frame.into_boxed_slice()));
         offset = end;
     }
 
@@ -668,6 +681,27 @@ mod sensitive_login_tests {
 
         // The concatenated payloads must reconstruct the original login bytes.
         assert_eq!(reassembled, payload);
+    }
+
+    // The frames are now `Box<[u8]>` built at exact capacity (len==capacity
+    // before `into_boxed_slice`, guarded by a debug_assert in the builder). The
+    // total bytes across all frames must therefore be exactly one header per
+    // frame plus the whole payload — no slack from over-reserved/realloc'd
+    // buffers — which this test enforces.
+    #[test]
+    fn framed_login_has_no_slack_bytes() {
+        let packet_size = 16;
+        let payload: Vec<u8> = (0..50u16).map(|i| i as u8).collect();
+        let header = PacketHeader::login(5);
+
+        let frames = frame_sensitive_login(header, &payload, packet_size).unwrap();
+
+        let total: usize = frames.iter().map(|f| f.len()).sum();
+        assert_eq!(
+            total,
+            frames.len() * HEADER_BYTES + payload.len(),
+            "framed bytes must equal one header per frame plus the exact payload"
+        );
     }
 
     // A cross-check that a single frame produced by `frame_sensitive_login`
