@@ -207,16 +207,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let packet_size = (self.context.packet_size() as usize) - HEADER_BYTES;
 
         // Frame the login into zeroizable packets off the shared `BytesMut`
-        // path, then write each and wipe it immediately. Both the frames and the
-        // source `payload` are `Zeroizing`, so any sensitive bytes are cleared.
+        // path. Each frame is a `Zeroizing` wiped on drop at the end of its
+        // loop iteration, so no explicit call is needed there; `payload` is
+        // zeroized right after framing to drop the plaintext copy before the
+        // network-write loop's awaits.
         let frames = frame_sensitive_login(header, &payload, packet_size)?;
         payload.zeroize();
 
-        for mut frame in frames {
+        for frame in frames {
             event!(Level::TRACE, "Sending a packet ({} bytes)", frame.len(),);
 
             self.transport.write_all(frame.as_slice()).await?;
-            frame.zeroize();
         }
 
         self.transport.flush().await?;
