@@ -17,7 +17,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
       - name: Install dependencies
-        run: sudo apt install -y openssl libkrb5-dev
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
       - name: Clippy
         # Advisory here: modernizes the retired actions-rs/clippy-check and reports
         # lints without gating. The strict `-D warnings` gate lands together with its
@@ -85,7 +85,7 @@ jobs:
         run: DOCKER_BUILDKIT=1 docker compose -f docker-compose.yml up -d mssql-${{matrix.database}}
 
       - name: Install dependencies
-        run: sudo apt install -y openssl libkrb5-dev
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
 
       - name: Wait for SQL Server
         # A listening port is not readiness: SQL Server binds 1433 before the SA
