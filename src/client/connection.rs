@@ -453,7 +453,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
 
                 login_message.user_name(user);
                 login_message.password(password.as_str());
-                let payload = login_message.encode_to_vec()?;
+                let payload = login_message.encode_to_boxed_slice()?;
                 password.zeroize();
 
                 let id = self.context.next_packet_id();

@@ -242,17 +242,17 @@ impl<'a> LoginMessage<'a> {
         self.packet_size = size;
     }
 
-    /// Exact number of bytes [`Self::encode_to_vec`] will write, i.e. the final
+    /// Exact number of bytes [`Self::encode_to_boxed_slice`] will write, i.e. the final
     /// length of the LOGIN7 buffer.
     ///
     /// This is used to reserve the whole buffer up front so it never reallocates
     /// while the (obfuscated) password lives inside it — see the security note
-    /// in `encode_to_vec`. The layout mirrors the writes in `encode_to_vec`
+    /// in `encode_to_boxed_slice`. The layout mirrors the writes in `encode_to_boxed_slice`
     /// exactly; if that layout changes this must change with it (the capacity
-    /// assertion at the end of `encode_to_vec` guards against drift).
+    /// assertion at the end of `encode_to_boxed_slice` guards against drift).
     fn encoded_len(&self) -> usize {
         // Fixed prefix written before any variable-length data. This equals the
-        // initial `data_offset` computed in `encode_to_vec`:
+        // initial `data_offset` computed in `encode_to_boxed_slice`:
         //   4 (length) + 5 * 4 (header u32s) + 4 (flag bytes) + 2 * 4 (tz + lcid)
         //     = 36 bytes of fixed header, then
         //   var_data.len() (13) * 2 * 2 offset/length table entries + 6
@@ -290,7 +290,7 @@ impl<'a> LoginMessage<'a> {
         len
     }
 
-    pub(crate) fn encode_to_vec(self) -> crate::Result<Zeroizing<Box<[u8]>>> {
+    pub(crate) fn encode_to_boxed_slice(self) -> crate::Result<Zeroizing<Box<[u8]>>> {
         // SECURITY (password zeroization): the password is written into this
         // buffer (only lightly obfuscated with a trivially reversible transform)
         // and the returned `Vec` is wrapped in `Zeroizing` so it is wiped on
@@ -498,7 +498,7 @@ impl<'a> Encode<BytesMut> for LoginMessage<'a> {
         // `encoded` is `Zeroizing<Box<[u8]>>`; it is wiped on drop at the end of
         // this function, immediately after the copy into `dst`, so no explicit
         // `zeroize()` is needed here.
-        let encoded = self.encode_to_vec()?;
+        let encoded = self.encode_to_boxed_slice()?;
         dst.extend_from_slice(&encoded[..]);
 
         Ok(())
@@ -749,7 +749,9 @@ mod tests {
         login.server_name("some-server");
 
         let expected = login.encoded_len();
-        let encoded = login.encode_to_vec().expect("encode should succeed");
+        let encoded = login
+            .encode_to_boxed_slice()
+            .expect("encode should succeed");
         assert_eq!(encoded.len(), expected);
     }
 
@@ -757,7 +759,7 @@ mod tests {
     fn large_fields_do_not_reallocate_encode_buffer() {
         // Fields far larger than the old fixed 512-byte capacity: with the old
         // code the Vec would reallocate after the password was written, leaking
-        // an un-zeroized copy. `encode_to_vec` now asserts the capacity never
+        // an un-zeroized copy. `encode_to_boxed_slice` now asserts the capacity never
         // changed, so this both exercises and enforces the fix.
         let mut login = LoginMessage::new();
         login.user_name("u".repeat(200));
@@ -767,7 +769,9 @@ mod tests {
         login.app_name("a".repeat(200));
 
         let expected = login.encoded_len();
-        let encoded = login.encode_to_vec().expect("encode should succeed");
+        let encoded = login
+            .encode_to_boxed_slice()
+            .expect("encode should succeed");
         assert_eq!(encoded.len(), expected);
     }
 
@@ -781,12 +785,14 @@ mod tests {
         login.aad_token("t".repeat(500), true, Some([7u8; 32]));
 
         let expected = login.encoded_len();
-        let encoded = login.encode_to_vec().expect("encode should succeed");
+        let encoded = login
+            .encode_to_boxed_slice()
+            .expect("encode should succeed");
         assert_eq!(encoded.len(), expected);
     }
 
     #[test]
-    fn encode_to_vec_returns_exact_len_boxed_slice_that_round_trips() {
+    fn encode_to_boxed_slice_returns_exact_len_that_round_trips() {
         // The buffer is now a `Box<[u8]>` produced via `into_boxed_slice()` from
         // a Vec whose len equals its (reserved) capacity, so the boxed slice
         // must be exactly `encoded_len()` bytes — no shrink-realloc leak — and it
@@ -800,7 +806,7 @@ mod tests {
         let expected_len = login.encoded_len();
         let encoded: Zeroizing<Box<[u8]>> = login
             .clone()
-            .encode_to_vec()
+            .encode_to_boxed_slice()
             .expect("encode should succeed");
         assert_eq!(
             encoded.len(),
@@ -816,7 +822,7 @@ mod tests {
     #[test]
     fn fed_auth_token_encode_path_produces_correct_output() {
         // Exercises the fed-auth token buffer specifically: a non-empty token
-        // and nonce force the `encode_to_vec` fed-auth branch to build and copy
+        // and nonce force the `encode_to_boxed_slice` fed-auth branch to build and copy
         // the token temp buffer (whose capacity==len invariant is checked by an
         // internal debug_assert, so this test would panic on realloc). Assert
         // the encoded bytes decode back to exactly the token/echo/nonce we set.
@@ -828,7 +834,9 @@ mod tests {
         login.aad_token(token, true, Some(nonce));
 
         let expected_len = login.encoded_len();
-        let encoded = login.encode_to_vec().expect("encode should succeed");
+        let encoded = login
+            .encode_to_boxed_slice()
+            .expect("encode should succeed");
         assert_eq!(
             encoded.len(),
             expected_len,
