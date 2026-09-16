@@ -249,8 +249,9 @@ impl Config {
 
     /// Set the preferred encryption level.
     ///
-    /// - With `tls` feature, defaults to `Required`.
-    /// - Without `tls` feature, defaults to `NotSupported`.
+    /// - With a TLS backend enabled (any of the `rustls`, `native-tls`, or
+    ///   `vendored-openssl` features), defaults to `Required`.
+    /// - Without a TLS backend, defaults to `NotSupported`.
     pub fn encryption(&mut self, encryption: EncryptionLevel) {
         self.encryption = encryption;
     }
@@ -321,8 +322,8 @@ impl Config {
     /// Sets ApplicationIntent readonly.
     ///
     /// - Defaults to `false`.
-    pub fn readonly(&mut self, readnoly: bool) {
-        self.readonly = readnoly;
+    pub fn readonly(&mut self, readonly: bool) {
+        self.readonly = readonly;
     }
 
     /// Enable multi-subnet failover.
@@ -644,8 +645,9 @@ impl ConfigBuilder {
 
     /// Set the preferred encryption level.
     ///
-    /// - With `tls` feature, defaults to `Required`.
-    /// - Without `tls` feature, defaults to `NotSupported`.
+    /// - With a TLS backend enabled (any of the `rustls`, `native-tls`, or
+    ///   `vendored-openssl` features), defaults to `Required`.
+    /// - Without a TLS backend, defaults to `NotSupported`.
     pub fn encryption(mut self, encryption: EncryptionLevel) -> Self {
         self.inner.encryption = encryption;
         self
@@ -662,10 +664,7 @@ impl ConfigBuilder {
     ///
     /// - Defaults to `default`, meaning server certificate is validated against system-truststore.
     pub fn trust_cert(mut self) -> Self {
-        if let TrustConfig::CaCertificateLocation(_) = &self.inner.trust {
-            panic!("'trust_cert' and 'trust_cert_ca' are mutual exclusive! Only use one.")
-        }
-        self.inner.trust = TrustConfig::TrustAll;
+        self.inner.trust_cert();
         self
     }
 
@@ -679,11 +678,7 @@ impl ConfigBuilder {
     ///
     /// - Defaults to validating the server certificate is validated against system's certificate storage.
     pub fn trust_cert_ca(mut self, path: impl ToString) -> Self {
-        if let TrustConfig::TrustAll = &self.inner.trust {
-            panic!("'trust_cert' and 'trust_cert_ca' are mutual exclusive! Only use one.")
-        } else {
-            self.inner.trust = TrustConfig::CaCertificateLocation(PathBuf::from(path.to_string()))
-        }
+        self.inner.trust_cert_ca(path);
         self
     }
 
@@ -794,8 +789,7 @@ pub(crate) trait ConfigString {
             .or_else(|| self.dict().get("integrated security"))
         {
             #[cfg(all(windows, feature = "winauth"))]
-            Some(val) if val.to_lowercase() == "sspi" || Self::parse_bool(val)? => match (user, pw)
-            {
+            Some(val) if Self::is_sspi_or_truthy(val)? => match (user, pw) {
                 (None, None) => Ok(AuthMethod::Integrated),
                 _ => Ok(AuthMethod::windows(user.unwrap_or(""), pw.unwrap_or(""))),
             },
@@ -804,21 +798,23 @@ pub(crate) trait ConfigString {
             // back to Kerberos (`Integrated`) only if `integrated-auth-gssapi`
             // is also enabled and no credentials are given.
             #[cfg(all(unix, feature = "sspi-rs"))]
-            Some(val) if val.to_lowercase() == "sspi" || Self::parse_bool(val)? => {
-                match (user, pw) {
-                    (Some(user), Some(pw)) => Ok(AuthMethod::windows(user, pw)),
-                    #[cfg(feature = "integrated-auth-gssapi")]
-                    (None, None) => Ok(AuthMethod::Integrated),
-                    _ => Ok(AuthMethod::windows(user.unwrap_or(""), pw.unwrap_or(""))),
-                }
-            }
+            Some(val) if Self::is_sspi_or_truthy(val)? => match (user, pw) {
+                (Some(user), Some(pw)) => Ok(AuthMethod::windows(user, pw)),
+                #[cfg(feature = "integrated-auth-gssapi")]
+                (None, None) => Ok(AuthMethod::Integrated),
+                _ => Ok(AuthMethod::windows(user.unwrap_or(""), pw.unwrap_or(""))),
+            },
             #[cfg(all(
                 feature = "integrated-auth-gssapi",
                 not(all(unix, feature = "sspi-rs"))
             ))]
-            Some(val) if val.to_lowercase() == "sspi" || Self::parse_bool(val)? => {
-                Ok(AuthMethod::Integrated)
-            }
+            Some(val) if Self::is_sspi_or_truthy(val)? => Ok(AuthMethod::Integrated),
+            // Default (no integrated security): SQL Server authentication. A
+            // missing user or password is intentionally passed through as an
+            // empty string rather than rejected here — validation of the
+            // credentials is deferred to the server LOGIN response, which
+            // returns a precise authentication error. Failing early would also
+            // break the (unusual but valid) case of an empty SQL login.
             _ => Ok(AuthMethod::sql_server(user.unwrap_or(""), pw.unwrap_or(""))),
         }
     }
@@ -910,6 +906,23 @@ pub(crate) trait ConfigString {
                 "Connection string: Not a valid boolean".into(),
             )),
         }
+    }
+
+    /// An `IntegratedSecurity` connection-string value selects Windows/SSPI auth
+    /// when it is the literal `SSPI` (case-insensitive) or a truthy boolean.
+    /// Uses `eq_ignore_ascii_case` so the `SSPI` comparison does not allocate.
+    ///
+    /// Only referenced by the integrated-auth match arms, which are themselves
+    /// feature-gated; gate the helper identically so builds without any
+    /// integrated-auth backend do not warn about it being unused.
+    #[cfg(any(
+        all(windows, feature = "winauth"),
+        all(unix, feature = "sspi-rs"),
+        feature = "integrated-auth-gssapi"
+    ))]
+    fn is_sspi_or_truthy<T: AsRef<str>>(v: T) -> crate::Result<bool> {
+        let v = v.as_ref();
+        Ok(v.eq_ignore_ascii_case("sspi") || Self::parse_bool(v)?)
     }
 
     fn readonly(&self) -> bool {

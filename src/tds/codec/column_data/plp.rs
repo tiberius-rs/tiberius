@@ -2,10 +2,15 @@ use crate::sql_read_bytes::SqlReadBytes;
 
 // Decode a partially length-prefixed type.
 //
-// NOTE: values are read via the packet-aware `read_u8`/`read_u16_le`/`read_u32_le`
-// helpers (which transparently span TDS packet boundaries). The generic
-// `AsyncReadExt::read_exact` must NOT be used here: a PLP value can span multiple
-// packets, and `read_exact` treats a packet-boundary `Ok(0)` as EOF.
+// NOTE: the length/chunk prefixes are read with the packet-aware
+// `read_u16_le` (fixed-size total length), `read_u64_le` (PLP total-length
+// field) and `read_u32_le` (per-chunk length) helpers, and the value bytes
+// themselves via the packet-aware bulk reader `read_bytes_into`. All of these
+// transparently span TDS packet boundaries. The generic
+// `AsyncReadExt::read_exact` must NOT be used to read the value bytes here: a
+// PLP value can span multiple packets, and `read_exact` treats a
+// packet-boundary `Ok(0)` as EOF (truncating the value), whereas
+// `read_bytes_into` continues across the boundary.
 pub(crate) async fn decode<R>(src: &mut R, len: usize) -> crate::Result<Option<Vec<u8>>>
 where
     R: SqlReadBytes + Unpin,
@@ -19,11 +24,14 @@ where
                 // NULL
                 0xffff => Ok(None),
                 _ => {
-                    let mut data = Vec::with_capacity(len.min(super::MAX_PREALLOC));
-
-                    for _ in 0..len {
-                        data.push(src.read_u8().await?);
-                    }
+                    let mut data = Vec::new();
+                    crate::sql_read_bytes::read_bytes_into(
+                        src,
+                        &mut data,
+                        len,
+                        super::MAX_PREALLOC,
+                    )
+                    .await?;
 
                     Ok(Some(data))
                 }
@@ -44,39 +52,36 @@ where
                 _ => Vec::with_capacity((len as usize).min(super::MAX_PREALLOC)),
             };
 
-            let mut chunk_data_left = 0usize;
-
             loop {
-                if chunk_data_left == 0 {
-                    // We have no chunk. Start a new one.
-                    let chunk_size = src.read_u32_le().await? as usize;
+                let chunk_size = src.read_u32_le().await? as usize;
 
-                    if chunk_size == 0 {
-                        break; // found a sentinel, we're done
-                    }
-
-                    // The number of chunks in an "unknown length" PLP value is
-                    // unbounded on the wire. Cap the running total so a hostile
-                    // server cannot stream chunks forever and exhaust memory on
-                    // a single value.
-                    if data.len().saturating_add(chunk_size) > super::MAX_PLP_SIZE {
-                        return Err(crate::Error::Protocol(
-                            format!(
-                                "PLP value exceeds the maximum supported size of {} bytes",
-                                super::MAX_PLP_SIZE
-                            )
-                            .into(),
-                        ));
-                    }
-
-                    chunk_data_left = chunk_size;
-                } else {
-                    // Read a byte (packet-aware).
-                    let byte = src.read_u8().await?;
-                    chunk_data_left -= 1;
-
-                    data.push(byte);
+                if chunk_size == 0 {
+                    break; // found a sentinel, we're done
                 }
+
+                // The number of chunks in an "unknown length" PLP value is
+                // unbounded on the wire. Cap the running total so a hostile
+                // server cannot stream chunks forever and exhaust memory on
+                // a single value.
+                if data.len().saturating_add(chunk_size) > super::MAX_PLP_SIZE {
+                    return Err(crate::Error::Protocol(
+                        format!(
+                            "PLP value exceeds the maximum supported size of {} bytes",
+                            super::MAX_PLP_SIZE
+                        )
+                        .into(),
+                    ));
+                }
+
+                // Bulk-read the whole chunk (packet-aware), appending it to the
+                // running accumulation buffer.
+                crate::sql_read_bytes::read_bytes_into(
+                    src,
+                    &mut data,
+                    chunk_size,
+                    super::MAX_PREALLOC,
+                )
+                .await?;
             }
 
             Ok(Some(data))

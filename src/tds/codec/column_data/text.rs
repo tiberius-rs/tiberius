@@ -13,9 +13,9 @@ where
         return Ok(ColumnData::String(None));
     }
 
-    for _ in 0..ptr_len {
-        src.read_u8().await?;
-    }
+    // Skip the text pointer (packet-aware bulk read into a throwaway buffer).
+    let mut ptr = Vec::new();
+    crate::sql_read_bytes::read_bytes_into(src, &mut ptr, ptr_len, super::MAX_PREALLOC).await?;
 
     src.read_i32_le().await?; // days
     src.read_u32_le().await?; // second fractions
@@ -25,11 +25,9 @@ where
         Some(collation) => {
             let encoder = collation.encoding()?;
             let text_len = src.read_u32_le().await? as usize;
-            let mut buf = Vec::with_capacity(text_len.min(super::MAX_PREALLOC));
-
-            for _ in 0..text_len {
-                buf.push(src.read_u8().await?);
-            }
+            let mut buf = Vec::new();
+            crate::sql_read_bytes::read_bytes_into(src, &mut buf, text_len, super::MAX_PREALLOC)
+                .await?;
 
             encoder
                 .decode_without_bom_handling_and_without_replacement(buf.as_ref())
@@ -38,13 +36,27 @@ where
         }
         // NTEXT
         None => {
-            let text_len = src.read_u32_le().await? as usize / 2;
-            // u16 elements; cap the reservation to MAX_PREALLOC bytes' worth.
-            let mut buf = Vec::with_capacity(text_len.min(super::MAX_PREALLOC / 2));
-
-            for _ in 0..text_len {
-                buf.push(src.read_u16_le().await?);
+            let byte_len = src.read_u32_le().await? as usize;
+            // NTEXT is UTF-16: the byte length must be even. An odd length would
+            // desync the stream (the final `read_u16_le` would consume a byte
+            // from the next field), so reject it as a protocol error.
+            if !byte_len.is_multiple_of(2) {
+                return Err(Error::Protocol(
+                    format!("ntext: odd byte length {byte_len} is invalid").into(),
+                ));
             }
+            // Bulk-read the raw UTF-16LE bytes, then decode them as u16 code
+            // units (like string.rs), instead of one packet-aware u16 per poll.
+            let mut raw = Vec::new();
+            crate::sql_read_bytes::read_bytes_into(src, &mut raw, byte_len, super::MAX_PREALLOC)
+                .await?;
+
+            // `byte_len` is guaranteed even (odd lengths are rejected above),
+            // so every 2-byte chunk is a complete UTF-16LE code unit.
+            let buf: Vec<u16> = raw
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
 
             String::from_utf16(&buf[..])?
         }
@@ -81,6 +93,24 @@ mod tests {
 
         let data = decode(&mut buf.into_sql_read_bytes(), None).await.unwrap();
         assert_eq!(data, ColumnData::String(Some("hi".into())));
+    }
+
+    #[tokio::test]
+    async fn decode_ntext_rejects_odd_byte_length() {
+        // An odd UTF-16 byte length must be a protocol error, not a desync.
+        let mut buf = BytesMut::new();
+        buf.put_u8(1); // ptr_len
+        buf.put_u8(0xAA); // pointer byte (ignored)
+        buf.put_i32_le(0); // days
+        buf.put_u32_le(0); // second fractions
+        buf.put_u32_le(3); // odd byte length
+        buf.put_u16_le('h' as u16);
+        buf.put_u8(0);
+
+        let err = decode(&mut buf.into_sql_read_bytes(), None)
+            .await
+            .expect_err("odd ntext length must be rejected");
+        assert!(matches!(err, Error::Protocol(_)));
     }
 
     #[tokio::test]

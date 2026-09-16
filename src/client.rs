@@ -111,6 +111,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// This API is not quite suitable for dynamic query parameters. In these
     /// cases using a [`Query`] object might be easier.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the statement cannot be sent, if the server reports
+    /// an error while executing it, or if the connection fails during the
+    /// request.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -170,9 +176,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// if fighting too much with the compiler, using a [`Query`] object might be
     /// easier.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the statement cannot be sent, if the server reports
+    /// an error while executing it, or if the connection fails during the
+    /// request. Note that per-statement server errors may instead surface while
+    /// consuming the returned [`QueryStream`].
+    ///
     /// # Example
     ///
-    /// ```
+    /// ```no_run
     /// # use tiberius::Config;
     /// # use tokio_util::compat::TokioAsyncWriteCompatExt;
     /// # use std::env;
@@ -224,9 +237,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// Execute multiple queries, delimited with `;` and return multiple result
     /// sets; one for each query.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch cannot be sent, if the server reports an
+    /// error while executing it, or if the connection fails during the request.
+    /// Per-statement server errors may instead surface while consuming the
+    /// returned [`QueryStream`].
+    ///
     /// # Example
     ///
-    /// ```
+    /// ```no_run
     /// # use tiberius::Config;
     /// # use tokio_util::compat::TokioAsyncWriteCompatExt;
     /// # use std::env;
@@ -292,9 +312,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// identifiers (NUL/ASCII control characters or an unbalanced `]` bracket),
     /// but that guard is not a substitute for passing trusted input.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if `table` is a malformed identifier, if the column
+    /// metadata query fails, or if the server rejects the `INSERT BULK`
+    /// statement. Row-level failures surface later from [`send`] and
+    /// [`finalize`] on the returned request.
+    ///
+    /// [`send`]: BulkLoadRequest::send
+    /// [`finalize`]: BulkLoadRequest::finalize
+    ///
     /// # Example
     ///
-    /// ```
+    /// ```no_run
     /// # use tiberius::{Config, IntoRow};
     /// # use tokio_util::compat::TokioAsyncWriteCompatExt;
     /// # use std::env;
@@ -358,9 +388,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// unbalanced `]` bracket), but that guard is not a substitute for passing
     /// trusted input.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if `table` is a malformed identifier, if the column
+    /// metadata query fails, or if the server rejects the `INSERT BULK`
+    /// statement. Row-level failures surface later from [`send`] and
+    /// [`finalize`] on the returned request.
+    ///
+    /// [`send`]: BulkLoadRequest::send
+    /// [`finalize`]: BulkLoadRequest::finalize
+    ///
     /// # Example
     ///
-    /// ```
+    /// ```no_run
     /// # use tiberius::{Config, IntoRow};
     /// # use tokio_util::compat::TokioAsyncWriteCompatExt;
     /// # use std::env;
@@ -457,6 +497,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// Pass `&["*"]` as `columns` to return the metadata for every column of the
     /// table.
     ///
+    /// # Security
+    ///
+    /// Both `table` and the entries of `columns` are interpolated **directly**
+    /// into the SQL batch sent to the server (`SELECT TOP 0 {columns} FROM
+    /// {table}`). SQL Server does not allow identifiers to be supplied as bound
+    /// parameters, so these values cannot be parameterized — they become part of
+    /// the SQL text verbatim. The caller MUST therefore pass **trusted,
+    /// hard-coded or otherwise validated** identifiers and MUST NOT pass
+    /// untrusted or user-supplied input, which would open a SQL injection
+    /// vector. As cheap defense-in-depth this method rejects obviously-malformed
+    /// identifiers (NUL/ASCII control characters or an unbalanced `]` bracket),
+    /// but that guard is not a substitute for passing trusted input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `table` is a malformed identifier, if the metadata
+    /// `SELECT` fails, or if the server reports an error while executing it.
+    ///
     /// ```no_run
     /// # use tiberius::Config;
     /// # use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -480,6 +538,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         table: &str,
         columns: &[&str],
     ) -> crate::Result<Vec<MetaDataColumn<'static>>> {
+        // `table` and each `column` are interpolated directly into the SQL
+        // batch below (identifiers cannot be parameterized in T-SQL). Reject
+        // obviously-malformed/dangerous input as cheap defense-in-depth; see the
+        // `# Security` note above.
+        validate_bulk_table_identifier(table)?;
+        for column in columns {
+            validate_bulk_column_identifier(column)?;
+        }
+
         self.connection.flush_stream().await?;
 
         // Ask the server for the column layout without returning any rows.
@@ -771,17 +838,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
 /// is interpolated directly into the SQL batch because T-SQL does not allow
 /// identifiers to be parameterized. This guard is cheap defense-in-depth — it
 /// does NOT make untrusted input safe. It only rejects input that cannot be a
-/// legitimate identifier:
-///
-/// - a NUL byte or any ASCII control character, and
-/// - an unbalanced closing bracket `]` (per the T-SQL bracket-escaping rule a
-///   literal `]` inside a `[...]` quoted identifier must be doubled as `]]`).
+/// legitimate identifier (see [`validate_sql_identifier`] for the exact rules).
 ///
 /// It deliberately does NOT try to quote or rewrite the identifier, so
 /// multi-part names (`schema.table`), already-bracketed names (`[my table]`) and
 /// temp tables (`##bulk_test`) keep working unchanged.
 fn validate_bulk_table_identifier(table: &str) -> crate::Result<()> {
-    validate_bulk_identifier("table", table)
+    validate_sql_identifier("bulk insert table", table)
 }
 
 /// Reject an obviously-malformed or dangerous bulk-insert `column` identifier.
@@ -790,16 +853,46 @@ fn validate_bulk_table_identifier(table: &str) -> crate::Result<()> {
 /// column list exactly like `table`, so they get the same cheap
 /// defense-in-depth check. See [`validate_bulk_table_identifier`].
 fn validate_bulk_column_identifier(column: &str) -> crate::Result<()> {
-    validate_bulk_identifier("column", column)
+    validate_sql_identifier("bulk insert column", column)
 }
 
-/// Shared implementation for the bulk `table`/`column` identifier guards.
-/// `what` names the kind of identifier for the error message.
-fn validate_bulk_identifier(what: &str, ident: &str) -> crate::Result<()> {
+/// Reject an obviously-malformed or dangerous SQL identifier that will be
+/// interpolated directly into a SQL batch because T-SQL does not allow
+/// identifiers or type names to be parameterized. `what` names the kind of
+/// identifier for the error message.
+///
+/// This is cheap defense-in-depth — it does NOT make untrusted input safe. It
+/// rejects input that cannot be a legitimate identifier:
+///
+/// - a NUL byte or any ASCII control character;
+/// - **outside** a `[...]` bracket-quoted segment, any character that is not
+///   identifier-safe. Only alphanumerics and the punctuation needed for real
+///   identifiers/type names are allowed — `_`, `.` (multi-part names like
+///   `dbo.MyType`), `@`/`#` (variable/temp-style names), `*` (a bulk column
+///   list may be `*`), and `(`, `)`, `,` (parameterized types such as
+///   `decimal(10,2)` / `varchar(max)`). A space is allowed only *inside* those
+///   parens (e.g. `decimal(18, 4)`); a top-level space is rejected because it
+///   would let one identifier split into several SQL tokens. This rejects
+///   statement-breaking characters such as `;`, quotes and `-`, so a value like
+///   `1; DROP TABLE Users--` cannot slip through; and
+/// - **inside** a `[...]` bracket-quoted segment anything is allowed except an
+///   unescaped `]` (per the T-SQL bracket-escaping rule a literal `]` must be
+///   doubled as `]]`). A `]` seen outside any bracket is unbalanced and
+///   rejected. A closing `]`, and a top-level closing `)`, are themselves SQL
+///   token boundaries, so a segment may only be followed by `.` (the next part
+///   of a multi-part name) or the end of the string — this stops delimiter-
+///   adjacent splicing such as `[t]UNION(...)` or `foo(1)UNION(...)` that needs
+///   no space.
+///
+/// It deliberately does NOT try to quote or rewrite the identifier, so
+/// multi-part names (`schema.table`), already-bracketed names (`[my table]`,
+/// `[dbo].[my table]`, `[weird]]name]`) and temp tables (`##bulk_test`) keep
+/// working unchanged. This is shared by the bulk-insert guards here and by
+/// `validate_db_type_identifier` in `src/command.rs`.
+pub(crate) fn validate_sql_identifier(what: &str, ident: &str) -> crate::Result<()> {
     if ident.chars().any(|c| c.is_ascii_control()) {
         return Err(crate::Error::BulkInput(
-            format!("bulk insert {what} identifier must not contain NUL or control characters")
-                .into(),
+            format!("{what} identifier must not contain NUL or control characters").into(),
         ));
     }
 
@@ -808,30 +901,77 @@ fn validate_bulk_identifier(what: &str, ident: &str) -> crate::Result<()> {
     // outside of any bracket is unbalanced and rejected. Tracking bracket state
     // keeps legitimate names like `[dbo].[my table]` and `[weird]]name]`
     // working while catching stray closing brackets such as `Foo]`.
-    let bytes = ident.as_bytes();
+    let mut chars = ident.chars().peekable();
     let mut in_bracket = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'[' if !in_bracket => in_bracket = true,
-            b']' if in_bracket => {
-                if bytes.get(i + 1) == Some(&b']') {
-                    // doubled `]]` escape: consume the pair, stay in the bracket
-                    i += 2;
-                    continue;
+    let mut paren_depth: u32 = 0;
+    while let Some(c) = chars.next() {
+        if in_bracket {
+            if c == ']' {
+                if chars.peek() == Some(&']') {
+                    chars.next(); // consume the doubled `]]` escape
+                } else {
+                    in_bracket = false;
+                    // A quoted-identifier segment may only be followed by `.`
+                    // (introducing the next part of a multi-part name) or the
+                    // end of the string. Anything else — e.g. `[t]UNION ...` —
+                    // splices a fresh SQL token directly onto the closing `]`
+                    // (which is itself a token boundary, needing no space), so
+                    // reject it.
+                    match chars.peek() {
+                        None | Some('.') => {}
+                        Some(_) => {
+                            return Err(crate::Error::BulkInput(
+                                format!("{what} identifier has trailing characters after a bracket-quoted segment").into(),
+                            ));
+                        }
+                    }
                 }
-                // single `]` closes the quoted identifier
-                in_bracket = false;
             }
-            b']' => {
+            continue;
+        }
+
+        match c {
+            '[' => in_bracket = true,
+            ']' => {
                 return Err(crate::Error::BulkInput(
-                    format!("bulk insert {what} identifier contains an unbalanced `]` bracket")
-                        .into(),
+                    format!("{what} identifier contains an unbalanced `]` bracket").into(),
                 ));
             }
-            _ => {}
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                // A parameterized type ends at its closing paren; nothing is a
+                // legitimate continuation after a top-level `)`. Rejecting it
+                // stops `)`-delimited token splicing such as `foo(1)UNION(...)`
+                // (the `)` is a token boundary, so no space is required).
+                if paren_depth == 0 && chars.peek().is_some() {
+                    return Err(crate::Error::BulkInput(
+                        format!("{what} identifier has trailing characters after a closing `)`")
+                            .into(),
+                    ));
+                }
+            }
+            // A space is only legitimate inside a parameterized type's parens
+            // (e.g. `decimal(18, 4)`) or inside a bracket-quoted name (handled
+            // above). A *top-level* space would let a single identifier split
+            // into several SQL tokens (`t UNION SELECT ...`, `t WHERE ...`)
+            // without using any otherwise-blocked character, so reject it.
+            ' ' if paren_depth == 0 => {
+                return Err(crate::Error::BulkInput(
+                    format!("{what} identifier contains a disallowed character").into(),
+                ));
+            }
+            // Outside a bracket-quoted segment only identifier-safe characters
+            // are permitted (see the doc comment). Everything else — `;`,
+            // quotes, `-`, etc. — is rejected.
+            c if c.is_alphanumeric() => {}
+            '_' | '.' | '@' | '#' | ',' | ' ' | '*' => {}
+            _ => {
+                return Err(crate::Error::BulkInput(
+                    format!("{what} identifier contains a disallowed character").into(),
+                ));
+            }
         }
-        i += 1;
     }
 
     Ok(())
@@ -891,5 +1031,89 @@ mod tests {
         assert!(validate_bulk_table_identifier("Foo]").is_err());
         assert!(validate_bulk_table_identifier("[my] table]").is_err());
         assert!(validate_bulk_table_identifier("a]b").is_err());
+    }
+
+    #[test]
+    fn column_metadata_guards_reject_bad_identifiers() {
+        // `column_metadata` interpolates `table`/`columns` into
+        // `SELECT TOP 0 {columns} FROM {table}` and now validates both with the
+        // same guards as `bulk_insert*`. A malformed table or column identifier
+        // must be rejected before any SQL is built.
+        assert!(validate_bulk_table_identifier("Foo]").is_err());
+        assert!(validate_bulk_table_identifier("Foo\nbar").is_err());
+        assert!(validate_bulk_column_identifier("id]").is_err());
+        assert!(validate_bulk_column_identifier("col\0").is_err());
+    }
+
+    #[test]
+    fn rejects_statement_breaking_identifiers() {
+        // The guard must reject statement-breakers (`;`, quotes, `--`, `=`)
+        // that would let an injected column/table escape the interpolated SQL.
+        for bad in [
+            "1; DROP TABLE Users--",
+            "id = 1",
+            "foo'bar",
+            "foo\"bar",
+            "foo--bar",
+            "foo;bar",
+        ] {
+            assert!(
+                validate_bulk_column_identifier(bad).is_err(),
+                "expected column {bad:?} to be rejected",
+            );
+            assert!(
+                validate_bulk_table_identifier(bad).is_err(),
+                "expected table {bad:?} to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_star_and_bracketed_statement_breakers() {
+        // `*` must stay valid as a whole column list (bulk_insert uses `&["*"]`),
+        // and characters that would be statement-breakers outside brackets are
+        // fine when properly bracket-quoted.
+        assert!(validate_bulk_column_identifier("*").is_ok());
+        assert!(validate_bulk_column_identifier("[weird;name]").is_ok());
+        assert!(validate_bulk_table_identifier("[dbo].[my;table]").is_ok());
+    }
+
+    #[test]
+    fn rejects_top_level_space_but_allows_it_inside_parens_and_brackets() {
+        // A top-level space lets a single identifier split into multiple SQL
+        // tokens without any otherwise-blocked character, so it is rejected.
+        assert!(validate_bulk_table_identifier("t UNION SELECT name FROM sysobjects").is_err());
+        assert!(validate_bulk_table_identifier("t WHERE 1=1").is_err());
+        assert!(validate_bulk_column_identifier("a b").is_err());
+
+        // A space is still fine inside a parameterized type's parens...
+        assert!(super::validate_sql_identifier("db_type", "decimal(18, 4)").is_ok());
+        // ...and inside a bracket-quoted name.
+        assert!(validate_bulk_table_identifier("[my table]").is_ok());
+        // The canonical no-space forms keep working.
+        assert!(super::validate_sql_identifier("db_type", "decimal(10,2)").is_ok());
+        assert!(super::validate_sql_identifier("db_type", "varchar(max)").is_ok());
+    }
+
+    #[test]
+    fn rejects_delimiter_adjacent_token_splicing() {
+        // A `]` or `)` is itself a SQL token boundary, so an attacker can splice
+        // a new token onto one without any (now-blocked) top-level space. Both
+        // forms must be rejected.
+        assert!(
+            validate_bulk_table_identifier("[RealTable]UNION(SELECT secret FROM users)").is_err()
+        );
+        assert!(validate_bulk_table_identifier("[t]UNION").is_err());
+        assert!(validate_bulk_table_identifier("[t](1)").is_err());
+        assert!(super::validate_sql_identifier("t", "foo(1)UNION(SELECT x)").is_err());
+        assert!(super::validate_sql_identifier("t", "decimal(10,2)x").is_err());
+
+        // ...while every legitimate multi-part / parameterized form still passes.
+        assert!(validate_bulk_table_identifier("[dbo].[my table]").is_ok());
+        assert!(validate_bulk_table_identifier("[db].[schema].[tbl]").is_ok());
+        assert!(validate_bulk_table_identifier("[weird]]name]").is_ok());
+        assert!(super::validate_sql_identifier("db_type", "decimal(18,4)").is_ok());
+        assert!(super::validate_sql_identifier("db_type", "numeric(38, 38)").is_ok());
+        assert!(super::validate_sql_identifier("db_type", "varchar(max)").is_ok());
     }
 }

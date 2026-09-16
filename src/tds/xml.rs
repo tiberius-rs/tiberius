@@ -67,9 +67,8 @@ impl XmlData {
     }
 
     /// Returns information about the schema of the XML file, if existing.
-    #[allow(clippy::option_as_ref_deref)]
     pub fn schema(&self) -> Option<&XmlSchema> {
-        self.schema.as_ref().map(|s| &**s)
+        self.schema.as_deref()
     }
 
     /// Takes the XML string out from the struct.
@@ -110,9 +109,15 @@ impl Encode<BytesMut> for XmlData {
         // PLP_TERMINATOR, no next blobs
         dst.put_u32_le(0);
 
+        // The on-the-wire blob length is a byte count (`length` UTF-16 code
+        // units => `length * 2` bytes) that must fit in the u32 length field.
+        let byte_len = length.checked_mul(2).ok_or_else(|| {
+            crate::Error::Protocol("xml payload byte length overflows u32".into())
+        })?;
+
         let dst: &mut [u8] = dst.borrow_mut();
         let mut dst = &mut dst[len_pos..];
-        dst.put_u32_le(length * 2);
+        dst.put_u32_le(byte_len);
 
         Ok(())
     }

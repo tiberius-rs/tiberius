@@ -1,4 +1,4 @@
-use super::{AllHeaderTy, Encode, ALL_HEADERS_LEN_TX};
+use super::{encode_all_headers_tx, encode_b_varchar, Encode};
 use bytes::{BufMut, BytesMut};
 use std::borrow::Cow;
 
@@ -130,43 +130,10 @@ impl<'a> TransactionManagerRequest<'a> {
     }
 }
 
-/// Encodes a `B_VARCHAR`: a single-byte count of UTF-16 code units followed by
-/// the string encoded as little-endian UCS-2 (MS-TDS 2.2.5.1.2).
-///
-/// The length prefix is a single byte, so a string longer than 255 UTF-16 code
-/// units cannot be represented. Truncating the count with `as u8` while still
-/// writing every unit would corrupt the stream, so an over-long name is
-/// rejected instead.
-fn encode_b_varchar(dst: &mut BytesMut, s: &str) -> crate::Result<()> {
-    let units: Vec<u16> = s.encode_utf16().collect();
-
-    if units.len() > u8::MAX as usize {
-        return Err(crate::Error::Protocol(
-            format!(
-                "transaction name is too long ({} UTF-16 code units, max 255)",
-                units.len()
-            )
-            .into(),
-        ));
-    }
-
-    dst.put_u8(units.len() as u8);
-
-    for unit in units {
-        dst.put_u16_le(unit);
-    }
-
-    Ok(())
-}
-
 impl<'a> Encode<BytesMut> for TransactionManagerRequest<'a> {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
         // ALL_HEADERS block carrying the transaction descriptor.
-        dst.put_u32_le(ALL_HEADERS_LEN_TX as u32);
-        dst.put_u32_le(ALL_HEADERS_LEN_TX as u32 - 4);
-        dst.put_u16_le(AllHeaderTy::TransactionDescriptor as u16);
-        dst.put_slice(&self.transaction_desc);
-        dst.put_u32_le(1);
+        encode_all_headers_tx(dst, self.transaction_desc);
 
         // Request type (USHORT).
         dst.put_u16_le(self.request_type() as u16);
@@ -196,6 +163,7 @@ impl<'a> Encode<BytesMut> for TransactionManagerRequest<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{AllHeaderTy, ALL_HEADERS_LEN_TX};
     use super::*;
 
     fn all_headers() -> Vec<u8> {

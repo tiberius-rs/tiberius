@@ -17,7 +17,7 @@ where
         (8, _) => ColumnData::I64(Some(src.read_i64_le().await?)),
         _ => {
             return Err(Error::Protocol(
-                format!("invalid integer length: {}", recv_len).into(),
+                format!("intn: length of {} is invalid", recv_len).into(),
             ))
         }
     };
@@ -43,7 +43,7 @@ mod tests {
 
         match err {
             Error::Protocol(msg) => {
-                assert!(msg.to_string().contains("invalid integer length"));
+                assert!(msg.to_string().contains("intn: length of"));
             }
             other => panic!("expected Error::Protocol, got {other:?}"),
         }

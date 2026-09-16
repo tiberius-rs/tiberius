@@ -77,7 +77,7 @@ pub enum AuthMethod {
     Integrated,
     /// Authenticate with an AAD token. The token should encode an AAD user/service principal
     /// which has access to SQL Server.
-    AADToken(String),
+    AADToken(Zeroizing<String>),
     #[doc(hidden)]
     None,
 }
@@ -132,7 +132,7 @@ impl AuthMethod {
 
     /// Construct a new configuration with AAD auth token.
     pub fn aad_token(token: impl ToString) -> Self {
-        Self::AADToken(token.to_string())
+        Self::AADToken(Zeroizing::new(token.to_string()))
     }
 }
 
