@@ -51,7 +51,7 @@ jobs:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install dependencies
-        run: sudo apt-get install -y openssl libkrb5-dev
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
       - name: Check on MSRV
         run: cargo check --features all
 
@@ -73,7 +73,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install dependencies
-        run: sudo apt-get install -y openssl libkrb5-dev
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@cargo-semver-checks
       - name: Fetch baseline branch
@@ -188,7 +188,7 @@ jobs:
       - name: Start SQL Server 2025
         run: DOCKER_BUILDKIT=1 docker compose -f docker-compose.yml up -d mssql-2025
       - name: Install dependencies
-        run: sudo apt-get install -y openssl libkrb5-dev
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
       - name: Wait for SQL Server
         # Authenticated readiness (not just an open port) — see the smoke job.
         run: |
