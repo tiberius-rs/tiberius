@@ -525,6 +525,8 @@ mod tests {
         assert_eq!(header.status(), PacketStatus::EndOfMessage);
     }
 
+    // `PacketHeader::sspi` only exists on the Windows integrated-auth path.
+    #[cfg(all(windows, feature = "winauth"))]
     #[test]
     fn sspi_header_type_and_status() {
         let header = PacketHeader::sspi(7);
