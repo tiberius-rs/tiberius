@@ -117,3 +117,64 @@ impl Encode<BytesMut> for XmlData {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xml_schema_accessors() {
+        let schema = XmlSchema::new("db", "owner", "collection");
+        assert_eq!(schema.db_name(), "db");
+        assert_eq!(schema.owner(), "owner");
+        assert_eq!(schema.collection(), "collection");
+    }
+
+    #[test]
+    fn xml_schema_eq_and_clone() {
+        let a = XmlSchema::new("db", "owner", "collection");
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn xml_data_without_schema() {
+        let data = XmlData::new("<root/>");
+        assert!(data.schema().is_none());
+        assert_eq!(data.as_ref(), "<root/>");
+        assert_eq!(format!("{}", data), "<root/>");
+        assert_eq!(data.into_string(), "<root/>");
+    }
+
+    #[test]
+    fn xml_data_with_schema() {
+        let schema = Arc::new(XmlSchema::new("db", "owner", "collection"));
+        let mut data = XmlData::new("<a>1</a>");
+        data.set_schema(schema.clone());
+
+        let stored = data.schema().expect("schema present");
+        assert_eq!(stored.db_name(), "db");
+        assert_eq!(stored.owner(), "owner");
+        assert_eq!(stored.collection(), "collection");
+    }
+
+    #[test]
+    fn encode_writes_plp_header_and_backpatches_length() {
+        let mut buf = BytesMut::new();
+        XmlData::new("ab")
+            .encode(&mut buf)
+            .expect("encode succeeds");
+
+        // 8 (unknown-size marker) + 4 (length) + 2*2 (utf16 chars) + 4 (terminator)
+        assert_eq!(buf.len(), 8 + 4 + 4 + 4);
+
+        // unknown size marker
+        assert_eq!(&buf[0..8], &0xfffffffffffffffe_u64.to_le_bytes());
+        // backpatched length is number of chars * 2 bytes
+        assert_eq!(&buf[8..12], &(4u32).to_le_bytes());
+        // 'a' then 'b' as UTF-16LE
+        assert_eq!(&buf[12..16], &[b'a', 0, b'b', 0]);
+        // PLP terminator
+        assert_eq!(&buf[16..20], &(0u32).to_le_bytes());
+    }
+}

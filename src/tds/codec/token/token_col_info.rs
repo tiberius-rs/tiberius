@@ -160,4 +160,75 @@ mod tests {
         assert!(!second.is_hidden());
         assert_eq!(second.col_name.as_deref(), Some("Id"));
     }
+
+    #[test]
+    fn colinfo_status_predicates() {
+        // Expression-only: is_expression true, the others false.
+        let expr = ColInfo {
+            col_num: 1,
+            table_num: 0,
+            status: STATUS_EXPRESSION,
+            col_name: None,
+        };
+        assert!(expr.is_expression());
+        assert!(!expr.is_key());
+        assert!(!expr.is_hidden());
+
+        // Key-only: is_key true, the others false.
+        let key = ColInfo {
+            col_num: 1,
+            table_num: 0,
+            status: STATUS_KEY,
+            col_name: None,
+        };
+        assert!(!key.is_expression());
+        assert!(key.is_key());
+        assert!(!key.is_hidden());
+
+        // Hidden-only: is_hidden true, the others false.
+        let hidden = ColInfo {
+            col_num: 1,
+            table_num: 0,
+            status: STATUS_HIDDEN,
+            col_name: None,
+        };
+        assert!(!hidden.is_expression());
+        assert!(!hidden.is_key());
+        assert!(hidden.is_hidden());
+    }
+
+    #[tokio::test]
+    async fn decode_col_info_advances_consumed_by_name_bytes() {
+        // A different-name column (with a multi-character name) followed by a
+        // plain column. The `consumed += char_len * 2` update must be exact for
+        // the loop to read both columns.
+        let mut body = BytesMut::new();
+
+        // Column 1: expression + different name "abc" (3 chars => 6 bytes).
+        body.put_u8(1); // ColNum
+        body.put_u8(0); // TableNum
+        body.put_u8(STATUS_EXPRESSION | STATUS_DIFFERENT_NAME); // Status
+        body.put_u8(3); // ColName length in characters
+        body.put_u16_le(u16::from(b'a'));
+        body.put_u16_le(u16::from(b'b'));
+        body.put_u16_le(u16::from(b'c'));
+
+        // Column 2: plain key column, no different name.
+        body.put_u8(2); // ColNum
+        body.put_u8(1); // TableNum
+        body.put_u8(STATUS_KEY); // Status
+
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(body.len() as u16);
+        buf.extend_from_slice(&body);
+
+        let mut reader = buf.into_sql_read_bytes();
+        let token = TokenColInfo::decode(&mut reader).await.unwrap();
+
+        assert_eq!(token.columns.len(), 2);
+        assert_eq!(token.columns[0].col_num, 1);
+        assert_eq!(token.columns[0].col_name.as_deref(), Some("abc"));
+        assert_eq!(token.columns[1].col_num, 2);
+        assert!(token.columns[1].is_key());
+    }
 }

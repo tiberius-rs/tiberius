@@ -14,12 +14,51 @@ use crate::tds::codec::ColumnData;
 #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 pub use chrono::offset::{FixedOffset, Utc};
 pub use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
-#[cfg(feature = "tds73")]
-use std::ops::Sub;
 
 #[inline]
-fn from_days(days: i64, start_year: i32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(start_year, 1, 1).unwrap() + chrono::Duration::days(days)
+fn from_days(days: i64, start_year: i32) -> crate::Result<NaiveDate> {
+    // `days` derives from untrusted server bytes. Every valid SQL date fits
+    // within `NaiveDate`; a genuinely out-of-range/malformed day offset is
+    // rejected as a protocol error rather than silently clamped to MIN/MAX
+    // (which would decode a malformed value to a plausible-but-wrong date).
+    let base = NaiveDate::from_ymd_opt(start_year, 1, 1).unwrap();
+    base.checked_add_signed(chrono::Duration::days(days))
+        .ok_or_else(|| {
+            crate::Error::Protocol(
+                format!("date day offset {days} is out of the representable range").into(),
+            )
+        })
+}
+
+/// Validate a server-supplied UTC offset (in whole minutes). SQL Server's
+/// `datetimeoffset` is only valid for -14:00..=+14:00; a malformed offset
+/// outside that range is rejected as a protocol error rather than silently
+/// falling back to UTC (which would shift the represented instant).
+#[inline]
+#[cfg(feature = "tds73")]
+fn validate_offset_minutes(minutes: i16) -> crate::Result<i32> {
+    if !(-840..=840).contains(&minutes) {
+        return Err(crate::Error::Protocol(
+            format!(
+                "datetimeoffset offset {minutes} minutes is outside the valid -14:00..=+14:00 range"
+            )
+            .into(),
+        ));
+    }
+
+    Ok(minutes as i32)
+}
+
+/// Convert a server-supplied fractional-seconds `increments` at the given
+/// `scale` into nanoseconds without panicking (`scale > 9` would underflow
+/// `9 - scale`; a large `increments` would overflow the multiply).
+#[inline]
+#[cfg(feature = "tds73")]
+fn nanos_from_increments(increments: u64, scale: u8) -> i64 {
+    let pow = 9u32.saturating_sub(scale as u32);
+    increments
+        .saturating_mul(10u64.saturating_pow(pow))
+        .min(i64::MAX as u64) as i64
 }
 
 #[inline]
@@ -53,54 +92,89 @@ fn to_sec_fragments(time: NaiveTime) -> i64 {
 #[cfg(feature = "tds73")]
 from_sql!(
     NaiveDateTime:
-        ColumnData::SmallDateTime(ref dt) => dt.map(|dt| NaiveDateTime::new(
-            from_days(dt.days as i64, 1900),
-            from_mins(dt.seconds_fragments as u32 * 60),
-        )),
-        ColumnData::DateTime2(ref dt) => dt.map(|dt| NaiveDateTime::new(
-            from_days(dt.date.days() as i64, 1),
-            NaiveTime::from_hms_opt(0,0,0).unwrap() + chrono::Duration::nanoseconds(dt.time.increments as i64 * 10i64.pow(9 - dt.time.scale as u32))
-        )),
-        ColumnData::DateTime(ref dt) => dt.map(|dt| NaiveDateTime::new(
-            from_days(dt.days as i64, 1900),
-            from_sec_fragments(dt.seconds_fragments as i64)
-        ));
+        ColumnData::SmallDateTime(ref dt) => match *dt {
+            Some(dt) => Some(NaiveDateTime::new(
+                from_days(dt.days as i64, 1900)?,
+                from_mins(dt.seconds_fragments as u32 * 60),
+            )),
+            None => None,
+        },
+        ColumnData::DateTime2(ref dt) => match *dt {
+            Some(dt) => Some(NaiveDateTime::new(
+                from_days(dt.date.days() as i64, 1)?,
+                NaiveTime::from_hms_opt(0,0,0).unwrap() + chrono::Duration::nanoseconds(nanos_from_increments(dt.time.increments, dt.time.scale))
+            )),
+            None => None,
+        },
+        ColumnData::DateTime(ref dt) => match *dt {
+            Some(dt) => Some(NaiveDateTime::new(
+                from_days(dt.days as i64, 1900)?,
+                from_sec_fragments(dt.seconds_fragments as i64)
+            )),
+            None => None,
+        };
     NaiveTime:
-        ColumnData::Time(ref time) => time.map(|time| {
-            let ns = time.increments as i64 * 10i64.pow(9 - time.scale as u32);
-            NaiveTime::from_hms_opt(0,0,0).unwrap() + chrono::Duration::nanoseconds(ns)
-        });
+        ColumnData::Time(ref time) => match *time {
+            Some(time) => {
+                let ns = nanos_from_increments(time.increments, time.scale);
+                Some(NaiveTime::from_hms_opt(0,0,0).unwrap() + chrono::Duration::nanoseconds(ns))
+            }
+            None => None,
+        };
     NaiveDate:
-        ColumnData::Date(ref date) => date.map(|date| from_days(date.days() as i64, 1));
+        ColumnData::Date(ref date) => match *date {
+            Some(date) => Some(from_days(date.days() as i64, 1)?),
+            None => None,
+        };
     chrono::DateTime<Utc>:
-        ColumnData::DateTimeOffset(ref dto) => dto.map(|dto| {
-            let date = from_days(dto.datetime2.date.days() as i64, 1);
-            let ns = dto.datetime2.time.increments as i64 * 10i64.pow(9 - dto.datetime2.time.scale as u32);
+        ColumnData::DateTimeOffset(ref dto) => match *dto {
+            Some(dto) => {
+                let date = from_days(dto.datetime2.date.days() as i64, 1)?;
+                let ns = nanos_from_increments(dto.datetime2.time.increments, dto.datetime2.time.scale);
+                let time = NaiveTime::from_hms_opt(0,0,0).unwrap() + chrono::Duration::nanoseconds(ns);
+
+                let minutes = validate_offset_minutes(dto.offset)?;
+                let offset = chrono::Duration::minutes(minutes as i64);
+                let base = NaiveDateTime::new(date, time);
+                // A valid offset keeps the instant representable; a malformed one
+                // that pushes the value out of range is rejected as a protocol error.
+                let naive = base.checked_sub_signed(offset).ok_or_else(|| {
+                    crate::Error::Protocol(
+                        "datetimeoffset value is out of the representable range".into(),
+                    )
+                })?;
+
+                Some(chrono::DateTime::from_naive_utc_and_offset(naive, Utc))
+            }
+            None => None,
+        },
+        ColumnData::DateTime2(ref dt2) => match *dt2 {
+            Some(dt2) => {
+                let date = from_days(dt2.date.days() as i64, 1)?;
+                let ns = nanos_from_increments(dt2.time.increments, dt2.time.scale);
+                let time = NaiveTime::from_hms_opt(0,0,0).unwrap() + chrono::Duration::nanoseconds(ns);
+                let naive = NaiveDateTime::new(date, time);
+
+                Some(chrono::DateTime::from_naive_utc_and_offset(naive, Utc))
+            }
+            None => None,
+        };
+    chrono::DateTime<FixedOffset>: ColumnData::DateTimeOffset(ref dto) => match *dto {
+        Some(dto) => {
+            let date = from_days(dto.datetime2.date.days() as i64, 1)?;
+            let ns = nanos_from_increments(dto.datetime2.time.increments, dto.datetime2.time.scale);
             let time = NaiveTime::from_hms_opt(0,0,0).unwrap() + chrono::Duration::nanoseconds(ns);
 
-            let offset = chrono::Duration::minutes(dto.offset as i64);
-            let naive = NaiveDateTime::new(date, time).sub(offset);
-
-            chrono::DateTime::from_naive_utc_and_offset(naive, Utc)
-        }),
-        ColumnData::DateTime2(ref dt2) => dt2.map(|dt2| {
-            let date = from_days(dt2.date.days() as i64, 1);
-            let ns = dt2.time.increments as i64 * 10i64.pow(9 - dt2.time.scale as u32);
-            let time = NaiveTime::from_hms_opt(0,0,0).unwrap() + chrono::Duration::nanoseconds(ns);
+            let minutes = validate_offset_minutes(dto.offset)?;
+            let offset = FixedOffset::east_opt(minutes * 60).ok_or_else(|| {
+                crate::Error::Protocol("datetimeoffset offset is not representable".into())
+            })?;
             let naive = NaiveDateTime::new(date, time);
 
-            chrono::DateTime::from_naive_utc_and_offset(naive, Utc)
-        });
-    chrono::DateTime<FixedOffset>: ColumnData::DateTimeOffset(ref dto) => dto.map(|dto| {
-        let date = from_days(dto.datetime2.date.days() as i64, 1);
-        let ns = dto.datetime2.time.increments as i64 * 10i64.pow(9 - dto.datetime2.time.scale as u32);
-        let time = NaiveTime::from_hms_opt(0,0,0).unwrap() + chrono::Duration::nanoseconds(ns);
-
-        let offset = FixedOffset::east_opt((dto.offset as i32) * 60).unwrap();
-        let naive = NaiveDateTime::new(date, time);
-
-        chrono::DateTime::from_naive_utc_and_offset(naive, offset)
-    })
+            Some(chrono::DateTime::from_naive_utc_and_offset(naive, offset))
+        }
+        None => None,
+    }
 );
 
 #[cfg(feature = "tds73")]
@@ -236,8 +310,219 @@ into_sql!(self_,
 #[cfg(not(feature = "tds73"))]
 from_sql!(
     NaiveDateTime:
-        ColumnData::DateTime(ref dt) => dt.map(|dt| NaiveDateTime::new(
-            from_days(dt.days as i64, 1900),
-            from_sec_fragments(dt.seconds_fragments as i64)
-        ))
+        ColumnData::DateTime(ref dt) => match *dt {
+            Some(dt) => Some(NaiveDateTime::new(
+                from_days(dt.days as i64, 1900)?,
+                from_sec_fragments(dt.seconds_fragments as i64)
+            )),
+            None => None,
+        }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FromSql, IntoSql};
+
+    #[test]
+    fn from_days_out_of_range_errors() {
+        // A day offset far outside the representable `NaiveDate` range must
+        // return a protocol error rather than silently clamping to MIN/MAX
+        // (which would decode a malformed value to a plausible-but-wrong date).
+        for days in [200_000_000_i64, -200_000_000_i64] {
+            let err = from_days(days, 1).expect_err("out-of-range day offset must error");
+            assert!(
+                matches!(err, crate::Error::Protocol(_)),
+                "expected a protocol error, got {err:?}"
+            );
+        }
+
+        // A valid in-range date still decodes correctly (happy path unchanged).
+        assert_eq!(
+            from_days(0, 1).unwrap(),
+            NaiveDate::from_ymd_opt(1, 1, 1).unwrap()
+        );
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn validate_offset_minutes_rejects_out_of_range() {
+        // Valid SQL Server range -14:00..=+14:00 (±840 minutes) succeeds.
+        assert_eq!(validate_offset_minutes(60).unwrap(), 60);
+        assert_eq!(validate_offset_minutes(-840).unwrap(), -840);
+
+        // A malformed offset beyond ±14h must error, not silently fall back to UTC.
+        for minutes in [841_i16, -841, 5000, -5000] {
+            let err = validate_offset_minutes(minutes).expect_err("out-of-range offset must error");
+            assert!(
+                matches!(err, crate::Error::Protocol(_)),
+                "expected a protocol error, got {err:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn datetimeoffset_out_of_range_offset_errors() {
+        // Build a DateTimeOffset with an offset well outside ±14h. Both the
+        // `DateTime<Utc>` and `DateTime<FixedOffset>` decode arms must error.
+        let dt2 = DateTime2::new(Date::new(0), Time::new(0, 7));
+        let dto = DateTimeOffset::new(dt2, 5000);
+        let data = ColumnData::DateTimeOffset(Some(dto));
+
+        let err = chrono::DateTime::<Utc>::from_sql(&data)
+            .expect_err("out-of-range offset must error, not silently fall back");
+        assert!(
+            matches!(err, crate::Error::Protocol(_)),
+            "expected a protocol error, got {err:?}"
+        );
+
+        let err = chrono::DateTime::<FixedOffset>::from_sql(&data)
+            .expect_err("out-of-range offset must error, not silently fall back");
+        assert!(
+            matches!(err, crate::Error::Protocol(_)),
+            "expected a protocol error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_sec_fragments_converts() {
+        // 300 sec-fragments (1/300 s units) == exactly one second.
+        assert_eq!(
+            from_sec_fragments(300),
+            NaiveTime::from_hms_opt(0, 0, 1).unwrap()
+        );
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn from_mins_converts() {
+        // `from_mins` takes seconds-from-midnight; 3600 s == 01:00:00.
+        assert_eq!(from_mins(3600), NaiveTime::from_hms_opt(1, 0, 0).unwrap());
+    }
+
+    #[cfg(not(feature = "tds73"))]
+    #[test]
+    fn to_sec_fragments_converts() {
+        // One second == 300 sec-fragments (1/300 s units).
+        assert_eq!(
+            to_sec_fragments(NaiveTime::from_hms_opt(0, 0, 1).unwrap()),
+            300
+        );
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn naive_date_round_trip() {
+        let date = NaiveDate::from_ymd_opt(2021, 6, 15).unwrap();
+        let cd: ColumnData<'static> = date.into_sql();
+        assert!(matches!(cd, ColumnData::Date(Some(_))));
+        assert_eq!(NaiveDate::from_sql(&cd).unwrap(), Some(date));
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn naive_time_round_trip() {
+        let time = NaiveTime::from_hms_opt(13, 37, 42).unwrap();
+        let cd: ColumnData<'static> = time.into_sql();
+        assert!(matches!(cd, ColumnData::Time(Some(_))));
+        assert_eq!(NaiveTime::from_sql(&cd).unwrap(), Some(time));
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn naive_datetime_round_trip() {
+        let dt = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2000, 12, 31).unwrap(),
+            NaiveTime::from_hms_opt(23, 59, 58).unwrap(),
+        );
+        let cd: ColumnData<'static> = dt.into_sql();
+        assert!(matches!(cd, ColumnData::DateTime2(Some(_))));
+        assert_eq!(NaiveDateTime::from_sql(&cd).unwrap(), Some(dt));
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn datetime_utc_round_trip() {
+        let naive = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2015, 3, 4).unwrap(),
+            NaiveTime::from_hms_opt(1, 2, 3).unwrap(),
+        );
+        let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+        let cd: ColumnData<'static> = dt.into_sql();
+        assert!(matches!(cd, ColumnData::DateTime2(Some(_))));
+        assert_eq!(chrono::DateTime::<Utc>::from_sql(&cd).unwrap(), Some(dt));
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn datetime_fixed_offset_round_trip() {
+        let offset = FixedOffset::east_opt(2 * 3600).unwrap();
+        let naive = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2015, 3, 4).unwrap(),
+            NaiveTime::from_hms_opt(1, 2, 3).unwrap(),
+        );
+        let dt = chrono::DateTime::from_naive_utc_and_offset(naive, offset);
+        let cd: ColumnData<'static> = dt.into_sql();
+        assert!(matches!(cd, ColumnData::DateTimeOffset(Some(_))));
+        assert_eq!(
+            chrono::DateTime::<FixedOffset>::from_sql(&cd).unwrap(),
+            Some(dt)
+        );
+    }
+
+    // The tds73 `from_sql` NaiveDateTime path has a dedicated arm for the legacy
+    // `ColumnData::DateTime` wire type; exercise it directly (round-trips produce
+    // `DateTime2`, never `DateTime`, so this arm is otherwise unreachable).
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn naive_datetime_from_legacy_datetime_column() {
+        let cd = ColumnData::DateTime(Some(crate::tds::time::DateTime::new(0, 0)));
+        let dt = NaiveDateTime::from_sql(&cd).unwrap().unwrap();
+        assert_eq!(
+            dt,
+            NaiveDateTime::new(
+                NaiveDate::from_ymd_opt(1900, 1, 1).unwrap(),
+                NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            )
+        );
+    }
+
+    // The `DateTimeOffset -> DateTime<Utc>` conversion arm (distinct from the
+    // `DateTime<FixedOffset>` arm exercised by the round-trip test).
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn datetime_offset_reads_as_utc() {
+        let offset = FixedOffset::east_opt(2 * 3600).unwrap();
+        let naive = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2015, 3, 4).unwrap(),
+            NaiveTime::from_hms_opt(1, 2, 3).unwrap(),
+        );
+        let dt: chrono::DateTime<FixedOffset> =
+            chrono::DateTime::from_naive_utc_and_offset(naive, offset);
+        let cd: ColumnData<'static> = dt.into_sql();
+        assert!(matches!(cd, ColumnData::DateTimeOffset(Some(_))));
+
+        let utc = chrono::DateTime::<Utc>::from_sql(&cd).unwrap();
+        assert!(utc.is_some());
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn null_maps_to_none() {
+        assert_eq!(NaiveDate::from_sql(&ColumnData::Date(None)).unwrap(), None);
+        assert_eq!(NaiveTime::from_sql(&ColumnData::Time(None)).unwrap(), None);
+    }
+
+    #[cfg(not(feature = "tds73"))]
+    #[test]
+    fn naive_datetime_round_trip_legacy() {
+        let dt = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(1990, 1, 1).unwrap(),
+            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+        );
+        let cd: ColumnData<'static> = dt.into_sql();
+        assert!(matches!(cd, ColumnData::DateTime(Some(_))));
+        assert_eq!(NaiveDateTime::from_sql(&cd).unwrap(), Some(dt));
+    }
+}

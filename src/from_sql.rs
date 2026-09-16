@@ -150,4 +150,143 @@ mod tests {
         assert_eq!(None, i32::from_sql(&data).unwrap());
         assert_eq!(None, i32::from_sql_owned(ColumnData::I16(None)).unwrap());
     }
+
+    #[test]
+    fn bool_from_bit() {
+        let data = ColumnData::Bit(Some(true));
+        assert_eq!(Some(true), bool::from_sql(&data).unwrap());
+        assert_eq!(Some(true), bool::from_sql_owned(data).unwrap());
+    }
+
+    #[test]
+    fn u8_from_u8_and_null_i32() {
+        let data = ColumnData::U8(Some(5));
+        assert_eq!(Some(5u8), u8::from_sql(&data).unwrap());
+        assert_eq!(Some(5u8), u8::from_sql_owned(data).unwrap());
+
+        let null = ColumnData::I32(None);
+        assert_eq!(None, u8::from_sql(&null).unwrap());
+        assert_eq!(None, u8::from_sql_owned(null).unwrap());
+    }
+
+    #[test]
+    fn i16_from_wrong_variant_errors() {
+        let data = ColumnData::F64(Some(1.0));
+        let err = i16::from_sql(&data).unwrap_err();
+        assert!(format!("{}", err).contains("cannot interpret"));
+    }
+
+    #[test]
+    fn i64_from_i64_and_null() {
+        let data = ColumnData::I64(Some(42));
+        assert_eq!(Some(42i64), i64::from_sql(&data).unwrap());
+        assert_eq!(Some(42i64), i64::from_sql_owned(data).unwrap());
+
+        let null = ColumnData::U8(None);
+        assert_eq!(None, i64::from_sql_owned(null).unwrap());
+    }
+
+    #[test]
+    fn f32_and_f64_from_sql() {
+        let f32_data = ColumnData::F32(Some(1.5));
+        assert_eq!(Some(1.5f32), f32::from_sql(&f32_data).unwrap());
+
+        let f64_data = ColumnData::F64(Some(2.5));
+        assert_eq!(Some(2.5f64), f64::from_sql(&f64_data).unwrap());
+    }
+
+    #[test]
+    fn uuid_from_guid() {
+        let uuid = Uuid::new_v4();
+        let data = ColumnData::Guid(Some(uuid));
+        assert_eq!(Some(uuid), Uuid::from_sql(&data).unwrap());
+        assert_eq!(Some(uuid), Uuid::from_sql_owned(data).unwrap());
+    }
+
+    #[test]
+    fn numeric_from_numeric() {
+        let numeric = crate::tds::Numeric::new_with_scale(1234, 2);
+        let data = ColumnData::Numeric(Some(numeric));
+        assert_eq!(Some(numeric), Numeric::from_sql(&data).unwrap());
+        assert_eq!(Some(numeric), Numeric::from_sql_owned(data).unwrap());
+    }
+
+    #[test]
+    fn xml_data_owned_and_borrowed() {
+        let xml = XmlData::new("<a/>".to_string());
+        let data = ColumnData::Xml(Some(std::borrow::Cow::Owned(xml.clone())));
+
+        let borrowed = <&XmlData as FromSql>::from_sql(&data).unwrap().unwrap();
+        assert_eq!(borrowed.to_string(), xml.to_string());
+
+        let owned = XmlData::from_sql_owned(data).unwrap().unwrap();
+        assert_eq!(owned.to_string(), xml.to_string());
+    }
+
+    #[test]
+    fn xml_data_wrong_variant_errors() {
+        let data = ColumnData::I32(Some(1));
+        let err = XmlData::from_sql_owned(data).unwrap_err();
+        assert!(format!("{}", err).contains("cannot interpret"));
+
+        let data = ColumnData::I32(Some(1));
+        let err = <&XmlData as FromSql>::from_sql(&data).unwrap_err();
+        assert!(format!("{}", err).contains("cannot interpret"));
+    }
+
+    #[test]
+    fn string_owned_and_borrowed_str() {
+        let data = ColumnData::String(Some(std::borrow::Cow::Borrowed("hello")));
+        let borrowed = <&str as FromSql>::from_sql(&data).unwrap();
+        assert_eq!(Some("hello"), borrowed);
+
+        let owned = String::from_sql_owned(data).unwrap();
+        assert_eq!(Some("hello".to_string()), owned);
+    }
+
+    #[test]
+    fn string_wrong_variant_errors() {
+        let data = ColumnData::I32(Some(1));
+        let err = String::from_sql_owned(data).unwrap_err();
+        assert!(format!("{}", err).contains("cannot interpret"));
+
+        let data = ColumnData::I32(Some(1));
+        let err = <&str as FromSql>::from_sql(&data).unwrap_err();
+        assert!(format!("{}", err).contains("cannot interpret"));
+    }
+
+    #[test]
+    fn binary_owned_and_borrowed_slice() {
+        let bytes = vec![1u8, 2, 3];
+        let data = ColumnData::Binary(Some(std::borrow::Cow::Owned(bytes.clone())));
+
+        let borrowed = <&[u8] as FromSql>::from_sql(&data).unwrap();
+        assert_eq!(Some(bytes.as_slice()), borrowed);
+
+        let owned = Vec::<u8>::from_sql_owned(data).unwrap();
+        assert_eq!(Some(bytes), owned);
+    }
+
+    #[test]
+    fn binary_wrong_variant_errors() {
+        let data = ColumnData::I32(Some(1));
+        let err = Vec::<u8>::from_sql_owned(data).unwrap_err();
+        assert!(format!("{}", err).contains("cannot interpret"));
+
+        let data = ColumnData::I32(Some(1));
+        let err = <&[u8] as FromSql>::from_sql(&data).unwrap_err();
+        assert!(format!("{}", err).contains("cannot interpret"));
+    }
+
+    #[test]
+    fn null_string_and_binary_values() {
+        let data = ColumnData::String(None);
+        assert_eq!(None, String::from_sql_owned(data).unwrap());
+
+        let data = ColumnData::Binary(None);
+        assert_eq!(None, Vec::<u8>::from_sql_owned(data).unwrap());
+
+        let data = ColumnData::Xml(None);
+        assert_eq!(None, XmlData::from_sql_owned(data).unwrap());
+    }
 }
