@@ -669,7 +669,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 login_message.aad_token(token, prelogin.fed_auth_required, prelogin.nonce);
                 // Encode into a zeroizing buffer and use the sensitive-login
                 // path so the bearer token does not linger in freed heap memory.
-                let payload = login_message.encode_to_vec()?;
+                let payload = login_message.encode_to_boxed_slice()?;
                 let id = self.context.next_packet_id();
                 self.send_sensitive_login(PacketHeader::login(id), payload)
                     .await?;
