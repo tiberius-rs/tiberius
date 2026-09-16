@@ -7,7 +7,7 @@ pub(crate) trait Encode<B: BufMut> {
 }
 
 impl Encoder for PacketCodec {
-    type Item = Packet;
+    type Item<'a> = Packet;
     type Error = crate::Error;
 
     fn encode(&mut self, item: Packet, dst: &mut BytesMut) -> Result<(), Self::Error> {

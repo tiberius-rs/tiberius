@@ -2,8 +2,9 @@ use crate::tds::codec::TokenSspi;
 use crate::{
     client::Connection,
     tds::codec::{
-        TokenColMetaData, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck, TokenInfo,
-        TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
+        TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenDone, TokenEnvChange,
+        TokenError, TokenFeatureExtAck, TokenFedAuthInfo, TokenInfo, TokenLoginAck, TokenOrder,
+        TokenReturnValue, TokenRow, TokenSessionState, TokenTabName,
     },
     Error, SqlReadBytes, TokenType,
 };
@@ -18,18 +19,24 @@ use tracing::{event, Level};
 #[allow(dead_code)]
 pub enum ReceivedToken {
     NewResultset(Arc<TokenColMetaData<'static>>),
+    NewAltResultset(Arc<TokenAltMetaData<'static>>),
     Row(TokenRow<'static>),
+    AltRow(TokenAltRow<'static>),
     Done(TokenDone),
     DoneInProc(TokenDone),
     DoneProc(TokenDone),
     ReturnStatus(u32),
     ReturnValue(TokenReturnValue),
     Order(TokenOrder),
+    ColInfo(TokenColInfo),
+    TabName(TokenTabName),
     EnvChange(TokenEnvChange),
     Info(TokenInfo),
     LoginAck(TokenLoginAck),
     Sspi(TokenSspi),
     FeatureExtAck(TokenFeatureExtAck),
+    SessionState(TokenSessionState),
+    FedAuthInfo(TokenFedAuthInfo),
     Error(TokenError),
 }
 
@@ -75,7 +82,34 @@ where
         }
     }
 
-    #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
+    /// Drain the token stream after a client Attention signal has been sent,
+    /// discarding every remaining token of the cancelled request until the
+    /// acknowledging DONE token (with the `DONE_ATTN` status bit set) is
+    /// received, per MS-TDS section 2.2.1.6. Returns that DONE token so the
+    /// connection is left clean and ready for reuse.
+    pub(crate) async fn flush_done_attention(self) -> crate::Result<TokenDone> {
+        let mut stream = self.try_unfold();
+
+        loop {
+            match stream.try_next().await? {
+                Some(ReceivedToken::Done(token))
+                | Some(ReceivedToken::DoneProc(token))
+                | Some(ReceivedToken::DoneInProc(token))
+                    if token.is_attention() =>
+                {
+                    return Ok(token);
+                }
+                Some(_) => (),
+                None => {
+                    return Err(crate::Error::Protocol(
+                        "Never got a DONE token acknowledging the Attention signal.".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    #[cfg(any(windows, feature = "integrated-auth-gssapi", feature = "sspi-rs"))]
     pub(crate) async fn flush_sspi(self) -> crate::Result<TokenSspi> {
         let mut stream = self.try_unfold();
         let mut last_error = None;
@@ -104,6 +138,30 @@ where
         event!(Level::TRACE, ?meta);
 
         Ok(ReceivedToken::NewResultset(meta))
+    }
+
+    async fn get_alt_col_metadata(&mut self) -> crate::Result<ReceivedToken> {
+        let meta = Arc::new(TokenAltMetaData::decode(self.conn).await?);
+        self.conn.context_mut().set_alt_meta(meta.clone());
+
+        event!(Level::TRACE, ?meta);
+
+        Ok(ReceivedToken::NewAltResultset(meta))
+    }
+
+    async fn get_alt_row(&mut self) -> crate::Result<ReceivedToken> {
+        // The id is read first so the matching ALTMETADATA can be looked up
+        // before the column values are parsed.
+        let id = self.conn.read_u16_le().await?;
+
+        let meta = self.conn.context().alt_meta(id).ok_or_else(|| {
+            Error::Protocol(format!("ALTROW for unknown compute id {}", id).into())
+        })?;
+
+        let row = TokenAltRow::decode(self.conn, id, &meta).await?;
+
+        event!(Level::TRACE, message = ?row);
+        Ok(ReceivedToken::AltRow(row))
     }
 
     async fn get_row(&mut self) -> crate::Result<ReceivedToken> {
@@ -148,6 +206,18 @@ where
         Ok(ReceivedToken::Order(order))
     }
 
+    async fn get_col_info(&mut self) -> crate::Result<ReceivedToken> {
+        let col_info = TokenColInfo::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?col_info);
+        Ok(ReceivedToken::ColInfo(col_info))
+    }
+
+    async fn get_tab_name(&mut self) -> crate::Result<ReceivedToken> {
+        let tab_name = TokenTabName::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?tab_name);
+        Ok(ReceivedToken::TabName(tab_name))
+    }
+
     async fn get_done_value(&mut self) -> crate::Result<ReceivedToken> {
         let done = TokenDone::decode(self.conn).await?;
         event!(Level::TRACE, "{}", done);
@@ -171,6 +241,16 @@ where
 
         match change {
             TokenEnvChange::PacketSize { new: new_size, .. } => {
+                // MS-TDS: a negotiated packet size must be within 512..=32767.
+                // Reject an out-of-range value from the server: the subsequent
+                // `packet_size - HEADER_BYTES` in the send paths would otherwise
+                // underflow (debug panic) or, for a value of exactly 8, produce
+                // a zero chunk size and spin `split_to(0)` forever.
+                if !(512..=32767).contains(&new_size) {
+                    return Err(crate::Error::Protocol(
+                        format!("server requested an invalid packet size of {new_size}").into(),
+                    ));
+                }
                 self.conn.context_mut().set_packet_size(new_size);
             }
             TokenEnvChange::BeginTransaction(desc) => {
@@ -211,6 +291,24 @@ where
         Ok(ReceivedToken::FeatureExtAck(ack))
     }
 
+    async fn get_session_state(&mut self) -> crate::Result<ReceivedToken> {
+        let state = TokenSessionState::decode(self.conn).await?;
+        event!(
+            Level::TRACE,
+            "SessionState seq_no={} recoverable={} states={}",
+            state.seq_no,
+            state.is_recoverable(),
+            state.states.len()
+        );
+        Ok(ReceivedToken::SessionState(state))
+    }
+
+    async fn get_fed_auth_info(&mut self) -> crate::Result<ReceivedToken> {
+        let info = TokenFedAuthInfo::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?info);
+        Ok(ReceivedToken::FedAuthInfo(info))
+    }
+
     async fn get_sspi(&mut self) -> crate::Result<ReceivedToken> {
         let sspi = TokenSspi::decode_async(self.conn).await?;
         event!(Level::TRACE, "SSPI response");
@@ -234,7 +332,9 @@ where
             let token = match ty {
                 TokenType::ReturnStatus => this.get_return_status().await?,
                 TokenType::ColMetaData => this.get_col_metadata().await?,
+                TokenType::AltMetaData => this.get_alt_col_metadata().await?,
                 TokenType::Row => this.get_row().await?,
+                TokenType::AltRow => this.get_alt_row().await?,
                 TokenType::NbcRow => this.get_nbc_row().await?,
                 TokenType::Done => this.get_done_value().await?,
                 TokenType::DoneProc => this.get_done_proc_value().await?,
@@ -242,11 +342,17 @@ where
                 TokenType::ReturnValue => this.get_return_value().await?,
                 TokenType::Error => this.get_error().await?,
                 TokenType::Order => this.get_order().await?,
+                TokenType::ColInfo => this.get_col_info().await?,
+                TokenType::TabName => this.get_tab_name().await?,
                 TokenType::EnvChange => this.get_env_change().await?,
                 TokenType::Info => this.get_info().await?,
                 TokenType::LoginAck => this.get_login_ack().await?,
                 TokenType::Sspi => this.get_sspi().await?,
+                TokenType::SessionState => this.get_session_state().await?,
+                TokenType::FedAuthInfo => this.get_fed_auth_info().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
+                // Defensive fallback for token types without a dedicated handler.
+                #[allow(unreachable_patterns)]
                 _ => {
                     return Err(Error::Protocol(
                         format!("Token {:?} unimplemented!", ty).into(),

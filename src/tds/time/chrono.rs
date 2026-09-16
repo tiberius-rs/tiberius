@@ -11,7 +11,7 @@ use super::DateTime as DateTime1;
 use super::{Date, DateTime2, DateTimeOffset, Time};
 use crate::tds::codec::ColumnData;
 #[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
 pub use chrono::offset::{FixedOffset, Utc};
 pub use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 #[cfg(feature = "tds73")]

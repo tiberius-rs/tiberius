@@ -41,13 +41,15 @@ pub enum Error {
     /// An error in the TLS handshake.
     Tls(String),
     #[cfg(any(all(unix, feature = "integrated-auth-gssapi"), doc))]
-    #[cfg_attr(
-        feature = "docs",
-        doc(cfg(all(unix, feature = "integrated-auth-gssapi")))
-    )]
+    #[cfg_attr(docsrs, doc(cfg(all(unix, feature = "integrated-auth-gssapi"))))]
     /// An error from the GSSAPI library.
     #[error("GSSAPI Error: {}", _0)]
     Gssapi(String),
+    #[cfg(any(all(unix, feature = "sspi-rs"), doc))]
+    #[cfg_attr(docsrs, doc(cfg(all(unix, feature = "sspi-rs"))))]
+    /// An error from the `sspi` (sspi-rs) library.
+    #[error("sspi-rs Error: {}", _0)]
+    SspiRs(String),
     #[error(
         "Server requested a connection to an alternative address: `{}:{}`",
         host,
@@ -83,7 +85,7 @@ impl Error {
 
 impl From<uuid::Error> for Error {
     fn from(e: uuid::Error) -> Self {
-        Self::Conversion(format!("Error convertiong a Guid value {}", e).into())
+        Self::Conversion(format!("Error converting a Guid value {}", e).into())
     }
 }
 
@@ -148,12 +150,150 @@ impl From<connection_string::Error> for Error {
 }
 
 #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
-#[cfg_attr(
-    feature = "docs",
-    doc(cfg(all(unix, feature = "integrated-auth-gssapi")))
-)]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "integrated-auth-gssapi"))))]
 impl From<libgssapi::error::Error> for Error {
     fn from(err: libgssapi::error::Error) -> Error {
         Error::Gssapi(format!("{}", err))
+    }
+}
+
+#[cfg(all(unix, feature = "sspi-rs"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "sspi-rs"))))]
+impl From<sspi::Error> for Error {
+    fn from(err: sspi::Error) -> Error {
+        Error::SspiRs(format!("{}", err))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token_error(code: u32) -> TokenError {
+        TokenError {
+            code,
+            state: 1,
+            class: 16,
+            message: "boom".to_string(),
+            server: "srv".to_string(),
+            procedure: "proc".to_string(),
+            line: 3,
+        }
+    }
+
+    #[test]
+    fn code_and_is_deadlock() {
+        let deadlock = Error::Server(token_error(1205));
+        assert_eq!(deadlock.code(), Some(1205));
+        assert!(deadlock.is_deadlock());
+
+        let other = Error::Server(token_error(500));
+        assert_eq!(other.code(), Some(500));
+        assert!(!other.is_deadlock());
+
+        let non_server = Error::Utf8;
+        assert_eq!(non_server.code(), None);
+        assert!(!non_server.is_deadlock());
+    }
+
+    #[test]
+    fn display_variants() {
+        assert_eq!(
+            format!("{}", Error::Protocol("bad".into())),
+            "Protocol error: bad"
+        );
+        assert_eq!(
+            format!("{}", Error::Encoding("bad".into())),
+            "Encoding error: bad"
+        );
+        assert_eq!(
+            format!("{}", Error::Conversion("bad".into())),
+            "Conversion error: bad"
+        );
+        assert_eq!(format!("{}", Error::Utf8), "UTF-8 error");
+        assert_eq!(format!("{}", Error::Utf16), "UTF-16 error");
+        assert_eq!(
+            format!("{}", Error::BulkInput("bad".into())),
+            "BULK UPLOAD input failure: bad"
+        );
+
+        let routing = Error::Routing {
+            host: "host".to_string(),
+            port: 1234,
+        };
+        assert!(format!("{}", routing).contains("host:1234"));
+    }
+
+    #[test]
+    fn from_io_error() {
+        let io_err = io::Error::new(io::ErrorKind::UnexpectedEof, "eof");
+        let err: Error = io_err.into();
+        match err {
+            Error::Io { kind, message } => {
+                assert_eq!(kind, io::ErrorKind::UnexpectedEof);
+                assert!(message.contains("eof"));
+            }
+            _ => panic!("expected Io"),
+        }
+    }
+
+    #[test]
+    fn from_parse_int_error() {
+        let parse_err = "not-a-number".parse::<i32>().unwrap_err();
+        let err: Error = parse_err.into();
+        assert!(matches!(err, Error::ParseInt(_)));
+    }
+
+    #[test]
+    #[allow(invalid_from_utf8)] // intentionally-invalid bytes to exercise the error path
+    fn from_utf8_and_utf16_errors() {
+        let utf8_err = String::from_utf8(vec![0xff, 0xfe]).unwrap_err();
+        assert!(matches!(Error::from(utf8_err), Error::Utf8));
+
+        let invalid: &[u8] = &[0xff, 0xfe];
+        let str_utf8 = std::str::from_utf8(invalid).unwrap_err();
+        assert!(matches!(Error::from(str_utf8), Error::Utf8));
+
+        let utf16_err = String::from_utf16(&[0xd800]).unwrap_err();
+        assert!(matches!(Error::from(utf16_err), Error::Utf16));
+    }
+
+    #[test]
+    fn from_uuid_error() {
+        let uuid_err = uuid::Uuid::parse_str("not-a-uuid").unwrap_err();
+        assert!(matches!(Error::from(uuid_err), Error::Conversion(_)));
+    }
+
+    #[test]
+    fn equality_between_errors() {
+        assert_eq!(Error::Utf8, Error::Utf8);
+        assert_ne!(Error::Utf8, Error::Utf16);
+    }
+
+    #[test]
+    fn from_connection_string_error() {
+        let cs_err = connection_string::Error::new("bad connection string");
+        let err: Error = cs_err.into();
+        match err {
+            Error::Conversion(msg) => assert!(msg.contains("bad connection string")),
+            _ => panic!("expected Conversion"),
+        }
+    }
+
+    #[cfg(all(unix, feature = "sspi-rs"))]
+    #[test]
+    fn from_sspi_error() {
+        let sspi_err = sspi::Error::new(sspi::ErrorKind::InternalError, "sspi boom");
+        assert!(matches!(Error::from(sspi_err), Error::SspiRs(_)));
+    }
+
+    #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
+    #[test]
+    fn from_gssapi_error() {
+        let gss_err = libgssapi::error::Error {
+            major: libgssapi::error::MajorFlags::empty(),
+            minor: 0,
+        };
+        assert!(matches!(Error::from(gss_err), Error::Gssapi(_)));
     }
 }

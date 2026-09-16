@@ -26,7 +26,7 @@ static CONN_STR: Lazy<String> = Lazy::new(|| {
 
 thread_local! {
     static NAMES: RefCell<Option<Generator<'static>>> =
-    RefCell::new(None);
+        const { RefCell::new(None) };
 }
 
 async fn random_table() -> String {
@@ -527,3 +527,69 @@ test_bulk_columns!(ab_ba_override_default_columns(
     (&["a", "b", "c"], vec![(1i32, 1f64, 10i32); 100]),
     (&["b", "c", "a"], vec![(2f64, 20i32, 2i32); 100]),
 ));
+
+// Server-gated regression for the COLMETADATA `Flags` bit layout (MS-TDS
+// §2.2.7.4): the bulk-insert column filter in `src/client.rs` selects only
+// columns whose flags report them as `Updateable` and non-`Identity`. If the
+// `Identity` or `Computed` bit is misdecoded, an identity/computed column would
+// wrongly be treated as a bulk target (or a real target wrongly skipped) and
+// the server would reject the row set. This drives a real server to prove the
+// flags cause the identity (and computed) columns to be skipped while the
+// normal column lands. Compiles locally; runs only with a live server in CI.
+#[test_on_runtimes]
+async fn bulk_insert_skips_identity_and_computed_columns<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+
+    // `id` is IDENTITY (fIdentity set, not writeable), `c` is COMPUTED
+    // (fComputed set, not writeable); only `val` is a valid bulk target.
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (id INT IDENTITY PRIMARY KEY, val INT NOT NULL, c AS (val + 1))",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    let mut req = conn.bulk_insert(&table).await?;
+    for v in 0..10i32 {
+        let mut row = TokenRow::new();
+        row.push(v.into_sql());
+        req.send(row).await?;
+    }
+    let res = req.finalize().await?;
+    assert_eq!(10, res.total());
+
+    // All rows landed, identity auto-populated, and the computed column
+    // reflects `val + 1` — confirming the identity/computed columns were
+    // correctly excluded from the bulk column list.
+    let count: i32 = conn
+        .query(&format!("SELECT COUNT(*) FROM {}", table), &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(10, count);
+
+    let bad: i32 = conn
+        .query(
+            &format!("SELECT COUNT(*) FROM {} WHERE c <> val + 1", table),
+            &[],
+        )
+        .await?
+        .into_row()
+        .await?
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(0, bad);
+
+    Ok(())
+}

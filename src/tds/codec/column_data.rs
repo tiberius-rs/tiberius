@@ -15,10 +15,12 @@ mod image;
 mod int;
 mod money;
 mod plp;
+mod sql_variant;
 mod string;
 mod text;
 #[cfg(feature = "tds73")]
 mod time;
+mod udt;
 mod var_len;
 mod xml;
 
@@ -27,7 +29,7 @@ use super::{Encode, FixedLenType, TypeInfo, VarLenType};
 use crate::tds::time::{Date, DateTime2, DateTimeOffset, Time};
 use crate::{
     tds::{time::DateTime, time::SmallDateTime, xml::XmlData, Numeric},
-    SqlReadBytes,
+    FromSql, FromSqlOwned, IntoSql, SqlReadBytes, ToSql,
 };
 use bytes::BufMut;
 pub(crate) use bytes_mut_with_type_info::BytesMutWithTypeInfo;
@@ -36,7 +38,48 @@ use uuid::Uuid;
 
 const MAX_NVARCHAR_SIZE: usize = 1 << 30;
 
+/// Number of days between `0001-01-01` (the `DateTime2`/`Date` epoch) and
+/// `1900-01-01` (the `datetime`/`Datetimen` epoch).
+#[cfg(feature = "tds73")]
+const DAYS_YEAR_1_TO_1900: u32 = 693_595;
+
+/// Converts a [`DateTime2`] value into the legacy `datetime` ([`DateTime`])
+/// wire representation.
+///
+/// This is used when bulk-inserting a `DateTime2`/`Date` value into a column
+/// whose server-side type is `datetime` (`Datetimen`). The `datetime` type
+/// counts days from `1900-01-01` and stores the time of day as 1/300-second
+/// fragments, so the sub-second precision of the source value is degraded to
+/// match. Returns a [`Conversion`] error if the date is earlier than
+/// `1900-01-01`, which `datetime` cannot represent.
+///
+/// [`Conversion`]: crate::Error::Conversion
+#[cfg(feature = "tds73")]
+fn datetime2_to_datetime(dt2: &DateTime2) -> crate::Result<DateTime> {
+    let dt2_days = dt2.date().days();
+
+    let days = dt2_days.checked_sub(DAYS_YEAR_1_TO_1900).ok_or_else(|| {
+        crate::Error::Conversion(
+            format!(
+                "invalid datetime, expecting a date not earlier than 1900-01-01 but got {} days after year 1",
+                dt2_days
+            )
+            .into(),
+        )
+    })? as i32;
+
+    // `increments` are counted in 10^-scale seconds; convert to nanoseconds and
+    // then to the 1/300-second fragments used by `datetime`, degrading the
+    // sub-second precision in the process.
+    let time = dt2.time();
+    let nanos = time.increments() as u128 * 10u128.pow(9 - time.scale() as u32);
+    let seconds_fragments = (nanos * 300 / 1_000_000_000) as u32;
+
+    Ok(DateTime::new(days, seconds_fragments))
+}
+
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 /// A container of a value that can be represented as a TDS value.
 pub enum ColumnData<'a> {
     /// 8-bit integer, unsigned.
@@ -68,19 +111,19 @@ pub enum ColumnData<'a> {
     /// A small DateTime value.
     SmallDateTime(Option<SmallDateTime>),
     #[cfg(feature = "tds73")]
-    #[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
     /// Time value.
     Time(Option<Time>),
     #[cfg(feature = "tds73")]
-    #[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
     /// Date value.
     Date(Option<Date>),
     #[cfg(feature = "tds73")]
-    #[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
     /// DateTime2 value.
     DateTime2(Option<DateTime2>),
     #[cfg(feature = "tds73")]
-    #[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
     /// DateTime2 value with an offset.
     DateTimeOffset(Option<DateTimeOffset>),
 }
@@ -136,6 +179,7 @@ impl<'a> ColumnData<'a> {
                 _ => todo!(),
             },
             TypeInfo::Xml { schema, size } => xml::decode(src, *size, schema.clone()).await?,
+            TypeInfo::Udt(_) => udt::decode(src).await?,
         };
 
         Ok(res)
@@ -158,13 +202,18 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
             (ColumnData::Bit(Some(val)), Some(TypeInfo::FixedLen(FixedLenType::Bit))) => {
                 dst.put_u8(val as u8);
             }
-            (ColumnData::Bit(Some(val)), None) => {
+            (ColumnData::Bit(opt), None) => {
                 // if TypeInfo was not given, encode a TypeInfo
                 // the first 1 is part of TYPE_INFO
-                // the second 1 is part of TYPE_VARBYTE
-                let header = [VarLenType::Bitn as u8, 1, 1];
+                let header = [VarLenType::Bitn as u8, 1];
                 dst.extend_from_slice(&header);
-                dst.put_u8(val as u8);
+                if let Some(val) = opt {
+                    // the second 1 is part of TYPE_VARBYTE
+                    dst.put_u8(1);
+                    dst.put_u8(val as u8);
+                } else {
+                    dst.put_u8(0);
+                }
             }
             (ColumnData::U8(opt), Some(TypeInfo::VarLenSized(vlc)))
                 if vlc.r#type() == VarLenType::Intn =>
@@ -179,10 +228,15 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
             (ColumnData::U8(Some(val)), Some(TypeInfo::FixedLen(FixedLenType::Int1))) => {
                 dst.put_u8(val);
             }
-            (ColumnData::U8(Some(val)), None) => {
-                let header = [VarLenType::Intn as u8, 1, 1];
+            (ColumnData::U8(opt), None) => {
+                let header = [VarLenType::Intn as u8, 1];
                 dst.extend_from_slice(&header);
-                dst.put_u8(val);
+                if let Some(val) = opt {
+                    dst.put_u8(1);
+                    dst.put_u8(val);
+                } else {
+                    dst.put_u8(0);
+                }
             }
             (ColumnData::I16(Some(val)), Some(TypeInfo::FixedLen(FixedLenType::Int2))) => {
                 dst.put_i16_le(val);
@@ -197,11 +251,15 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst.put_u8(0);
                 }
             }
-            (ColumnData::I16(Some(val)), None) => {
-                let header = [VarLenType::Intn as u8, 2, 2];
+            (ColumnData::I16(opt), None) => {
+                let header = [VarLenType::Intn as u8, 2];
                 dst.extend_from_slice(&header);
-
-                dst.put_i16_le(val);
+                if let Some(val) = opt {
+                    dst.put_u8(2);
+                    dst.put_i16_le(val);
+                } else {
+                    dst.put_u8(0);
+                }
             }
             (ColumnData::I32(Some(val)), Some(TypeInfo::FixedLen(FixedLenType::Int4))) => {
                 dst.put_i32_le(val);
@@ -216,10 +274,15 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst.put_u8(0);
                 }
             }
-            (ColumnData::I32(Some(val)), None) => {
-                let header = [VarLenType::Intn as u8, 4, 4];
+            (ColumnData::I32(opt), None) => {
+                let header = [VarLenType::Intn as u8, 4];
                 dst.extend_from_slice(&header);
-                dst.put_i32_le(val);
+                if let Some(val) = opt {
+                    dst.put_u8(4);
+                    dst.put_i32_le(val);
+                } else {
+                    dst.put_u8(0);
+                }
             }
             (ColumnData::I64(Some(val)), Some(TypeInfo::FixedLen(FixedLenType::Int8))) => {
                 dst.put_i64_le(val);
@@ -234,10 +297,15 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst.put_u8(0);
                 }
             }
-            (ColumnData::I64(Some(val)), None) => {
-                let header = [VarLenType::Intn as u8, 8, 8];
+            (ColumnData::I64(opt), None) => {
+                let header = [VarLenType::Intn as u8, 8];
                 dst.extend_from_slice(&header);
-                dst.put_i64_le(val);
+                if let Some(val) = opt {
+                    dst.put_u8(8);
+                    dst.put_i64_le(val);
+                } else {
+                    dst.put_u8(0);
+                }
             }
             (ColumnData::F32(Some(val)), Some(TypeInfo::FixedLen(FixedLenType::Float4))) => {
                 dst.put_f32_le(val);
@@ -252,10 +320,15 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst.put_u8(0);
                 }
             }
-            (ColumnData::F32(Some(val)), None) => {
-                let header = [VarLenType::Floatn as u8, 4, 4];
+            (ColumnData::F32(opt), None) => {
+                let header = [VarLenType::Floatn as u8, 4];
                 dst.extend_from_slice(&header);
-                dst.put_f32_le(val);
+                if let Some(val) = opt {
+                    dst.put_u8(4);
+                    dst.put_f32_le(val);
+                } else {
+                    dst.put_u8(0);
+                }
             }
             (ColumnData::F64(Some(val)), Some(TypeInfo::FixedLen(FixedLenType::Float8))) => {
                 dst.put_f64_le(val);
@@ -270,10 +343,15 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst.put_u8(0);
                 }
             }
-            (ColumnData::F64(Some(val)), None) => {
-                let header = [VarLenType::Floatn as u8, 8, 8];
+            (ColumnData::F64(opt), None) => {
+                let header = [VarLenType::Floatn as u8, 8];
                 dst.extend_from_slice(&header);
-                dst.put_f64_le(val);
+                if let Some(val) = opt {
+                    dst.put_u8(8);
+                    dst.put_f64_le(val);
+                } else {
+                    dst.put_u8(0);
+                }
             }
             (ColumnData::F64(opt), Some(TypeInfo::VarLenSized(vlc)))
                 if vlc.r#type() == VarLenType::Money =>
@@ -311,13 +389,17 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst.put_u8(0);
                 }
             }
-            (ColumnData::Guid(Some(uuid)), None) => {
-                let header = [VarLenType::Guid as u8, 16, 16];
+            (ColumnData::Guid(opt), None) => {
+                let header = [VarLenType::Guid as u8, 16];
                 dst.extend_from_slice(&header);
-
-                let mut data = *uuid.as_bytes();
-                super::guid::reorder_bytes(&mut data);
-                dst.extend_from_slice(&data);
+                if let Some(uuid) = opt {
+                    dst.put_u8(16);
+                    let mut data = *uuid.as_bytes();
+                    super::guid::reorder_bytes(&mut data);
+                    dst.extend_from_slice(&data);
+                } else {
+                    dst.put_u8(0);
+                }
             }
             (ColumnData::String(opt), Some(TypeInfo::VarLenSized(vlc)))
                 if vlc.r#type() == VarLenType::BigChar
@@ -681,6 +763,18 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
             }
             #[cfg(feature = "tds73")]
             (ColumnData::DateTime2(opt), Some(TypeInfo::VarLenSized(vlc)))
+                if vlc.r#type() == VarLenType::Datetimen =>
+            {
+                if let Some(dt2) = opt {
+                    let dt = datetime2_to_datetime(&dt2)?;
+                    dst.put_u8(8);
+                    dt.encode(dst)?;
+                } else {
+                    dst.put_u8(0);
+                }
+            }
+            #[cfg(feature = "tds73")]
+            (ColumnData::DateTime2(opt), Some(TypeInfo::VarLenSized(vlc)))
                 if vlc.r#type() == VarLenType::Datetime2 =>
             {
                 if let Some(mut dt2) = opt {
@@ -778,6 +872,9 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 dst.extend_from_slice(headers);
                 num.encode(&mut *dst)?;
             }
+            (data, Some(TypeInfo::VarLenSized(vlc))) if vlc.r#type() == VarLenType::SSVariant => {
+                sql_variant::encode(&mut *dst, data)?;
+            }
             (_, None) => {
                 // None/null
                 dst.put_u8(FixedLenType::Null as u8);
@@ -790,6 +887,36 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
         }
 
         Ok(())
+    }
+}
+
+/// Reads a [`ColumnData`] straight out of a row without any conversion,
+/// borrowing from the row's owned data.
+impl<'a> FromSql<'a> for ColumnData<'a> {
+    fn from_sql(value: &'a ColumnData<'static>) -> crate::Result<Option<Self>> {
+        Ok(Some(value.clone()))
+    }
+}
+
+/// Reads a [`ColumnData`] straight out of a row without any conversion, taking
+/// ownership of the value.
+impl<'a> FromSqlOwned for ColumnData<'a> {
+    fn from_sql_owned(value: ColumnData<'static>) -> crate::Result<Option<Self>> {
+        Ok(Some(value))
+    }
+}
+
+/// Binds a [`ColumnData`] directly as a query parameter, by reference.
+impl<'a> ToSql for ColumnData<'a> {
+    fn to_sql(&self) -> ColumnData<'_> {
+        self.clone()
+    }
+}
+
+/// Binds a [`ColumnData`] directly as a query parameter, by value.
+impl<'a> IntoSql<'a> for ColumnData<'a> {
+    fn into_sql(self) -> ColumnData<'a> {
+        self
     }
 }
 
@@ -820,6 +947,15 @@ mod tests {
             .read_u8()
             .await
             .expect_err("decode must consume entire buffer");
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_json_round_trip() {
+        let value = ColumnData::I32(Some(1234));
+        let json = serde_json::to_string(&value).expect("serialize");
+        let back: ColumnData<'static> = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(value, back);
     }
 
     #[tokio::test]
@@ -1517,5 +1653,58 @@ mod tests {
             ColumnData::F64(Some(3.5)),
         )
         .await;
+    }
+
+    #[test]
+    fn column_data_from_sql_clones_by_reference() {
+        let value: ColumnData<'static> = ColumnData::I32(Some(42));
+        let out = ColumnData::from_sql(&value).unwrap();
+        assert_eq!(out, Some(ColumnData::I32(Some(42))));
+    }
+
+    #[test]
+    fn column_data_from_sql_owned_passes_through() {
+        let value: ColumnData<'static> = ColumnData::String(Some(Cow::Borrowed("hello")));
+        let out = ColumnData::from_sql_owned(value).unwrap();
+        assert_eq!(out, Some(ColumnData::String(Some(Cow::Borrowed("hello")))));
+    }
+
+    #[test]
+    fn column_data_to_sql_clones_by_reference() {
+        let value = ColumnData::Bit(Some(true));
+        assert_eq!(value.to_sql(), ColumnData::Bit(Some(true)));
+        // Original is untouched.
+        assert_eq!(value, ColumnData::Bit(Some(true)));
+    }
+
+    #[test]
+    fn column_data_into_sql_passes_through() {
+        let value = ColumnData::F64(Some(1.5));
+        assert_eq!(value.into_sql(), ColumnData::F64(Some(1.5)));
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn datetime2_to_datetime_conversion() {
+        use crate::tds::time::{Date, DateTime2, Time};
+
+        // 2020-01-01 00:00:00 with scale 7 (100ns increments).
+        // Days from year 1 to 2020-01-01 is 737_425.
+        let dt2 = DateTime2::new(Date::new(737_425), Time::new(0, 7));
+        let dt = datetime2_to_datetime(&dt2).expect("conversion must succeed");
+
+        assert_eq!(dt.days(), (737_425 - DAYS_YEAR_1_TO_1900) as i32);
+        assert_eq!(dt.seconds_fragments(), 0);
+
+        // 12:00:00 exactly => half a day of 1/300s fragments.
+        let noon_increments = 12u64 * 3600 * 10u64.pow(7);
+        let dt2 = DateTime2::new(Date::new(737_425), Time::new(noon_increments, 7));
+        let dt = datetime2_to_datetime(&dt2).expect("conversion must succeed");
+
+        assert_eq!(dt.seconds_fragments(), 12 * 3600 * 300);
+
+        // Dates earlier than 1900-01-01 cannot be represented by `datetime`.
+        let dt2 = DateTime2::new(Date::new(0), Time::new(0, 7));
+        assert!(datetime2_to_datetime(&dt2).is_err());
     }
 }

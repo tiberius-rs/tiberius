@@ -23,16 +23,22 @@ impl Debug for SqlServerAuth {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-#[cfg(any(all(windows, feature = "winauth"), doc))]
-#[cfg_attr(feature = "docs", doc(all(windows, feature = "winauth")))]
+#[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"), doc))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"))))
+)]
 pub struct WindowsAuth {
     pub(crate) user: String,
     pub(crate) password: String,
     pub(crate) domain: Option<String>,
 }
 
-#[cfg(any(all(windows, feature = "winauth"), doc))]
-#[cfg_attr(feature = "docs", doc(all(windows, feature = "winauth")))]
+#[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"), doc))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"))))
+)]
 impl Debug for WindowsAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WindowsAuth")
@@ -48,9 +54,14 @@ impl Debug for WindowsAuth {
 pub enum AuthMethod {
     /// Authenticate directly with SQL Server.
     SqlServer(SqlServerAuth),
-    /// Authenticate with Windows credentials.
-    #[cfg(any(all(windows, feature = "winauth"), doc))]
-    #[cfg_attr(feature = "docs", doc(cfg(all(windows, feature = "winauth"))))]
+    /// Authenticate with Windows credentials. On Windows this uses SSPI via the
+    /// `winauth` feature; on Unix it uses NTLM (no Kerberos) via the `sspi-rs`
+    /// feature.
+    #[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"), doc))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"))))
+    )]
     Windows(WindowsAuth),
     /// Authenticate as the currently logged in user. On Windows uses SSPI and
     /// Kerberos on Unix platforms.
@@ -60,7 +71,7 @@ pub enum AuthMethod {
         doc
     ))]
     #[cfg_attr(
-        feature = "docs",
+        docsrs,
         doc(cfg(any(windows, all(unix, feature = "integrated-auth-gssapi"))))
     )]
     Integrated,
@@ -81,8 +92,11 @@ impl AuthMethod {
     }
 
     /// Construct a new Windows authentication configuration.
-    #[cfg(any(all(windows, feature = "winauth"), doc))]
-    #[cfg_attr(feature = "docs", doc(cfg(all(windows, feature = "winauth"))))]
+    #[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"), doc))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"))))
+    )]
     pub fn windows(user: impl AsRef<str>, password: impl ToString) -> Self {
         let (domain, user) = match user.as_ref().find('\\') {
             Some(idx) => (Some(&user.as_ref()[..idx]), &user.as_ref()[idx + 1..]),
