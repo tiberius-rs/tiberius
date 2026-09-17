@@ -70,11 +70,13 @@ impl Encode<BytesMut> for VarLenContext {
 
         // length
         match self.r#type {
+            // DATENTYPE carries neither length nor scale in TYPE_INFO: it is a
+            // fixed 3-byte value. The decoder below already implements this
+            // (`VarLenType::Daten => 3`, with no `read_u8`).
             #[cfg(feature = "tds73")]
-            VarLenType::Daten
-            | VarLenType::Timen
-            | VarLenType::DatetimeOffsetn
-            | VarLenType::Datetime2 => {
+            VarLenType::Daten => (),
+            #[cfg(feature = "tds73")]
+            VarLenType::Timen | VarLenType::DatetimeOffsetn | VarLenType::Datetime2 => {
                 dst.put_u8(self.len() as u8);
             }
             VarLenType::Bitn
@@ -394,6 +396,35 @@ mod tests {
                 .expect("decode must succeed");
 
             assert_eq!(nti, ti)
+        }
+    }
+
+    /// COLMETADATA is a *sequence* of type infos, so a single round trip is not
+    /// enough: an encoder that writes one byte too many still decodes back to
+    /// the same value, and only the column that follows it goes wrong.
+    ///
+    /// This is what a bulk load hits with a `DATE` column — SQL Server rejects
+    /// it with "Invalid column type from bcp client for colid <date + 1>",
+    /// blaming the column after the date.
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn round_trip_sequence_of_date_and_the_column_after_it() {
+        let types = vec![
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Daten, 3, None)),
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 8, None)),
+        ];
+
+        let mut buf = BytesMut::new();
+        for ti in types.iter().cloned() {
+            ti.encode(&mut buf).expect("encode should be successful");
+        }
+
+        let mut src = buf.into_sql_read_bytes();
+        for ti in types {
+            let nti = TypeInfo::decode(&mut src)
+                .await
+                .expect("decode must succeed");
+            assert_eq!(nti, ti);
         }
     }
 }
