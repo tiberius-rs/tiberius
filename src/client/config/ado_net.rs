@@ -666,6 +666,101 @@ mod tests {
         Ok(())
     }
 
+    // No-TLS build: an explicit encryption request must error (not silently
+    // downgrade to plaintext, #305); opting out and an omitted keyword stay
+    // `NotSupported`.
+
+    #[test]
+    #[cfg(not(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    )))]
+    fn encryption_parsing_on_errors_without_tls_backend() -> crate::Result<()> {
+        for test_str in ["encrypt=true", "encrypt=yes"] {
+            let ado: AdoNetConfig = test_str.parse()?;
+            let err = ado.encrypt().unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Tls(_)),
+                "expected Error::Tls for {test_str}, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("without a TLS backend"), "message was: {msg}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    )))]
+    fn encryption_parsing_strict_errors_without_tls_backend() {
+        let ado: AdoNetConfig = "encrypt=strict".parse().unwrap();
+        let err = ado.encrypt().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Tls(_)),
+            "expected Error::Tls, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    )))]
+    fn encryption_parsing_mandatory_errors_without_tls_backend() {
+        // `mandatory` is not an accepted token in either build; the with-TLS
+        // parser rejects it as a bad boolean, so the no-TLS branch mirrors that
+        // (still an error, just not the TLS-missing one).
+        let ado: AdoNetConfig = "encrypt=mandatory".parse().unwrap();
+        assert!(ado.encrypt().is_err());
+    }
+
+    #[test]
+    #[cfg(not(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    )))]
+    fn encryption_parsing_off_ok_without_tls_backend() -> crate::Result<()> {
+        for test_str in ["encrypt=false", "encrypt=no"] {
+            let ado: AdoNetConfig = test_str.parse()?;
+            assert_eq!(crate::EncryptionLevel::NotSupported, ado.encrypt()?);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    )))]
+    fn encryption_parsing_plaintext_ok_without_tls_backend() -> crate::Result<()> {
+        let ado: AdoNetConfig = "encrypt=DANGER_PLAINTEXT".parse()?;
+        assert_eq!(crate::EncryptionLevel::NotSupported, ado.encrypt()?);
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    )))]
+    fn encryption_parsing_missing_ok_without_tls_backend() -> crate::Result<()> {
+        let ado: AdoNetConfig = "".parse()?;
+        assert_eq!(crate::EncryptionLevel::NotSupported, ado.encrypt()?);
+
+        Ok(())
+    }
+
     #[test]
     fn client_name_parsing() -> crate::Result<()> {
         let test_str = "workstationid=meow";

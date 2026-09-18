@@ -1400,7 +1400,38 @@ pub(crate) trait ConfigString {
         feature = "vendored-openssl"
     )))]
     fn encrypt(&self) -> crate::Result<EncryptionLevel> {
-        Ok(EncryptionLevel::NotSupported)
+        // Security (#305): a no-TLS build cannot encrypt, so an explicit request
+        // to do so must fail loudly rather than silently downgrade to plaintext.
+        // Token classification follows the with-TLS `encrypt()`: the values that
+        // mean "encryption on" (`true`/`yes`/`strict`) become the TLS-missing
+        // error, while opting out (`false`/`no`/`DANGER_PLAINTEXT`) and an
+        // omitted keyword still resolve to `NotSupported`. (`strict` reports the
+        // missing backend rather than the with-TLS `tds80`-required hint — a
+        // TLS backend is the more fundamental thing it needs here.)
+        let Some(val) = self.dict().get("encrypt") else {
+            return Ok(EncryptionLevel::NotSupported);
+        };
+
+        match Self::parse_bool(val) {
+            Ok(false) => Ok(EncryptionLevel::NotSupported),
+            Err(_) if val == "DANGER_PLAINTEXT" => Ok(EncryptionLevel::NotSupported),
+            Ok(true) => Err(Self::tls_backend_missing()),
+            Err(_) if val.eq_ignore_ascii_case("strict") => Err(Self::tls_backend_missing()),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(not(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    )))]
+    fn tls_backend_missing() -> crate::Error {
+        crate::Error::Tls(
+            "encryption was requested (`encrypt=...`) but the crate was compiled without a TLS \
+             backend; enable one of the `native-tls`, `rustls` or `vendored-openssl` features."
+                .to_string(),
+        )
     }
 
     fn parse_bool<T: AsRef<str>>(v: T) -> crate::Result<bool> {
