@@ -61,6 +61,7 @@ pub struct Config {
     pub(crate) multi_subnet_failover: bool,
     pub(crate) handshake_timeout: Option<Duration>,
     pub(crate) command_timeout: Option<Duration>,
+    pub(crate) lossy_utf16_decoding: bool,
     #[cfg(any(
         feature = "rustls",
         feature = "native-tls",
@@ -154,6 +155,7 @@ impl Default for Config {
             multi_subnet_failover: false,
             handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
             command_timeout: Some(DEFAULT_COMMAND_TIMEOUT),
+            lossy_utf16_decoding: false,
             #[cfg(any(
                 feature = "rustls",
                 feature = "native-tls",
@@ -459,6 +461,57 @@ impl Config {
     /// See [`command_timeout`](Config::command_timeout).
     pub fn get_command_timeout(&self) -> Option<Duration> {
         self.command_timeout
+    }
+
+    /// Controls how malformed UTF-16 in NVARCHAR/NTEXT row values is handled.
+    ///
+    /// SQL Server stores `NVARCHAR`/`NCHAR`/`NTEXT` as unchecked UCS-2/UTF-16,
+    /// so a column can legitimately hold lone (unpaired) surrogates or other
+    /// sequences that are not valid Unicode. By default tiberius decodes these
+    /// values *strictly*: a malformed sequence aborts the row stream with an
+    /// error — [`Error::Protocol`] for NVARCHAR/NCHAR and [`Error::Utf16`] for
+    /// NTEXT (an odd, desynced byte length is always [`Error::Protocol`], in
+    /// both modes; see below). Strict decoding
+    /// is the safer default because it also surfaces framing desyncs (a decode
+    /// that silently "succeeds" on garbage can mask a misaligned read).
+    ///
+    /// Enabling this option makes decoding *lossy* for the NVARCHAR/NCHAR and
+    /// NTEXT text arms only: each invalid UTF-16 sequence is replaced with the
+    /// Unicode replacement character (`U+FFFD`, `�`) instead of erroring, so a
+    /// row containing bad Unicode stays readable.
+    ///
+    /// Scope and guarantees:
+    ///
+    /// - Only NVARCHAR/NCHAR (`string`) and NTEXT (`text`) decoding is affected.
+    ///   `XML` columns and code-page (`VARCHAR`/`CHAR`/`TEXT`) columns are
+    ///   always decoded strictly, regardless of this setting.
+    /// - Framing/length validation is always enforced: an odd byte length for a
+    ///   UTF-16 value is still a protocol error in both modes, because it
+    ///   indicates a desynced stream rather than merely bad Unicode.
+    ///
+    /// - Defaults to `false` (strict decoding).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tiberius::Config;
+    /// let mut config = Config::new();
+    /// // Tolerate legacy rows that hold unchecked UCS-2 with lone surrogates.
+    /// config.lossy_utf16_decoding(true);
+    /// ```
+    ///
+    /// [`Error::Protocol`]: crate::error::Error::Protocol
+    /// [`Error::Utf16`]: crate::error::Error::Utf16
+    pub fn lossy_utf16_decoding(&mut self, lossy: bool) {
+        self.lossy_utf16_decoding = lossy;
+    }
+
+    /// Returns whether lossy UTF-16 decoding is enabled for NVARCHAR/NTEXT
+    /// values.
+    ///
+    /// See [`lossy_utf16_decoding`](Config::lossy_utf16_decoding).
+    pub fn get_lossy_utf16_decoding(&self) -> bool {
+        self.lossy_utf16_decoding
     }
 
     /// Supplies a client certificate and private key used to authenticate the
@@ -885,6 +938,18 @@ impl ConfigBuilder {
     /// - Defaults to 30 seconds.
     pub fn command_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.inner.command_timeout = timeout;
+        self
+    }
+
+    /// Enables lossy UTF-16 decoding for NVARCHAR/NTEXT row values.
+    ///
+    /// See [`Config::lossy_utf16_decoding`] for the exact semantics (strict is
+    /// the default; enabling replaces invalid UTF-16 with `U+FFFD` for the
+    /// NVARCHAR/NCHAR and NTEXT arms only).
+    ///
+    /// - Defaults to `false`.
+    pub fn lossy_utf16_decoding(mut self, lossy: bool) -> Self {
+        self.inner.lossy_utf16_decoding = lossy;
         self
     }
 
@@ -1316,6 +1381,33 @@ mod tests {
     fn config_builder_defaults_command_timeout() {
         let config = Config::builder().build();
         assert_eq!(config.get_command_timeout(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn lossy_utf16_decoding_defaults_to_false() {
+        let config = Config::new();
+        assert!(!config.get_lossy_utf16_decoding());
+    }
+
+    #[test]
+    fn lossy_utf16_decoding_setter_roundtrips() {
+        let mut config = Config::new();
+        config.lossy_utf16_decoding(true);
+        assert!(config.get_lossy_utf16_decoding());
+        config.lossy_utf16_decoding(false);
+        assert!(!config.get_lossy_utf16_decoding());
+    }
+
+    #[test]
+    fn config_builder_sets_lossy_utf16_decoding() {
+        let config = Config::builder().lossy_utf16_decoding(true).build();
+        assert!(config.get_lossy_utf16_decoding());
+    }
+
+    #[test]
+    fn config_builder_defaults_lossy_utf16_decoding() {
+        let config = Config::builder().build();
+        assert!(!config.get_lossy_utf16_decoding());
     }
 
     #[test]

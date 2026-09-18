@@ -58,7 +58,16 @@ where
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
 
-            String::from_utf16(&buf[..])?
+            // NTEXT may be decoded losslessly when the connection opted in
+            // (`Config::lossy_utf16_decoding`), replacing invalid surrogates
+            // with U+FFFD so legacy rows holding unchecked UCS-2 stay readable.
+            // The odd-length guard above still fires in both modes; it is a
+            // framing (desync) error, not merely bad Unicode.
+            if src.context().lossy_utf16() {
+                String::from_utf16_lossy(&buf[..])
+            } else {
+                String::from_utf16(&buf[..])?
+            }
         }
     };
 
@@ -110,6 +119,59 @@ mod tests {
         let err = decode(&mut buf.into_sql_read_bytes(), None)
             .await
             .expect_err("odd ntext length must be rejected");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn decode_ntext_lossy_replaces_lone_surrogate() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(1); // ptr_len
+        buf.put_u8(0xAA); // pointer byte (ignored)
+        buf.put_i32_le(0); // days
+        buf.put_u32_le(0); // second fractions
+        buf.put_u32_le(2); // byte length (one lone surrogate)
+        buf.put_u16_le(0xD800); // unpaired high surrogate
+
+        let mut reader = buf.into_sql_read_bytes();
+        reader.context_mut().set_lossy_utf16(true);
+        let data = decode(&mut reader, None).await.unwrap();
+        assert_eq!(data, ColumnData::String(Some("\u{fffd}".into())));
+    }
+
+    #[tokio::test]
+    async fn decode_ntext_strict_rejects_lone_surrogate() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(1);
+        buf.put_u8(0xAA);
+        buf.put_i32_le(0);
+        buf.put_u32_le(0);
+        buf.put_u32_le(2);
+        buf.put_u16_le(0xD800);
+
+        // Default (strict) context: malformed UTF-16 must error.
+        let err = decode(&mut buf.into_sql_read_bytes(), None)
+            .await
+            .expect_err("strict ntext must reject malformed UTF-16");
+        assert!(matches!(err, Error::Utf16));
+    }
+
+    #[tokio::test]
+    async fn decode_ntext_lossy_still_rejects_odd_length() {
+        // The odd-length framing guard fires even when lossy decoding is on.
+        let mut buf = BytesMut::new();
+        buf.put_u8(1);
+        buf.put_u8(0xAA);
+        buf.put_i32_le(0);
+        buf.put_u32_le(0);
+        buf.put_u32_le(3); // odd byte length
+        buf.put_u16_le('h' as u16);
+        buf.put_u8(0);
+
+        let mut reader = buf.into_sql_read_bytes();
+        reader.context_mut().set_lossy_utf16(true);
+        let err = decode(&mut reader, None)
+            .await
+            .expect_err("odd ntext length must be rejected even when lossy");
         assert!(matches!(err, Error::Protocol(_)));
     }
 

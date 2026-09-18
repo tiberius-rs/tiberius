@@ -20,6 +20,14 @@ pub(crate) struct Context {
     /// time. `None` means unbounded. Read by the token stream to bound each
     /// server round-trip (see `TokenStream::try_unfold`).
     command_timeout: Option<Duration>,
+    /// When `true`, NVARCHAR/NTEXT row values that contain malformed UTF-16
+    /// (e.g. unpaired surrogates that SQL Server stored as unchecked UCS-2)
+    /// are decoded losslessly by replacing each invalid sequence with the
+    /// Unicode replacement character (U+FFFD) instead of aborting the row
+    /// stream with a protocol error. Propagated from
+    /// [`Config::lossy_utf16_decoding`](crate::Config::lossy_utf16_decoding) at
+    /// connect time. Defaults to `false` (strict decoding).
+    lossy_utf16: bool,
 }
 
 impl Context {
@@ -41,6 +49,7 @@ impl Context {
             alt_metas: HashMap::new(),
             spn: None,
             command_timeout: None,
+            lossy_utf16: false,
         }
     }
 
@@ -89,6 +98,20 @@ impl Context {
     /// [`Config`]: crate::Config
     pub(crate) fn set_command_timeout(&mut self, timeout: Option<Duration>) {
         self.command_timeout = timeout;
+    }
+
+    /// Whether malformed UTF-16 in NVARCHAR/NTEXT row values should be decoded
+    /// losslessly (replacing invalid sequences with U+FFFD) rather than
+    /// erroring. See
+    /// [`Config::lossy_utf16_decoding`](crate::Config::lossy_utf16_decoding).
+    pub(crate) fn lossy_utf16(&self) -> bool {
+        self.lossy_utf16
+    }
+
+    /// Records whether lossy UTF-16 decoding is enabled, negotiated from the
+    /// [`Config`](crate::Config) at connect time.
+    pub(crate) fn set_lossy_utf16(&mut self, lossy: bool) {
+        self.lossy_utf16 = lossy;
     }
 
     pub fn transaction_descriptor(&self) -> [u8; 8] {
@@ -168,6 +191,18 @@ mod tests {
 
         ctx.set_command_timeout(None);
         assert_eq!(ctx.command_timeout(), None);
+    }
+
+    #[test]
+    fn lossy_utf16_defaults_to_false_and_roundtrips() {
+        let mut ctx = Context::new();
+        assert!(!ctx.lossy_utf16());
+
+        ctx.set_lossy_utf16(true);
+        assert!(ctx.lossy_utf16());
+
+        ctx.set_lossy_utf16(false);
+        assert!(!ctx.lossy_utf16());
     }
 
     #[test]

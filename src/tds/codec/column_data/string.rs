@@ -38,12 +38,28 @@ where
 
             // Decode UTF-16LE straight from the byte pairs, without first
             // collecting an intermediate `Vec<u16>` (one fewer full-buffer
-            // allocation + copy per value). Invalid surrogates still error,
-            // matching the previous `String::from_utf16` behaviour.
-            let s = char::decode_utf16(buf.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])))
-                .collect::<Result<String, _>>()
-                .map_err(|_| Error::Protocol("nvarchar: invalid UTF-16 sequence".into()))?;
-            Ok(Some(s.into()))
+            // allocation + copy per value).
+            let units = buf.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]]));
+
+            // NVARCHAR/NCHAR may be decoded losslessly when the connection opted
+            // in (`Config::lossy_utf16_decoding`), replacing invalid surrogates
+            // with U+FFFD so legacy rows holding unchecked UCS-2 stay readable.
+            // XML (`ty == Xml`, routed here from `xml::decode`) is always strict,
+            // regardless of the flag. Either way the `buf.len() % 2` guard above
+            // already rejected desynced (odd) lengths.
+            if matches!(ty, NChar | NVarchar) && src.context().lossy_utf16() {
+                let s: String = char::decode_utf16(units)
+                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect();
+                Ok(Some(s.into()))
+            } else {
+                // Strict: invalid surrogates error, matching the previous
+                // `String::from_utf16` behaviour.
+                let s = char::decode_utf16(units)
+                    .collect::<Result<String, _>>()
+                    .map_err(|_| Error::Protocol("nvarchar: invalid UTF-16 sequence".into()))?;
+                Ok(Some(s.into()))
+            }
         }
         _ => Ok(None),
     }
@@ -54,6 +70,39 @@ mod tests {
     use super::*;
     use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
     use bytes::{BufMut, BytesMut};
+
+    // Lossy NVARCHAR decoding replaces an unpaired surrogate with U+FFFD.
+    #[tokio::test]
+    async fn nvarchar_lossy_replaces_lone_surrogate() {
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(2); // fixed-size PLP length prefix
+        buf.put_u16_le(0xD800); // unpaired high surrogate
+
+        let mut reader = buf.into_sql_read_bytes();
+        reader.context_mut().set_lossy_utf16(true);
+        let value = decode(&mut reader, VarLenType::NVarchar, 40, None)
+            .await
+            .expect("lossy nvarchar must decode malformed UTF-16");
+        assert_eq!(value.as_deref(), Some("\u{fffd}"));
+    }
+
+    // Strict is the default: an unpaired surrogate is a protocol error.
+    #[tokio::test]
+    async fn nvarchar_strict_rejects_lone_surrogate() {
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(2);
+        buf.put_u16_le(0xD800);
+
+        let err = decode(
+            &mut buf.into_sql_read_bytes(),
+            VarLenType::NVarchar,
+            40,
+            None,
+        )
+        .await
+        .expect_err("strict nvarchar must reject malformed UTF-16");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
 
     // A BigVarChar (non-UTF codepage) value with the collation omitted by the
     // server must return a protocol error rather than panicking on `unwrap`.
