@@ -18,7 +18,7 @@ use crate::{
 };
 use asynchronous_codec::Framed;
 use bytes::BytesMut;
-#[cfg(any(windows, feature = "integrated-auth-gssapi"))]
+#[cfg(any(windows, feature = "integrated-auth-gssapi", feature = "sspi-rs"))]
 use codec::TokenSspi;
 use futures_util::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use futures_util::ready;
@@ -40,6 +40,12 @@ use tracing::{event, Level};
 #[cfg(all(windows, feature = "winauth"))]
 use winauth::{windows::NtlmSspiBuilder, NextBytes};
 use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(all(unix, feature = "sspi-rs"))]
+use sspi::{
+    builders::EmptyInitializeSecurityContext, AuthIdentity, BufferType, ClientRequestFlags,
+    CredentialUse, DataRepresentation, Ntlm, SecurityBuffer, Sspi, SspiImpl, Username,
+};
 
 /// A `Connection` is an abstraction between the [`Client`] and the server. It
 /// can be used as a `Stream` to fetch [`Packet`]s from and to `send` packets
@@ -122,7 +128,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         TokenStream::new(self).flush_done().await
     }
 
-    #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
+    #[cfg(any(windows, feature = "integrated-auth-gssapi", feature = "sspi-rs"))]
     /// Flush the incoming token stream until receiving `SSPI` token.
     async fn flush_sspi(&mut self) -> crate::Result<TokenSspi> {
         TokenStream::new(self).flush_sspi().await
@@ -415,6 +421,83 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
 
                 self.send(header, next_token).await?;
             }
+
+            #[cfg(all(unix, feature = "sspi-rs", not(all(windows, feature = "winauth"))))]
+            AuthMethod::Windows(auth) => {
+                let mut ntlm = Ntlm::new();
+
+                let username = Username::new(&auth.user, auth.domain.as_deref())
+                    .map_err(|e| sspi::Error::from(e))?;
+
+                let identity = AuthIdentity {
+                    username,
+                    password: auth.password.clone().into(),
+                };
+
+                let mut creds = ntlm
+                    .acquire_credentials_handle()
+                    .with_credential_use(CredentialUse::Outbound)
+                    .with_auth_data(&identity)
+                    .execute(&mut ntlm)?;
+
+                let spn = self.context.spn().to_string();
+
+                let mut input = vec![SecurityBuffer::new(Vec::new(), BufferType::Token)];
+                let mut output = vec![SecurityBuffer::new(Vec::new(), BufferType::Token)];
+
+                let mut builder = ntlm
+                    .initialize_security_context()
+                    .with_credentials_handle(&mut creds.credentials_handle)
+                    .with_context_requirements(
+                        ClientRequestFlags::CONFIDENTIALITY | ClientRequestFlags::ALLOCATE_MEMORY,
+                    )
+                    .with_target_data_representation(DataRepresentation::Native)
+                    .with_target_name(&spn)
+                    .with_input(&mut input)
+                    .with_output(&mut output);
+
+                let _ = ntlm
+                    .initialize_security_context_impl(&mut builder)?
+                    .resolve_to_result()?;
+
+                login_message.integrated_security(Some(output[0].buffer.clone()));
+                let id = self.context.next_packet_id();
+                self.send(PacketHeader::login(id), login_message).await?;
+                self = self.post_login_encryption(encryption);
+
+                let sspi_bytes = self.flush_sspi().await?;
+
+                let mut input = vec![SecurityBuffer::new(
+                    sspi_bytes.as_ref().to_vec(),
+                    BufferType::Token,
+                )];
+                let mut output = vec![SecurityBuffer::new(Vec::new(), BufferType::Token)];
+
+                let mut builder = ntlm
+                    .initialize_security_context()
+                    .with_credentials_handle(&mut creds.credentials_handle)
+                    .with_context_requirements(
+                        ClientRequestFlags::CONFIDENTIALITY | ClientRequestFlags::ALLOCATE_MEMORY,
+                    )
+                    .with_target_data_representation(DataRepresentation::Native)
+                    .with_target_name(&spn)
+                    .with_input(&mut input)
+                    .with_output(&mut output);
+
+                let _ = ntlm
+                    .initialize_security_context_impl(&mut builder)?
+                    .resolve_to_result()?;
+
+                event!(Level::TRACE, authenticate_len = output[0].buffer.len());
+
+                let id = self.context.next_packet_id();
+                self.send(
+                    PacketHeader::login(id),
+                    TokenSspi::new(output[0].buffer.clone()),
+                )
+                .await?;
+            }
+
             #[cfg(all(windows, feature = "winauth"))]
             AuthMethod::Windows(auth) => {
                 let spn = self.context.spn().to_string();

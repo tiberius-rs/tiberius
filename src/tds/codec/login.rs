@@ -183,7 +183,7 @@ impl<'a> LoginMessage<'a> {
         }
     }
 
-    #[cfg(any(all(unix, feature = "integrated-auth-gssapi"), windows))]
+    #[cfg(any(all(unix, any(feature = "integrated-auth-gssapi", feature = "sspi-rs")), windows))]
     pub fn integrated_security(&mut self, bytes: Option<Vec<u8>>) {
         if bytes.is_some() {
             self.option_flags_2.insert(OptionFlag2::IntegratedSecurity);

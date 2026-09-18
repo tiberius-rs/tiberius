@@ -48,6 +48,15 @@ pub enum Error {
     /// An error from the GSSAPI library.
     #[error("GSSAPI Error: {}", _0)]
     Gssapi(String),
+
+    #[cfg(any(all(unix, feature = "sspi-rs"), doc))]
+    #[cfg_attr(
+        feature = "docs",
+        doc(cfg(all(unix, feature = "sspi-rs")))
+    )]
+    /// An error in the sspi-rs library.
+    #[error("sspi-rs Error: {}", _0)]
+    SspiRs(String),
     #[error(
         "Server requested a connection to an alternative address: `{}:{}`",
         host,
@@ -83,7 +92,7 @@ impl Error {
 
 impl From<uuid::Error> for Error {
     fn from(e: uuid::Error) -> Self {
-        Self::Conversion(format!("Error convertiong a Guid value {}", e).into())
+        Self::Conversion(format!("Error converting a Guid value {}", e).into())
     }
 }
 
@@ -155,5 +164,16 @@ impl From<connection_string::Error> for Error {
 impl From<libgssapi::error::Error> for Error {
     fn from(err: libgssapi::error::Error) -> Error {
         Error::Gssapi(format!("{}", err))
+    }
+}
+
+#[cfg(all(unix, feature = "sspi-rs"))]
+#[cfg_attr(
+    feature = "docs",
+    doc(cfg(all(unix, feature = "sspi-rs")))
+)]
+impl From<sspi::Error> for Error {
+    fn from(err: sspi::Error) -> Self {
+        Error::SspiRs(format!("{}", err))
     }
 }
