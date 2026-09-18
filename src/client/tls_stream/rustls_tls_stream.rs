@@ -108,6 +108,59 @@ fn get_server_name(config: &Config) -> crate::Result<ServerName<'static>> {
     }
 }
 
+/// Translate a TLS-handshake failure into an actionable [`crate::Error`].
+///
+/// `tokio-rustls` surfaces handshake failures as [`io::Error`]s that wrap the
+/// underlying [`RustlsError`]. When that inner error is a *certificate
+/// validation* failure (e.g. `UnsupportedCertVersion` from an older or
+/// non-conformant SQL Server certificate), the raw
+/// message ("invalid peer certificate ... UnsupportedCertVersion") is opaque
+/// and never names the fix. This maps such failures to an [`Error::Tls`] that
+/// spells out the remedies, while leaving every other I/O error untouched (it
+/// still flows through `From<io::Error>` as an [`Error::Io`]).
+///
+/// The message is only added for genuine certificate-validation failures under
+/// a *validating* trust config; `TrustConfig::TrustAll` already short-circuits
+/// certificate checks in [`NoCertVerifier`], so a cert error cannot originate
+/// there.
+fn map_handshake_error(err: io::Error, trust: &TrustConfig) -> crate::Error {
+    // Only certificate-*validation* failures get the extra guidance. Under
+    // TrustAll the verifier never rejects a cert, so any error there is
+    // genuinely transport-level and should pass through unchanged.
+    if !matches!(trust, TrustConfig::TrustAll) {
+        if let Some(RustlsError::InvalidCertificate(cert_err)) =
+            err.get_ref().and_then(|e| e.downcast_ref::<RustlsError>())
+        {
+            // `UnsupportedCertVersion` is the specific symptom. In
+            // this rustls version it arrives from webpki wrapped in
+            // `CertificateError::Other(..)` rather than as a named variant, so
+            // detect it from the rendered message. The same remedies apply to
+            // any validation rejection of a legacy/self-signed server cert.
+            let rendered = cert_err.to_string();
+            let hint = if rendered.contains("UnsupportedCertVersion") {
+                " The SQL Server presented a certificate rustls considers too \
+                 old (an outdated X.509 version), which frequently happens with \
+                 the self-signed certificate SQL Server auto-generates."
+            } else {
+                ""
+            };
+
+            return Error::Tls(format!(
+                "the server's certificate was rejected during the TLS handshake: {cert_err}.{hint} \
+                 To connect anyway you can: (1) trust a specific CA certificate with \
+                 `Config::trust_cert_ca(path)`; (2) skip certificate validation entirely with \
+                 `Config::trust_cert()` (accepts any certificate — only safe on a trusted \
+                 network); or (3) build tiberius with the `native-tls` backend, which is more \
+                 lenient toward legacy certificates. Note: SQL Server always performs a TLS \
+                 handshake during login even when `Encrypt=false`, so this can occur regardless \
+                 of the encryption setting."
+            ));
+        }
+    }
+
+    Error::from(err)
+}
+
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
     pub(super) async fn new(config: &Config, stream: S) -> crate::Result<Self> {
         event!(Level::DEBUG, "Performing a TLS handshake");
@@ -174,7 +227,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
 
         let tls_stream = connector
             .connect(get_server_name(config)?, stream.compat())
-            .await?;
+            .await
+            .map_err(|e| map_handshake_error(e, &config.trust))?;
 
         Ok(TlsStream(tls_stream.compat()))
     }
@@ -422,6 +476,7 @@ mod tests {
     use super::*;
     use crate::client::config::{ClientCertSource, ClientCertificate, Config};
     use std::path::PathBuf;
+    use tokio_rustls::rustls::CertificateError;
 
     fn make_config(host: Option<&str>, cert_host: Option<&str>, trust: TrustConfig) -> Config {
         let mut c = Config::new();
@@ -672,6 +727,231 @@ mod tests {
             msg.contains("found 0"),
             "error should mention the zero-cert count, got: {msg}"
         );
+    }
+
+    fn cert_io_error(cert_err: CertificateError) -> io::Error {
+        // Mirror how tokio-rustls wraps a rustls handshake failure: the
+        // `RustlsError` is carried as the inner error of an `io::Error`.
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            RustlsError::InvalidCertificate(cert_err),
+        )
+    }
+
+    /// Reproduce the exact shape of the failure: webpki's `UnsupportedCertVersion`
+    /// reaches rustls as `CertificateError::Other(..)` whose message contains the
+    /// string "UnsupportedCertVersion".
+    fn unsupported_cert_version_error() -> CertificateError {
+        use tokio_rustls::rustls::OtherError;
+
+        // `CertificateError`'s `Display` renders the `Other` variant via `{:?}`
+        // (Debug), so — matching real webpki, whose `UnsupportedCertVersion`
+        // Debugs to exactly that string — the fake must Debug to the same text.
+        struct WebpkiLike;
+        impl std::fmt::Debug for WebpkiLike {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("UnsupportedCertVersion")
+            }
+        }
+        impl std::fmt::Display for WebpkiLike {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("UnsupportedCertVersion")
+            }
+        }
+        impl std::error::Error for WebpkiLike {}
+
+        CertificateError::Other(OtherError(Arc::new(WebpkiLike)))
+    }
+
+    #[test]
+    fn map_handshake_error_annotates_unsupported_cert_version() {
+        let err = map_handshake_error(
+            cert_io_error(unsupported_cert_version_error()),
+            &TrustConfig::Default,
+        );
+        let msg = format!("{err}");
+        // Must be a TLS error (not the opaque Io variant) and name each remedy.
+        assert!(
+            matches!(err, Error::Tls(_)),
+            "expected Error::Tls, got: {msg}"
+        );
+        assert!(
+            msg.contains("trust_cert_ca"),
+            "should mention trust_cert_ca: {msg}"
+        );
+        assert!(
+            msg.contains("trust_cert()"),
+            "should mention trust_cert: {msg}"
+        );
+        assert!(
+            msg.contains("native-tls"),
+            "should mention native-tls backend: {msg}"
+        );
+        assert!(
+            msg.contains("Encrypt=false"),
+            "should explain the handshake still happens: {msg}"
+        );
+        // Version-specific hint present for this variant.
+        assert!(
+            msg.contains("outdated X.509 version"),
+            "should add version hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn map_handshake_error_annotates_other_cert_errors_without_version_hint() {
+        let err = map_handshake_error(
+            cert_io_error(CertificateError::NotValidForName),
+            &TrustConfig::Default,
+        );
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, Error::Tls(_)),
+            "expected Error::Tls, got: {msg}"
+        );
+        assert!(
+            msg.contains("trust_cert_ca"),
+            "should mention remedies: {msg}"
+        );
+        // The version-specific hint is only for UnsupportedCertVersion.
+        assert!(
+            !msg.contains("outdated X.509 version"),
+            "no version hint here: {msg}"
+        );
+    }
+
+    #[test]
+    fn map_handshake_error_passes_through_non_cert_io_errors() {
+        let err = map_handshake_error(
+            io::Error::new(io::ErrorKind::UnexpectedEof, "connection reset"),
+            &TrustConfig::Default,
+        );
+        // Non-certificate transport failures keep the generic Io mapping.
+        match err {
+            Error::Io { kind, message } => {
+                assert_eq!(kind, io::ErrorKind::UnexpectedEof);
+                assert!(message.contains("connection reset"), "got: {message}");
+            }
+            other => panic!("expected Error::Io, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_handshake_error_passes_through_non_certificate_rustls_errors() {
+        // A rustls error that is *not* a certificate-validation failure (e.g. a
+        // transport/decrypt error) must keep the generic Io mapping — the cert
+        // remedies would be misleading for it.
+        let inner = RustlsError::General("handshake alert".to_string());
+        let err = map_handshake_error(
+            io::Error::new(io::ErrorKind::InvalidData, inner),
+            &TrustConfig::Default,
+        );
+        assert!(
+            matches!(err, Error::Io { .. }),
+            "non-certificate rustls errors must pass through as Io, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn no_cert_verifier_accepts_any_certificate_when_opted_in() {
+        // `trust_cert` (TrustAll) installs `NoCertVerifier`, which must accept a
+        // well-formed certificate that does NOT chain to any trusted root — this
+        // is the explicit opt-in bypass. This is the very same
+        // certificate the default verifier rejects in
+        // `default_verifier_rejects_untrusted_certificate` below, so the pair
+        // proves the bypass is opt-in rather than the default.
+        let leaf = read_cert_chain(Path::new("docker/certs/server.crt")).unwrap();
+        let leaf = leaf.into_iter().next().unwrap();
+        let verifier = NoCertVerifier;
+        let name = ServerName::try_from("legacy.sql.example.com").unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&leaf, &[], &name, &[], UnixTime::now())
+                .is_ok(),
+            "TrustAll must accept an untrusted server certificate"
+        );
+    }
+
+    #[test]
+    fn default_verifier_rejects_untrusted_certificate() {
+        // Security-preserving invariant: with no explicit opt-in, a *well-formed*
+        // certificate that does not chain to a trusted root MUST be rejected with
+        // a genuine trust-chain failure (`UnknownIssuer`) — not merely a DER-parse
+        // error. `NoCertVerifier` accepts this exact certificate under `trust_cert`
+        // (see `no_cert_verifier_accepts_any_certificate_when_opted_in`), so this
+        // proves the bypass is opt-in, not the default.
+        //
+        // `server.crt` is a well-formed leaf issued by `customCA`. Build a trust
+        // store that does NOT contain `customCA` (it trusts an unrelated anchor),
+        // so the leaf's real issuer is untrusted and path building must fail — this
+        // exercises chain-of-trust enforcement, which a malformed blob would never
+        // reach (it would be rejected at DER parsing instead).
+        let leaf = read_cert_chain(Path::new("docker/certs/server.crt")).unwrap();
+        let leaf = leaf.into_iter().next().unwrap();
+
+        let mut roots = RootCertStore::empty();
+        // Trust an unrelated anchor; `customCA` (the actual issuer of `leaf`) is
+        // deliberately absent, so `leaf` cannot chain to anything trusted.
+        roots.add(leaf.clone()).unwrap();
+
+        let provider = Arc::new(aws_lc_rs::default_provider());
+        let verifier = tokio_rustls::rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider,
+        )
+        .build()
+        .expect("verifier builds over a non-empty root store");
+
+        let name = ServerName::try_from("localhost").unwrap();
+        // Pin verification time inside `server.crt`'s validity window
+        // (notBefore 2026-05-11, notAfter 2027-11-02). webpki checks certificate
+        // validity *before* issuer matching, so using the wall clock would make
+        // this assertion flip from `UnknownIssuer` to `Expired` once the fixture
+        // expires — a spurious failure unrelated to any code change. 2027-01-15.
+        let at = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_800_000_000));
+        let result = verifier.verify_server_cert(&leaf, &[], &name, &[], at);
+        assert!(
+            matches!(
+                result,
+                Err(RustlsError::InvalidCertificate(
+                    CertificateError::UnknownIssuer
+                ))
+            ),
+            "the default verifier MUST reject a cert that does not chain to a trusted \
+             root with UnknownIssuer (a real trust failure, not a parse error), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn map_handshake_error_trustall_does_not_annotate() {
+        // Under TrustAll the verifier never rejects a cert, so even a cert-shaped
+        // error must pass through unchanged rather than gaining misleading advice.
+        let err = map_handshake_error(
+            cert_io_error(unsupported_cert_version_error()),
+            &TrustConfig::TrustAll,
+        );
+        assert!(
+            matches!(err, Error::Io { .. }),
+            "TrustAll must not rewrite the error into TLS guidance"
+        );
+    }
+
+    #[test]
+    fn map_handshake_error_trustall_passes_through_non_cert_io_errors() {
+        // Under TrustAll a plain transport error must also pass through as Io,
+        // preserving kind and message (the cert-detection block is skipped
+        // wholesale, regardless of the error's shape).
+        let err = map_handshake_error(
+            io::Error::new(io::ErrorKind::ConnectionReset, "reset by peer"),
+            &TrustConfig::TrustAll,
+        );
+        match err {
+            Error::Io { kind, message } => {
+                assert_eq!(kind, io::ErrorKind::ConnectionReset);
+                assert!(message.contains("reset by peer"), "got: {message}");
+            }
+            other => panic!("expected Error::Io, got: {other:?}"),
+        }
     }
 
     #[test]

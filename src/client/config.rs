@@ -250,6 +250,17 @@ impl Config {
     /// On production setting, the certificate should be added to the local key
     /// storage (or use `trust_cert_ca` instead), using this setting is potentially dangerous.
     ///
+    /// This also bypasses the rustls backend's certificate *version* checks, so
+    /// it is the escape hatch for the `invalid peer certificate:
+    /// UnsupportedCertVersion` failure some older or self-signed SQL Server
+    /// certificates trigger. Prefer [`trust_cert_ca`] when you
+    /// can point at the server's CA; reach for `trust_cert` only when you cannot.
+    /// Note that SQL Server performs a TLS handshake during login even when
+    /// `Encrypt=false`, so certificate errors can surface regardless of the
+    /// encryption level.
+    ///
+    /// [`trust_cert_ca`]: Self::trust_cert_ca
+    ///
     /// # Panics
     /// Will panic in case `trust_cert_ca` was called before.
     ///
@@ -1170,6 +1181,16 @@ mod tests {
             config.trust,
             TrustConfig::CaCertificateLocation(_)
         ));
+    }
+
+    #[test]
+    fn trust_cert_sets_trust_all() {
+        // The default must be a validating config; `trust_cert()` is the explicit
+        // opt-in that switches to bypass validation.
+        let mut config = Config::new();
+        assert!(matches!(config.trust, TrustConfig::Default));
+        config.trust_cert();
+        assert!(matches!(config.trust, TrustConfig::TrustAll));
     }
 
     #[test]
