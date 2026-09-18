@@ -8,6 +8,8 @@ use super::AuthMethod;
 use crate::EncryptionLevel;
 use ado_net::*;
 use jdbc::*;
+#[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
+use secrecy::SecretString;
 
 #[derive(Clone, Debug)]
 /// The `Config` struct contains all configuration information
@@ -81,44 +83,30 @@ pub(crate) struct ClientCertificate {
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
-#[derive(Clone)]
+// `SecretString` redacts the PKCS#12 password from `Debug` (and zeroizes it on
+// drop), so this can derive `Debug` without leaking the password.
+#[derive(Clone, Debug)]
 pub(crate) enum ClientCertSource {
     /// A certificate file and a separate private-key file. Both may be PEM
     /// (`.pem`/`.crt` for the certificate, `.pem`/`.key` for the key) or DER
     /// (`.der`); the concrete format is detected from the file extension by the
     /// active TLS backend.
+    ///
+    /// The `cert`/`key` fields are read only by the `rustls` and `native-tls`
+    /// backends; the `vendored-openssl` (opentls) backend rejects this variant
+    /// (it supports PKCS#12 only). In a `vendored-openssl`-only build the fields
+    /// are therefore never read, so silence dead-code exactly there rather than
+    /// unconditionally — this keeps the derived `Debug` (which no longer counts
+    /// as a read) while still compiling clean under `-Dwarnings`.
+    #[cfg_attr(not(any(feature = "rustls", feature = "native-tls")), allow(dead_code))]
     CertAndKey { cert: PathBuf, key: PathBuf },
     /// A PKCS#12 / PFX bundle path together with its decryption password. Only
     /// supported by the `native-tls` and `vendored-openssl` backends.
     #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
     Pkcs12 {
         path: PathBuf,
-        password: zeroize::Zeroizing<String>,
+        password: SecretString,
     },
-}
-
-// Manual `Debug` so the PKCS#12 password is never printed.
-#[cfg(any(
-    feature = "rustls",
-    feature = "native-tls",
-    feature = "vendored-openssl"
-))]
-impl std::fmt::Debug for ClientCertSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientCertSource::CertAndKey { cert, key } => f
-                .debug_struct("CertAndKey")
-                .field("cert", cert)
-                .field("key", key)
-                .finish(),
-            #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
-            ClientCertSource::Pkcs12 { path, .. } => f
-                .debug_struct("Pkcs12")
-                .field("path", path)
-                .field("password", &"<redacted>")
-                .finish(),
-        }
-    }
 }
 
 impl Default for Config {
@@ -416,7 +404,7 @@ impl Config {
         self.client_cert = Some(ClientCertificate {
             source: ClientCertSource::Pkcs12 {
                 path: path.into(),
-                password: zeroize::Zeroizing::new(password.into()),
+                password: crate::client::auth::secret_from_string(password.into()),
             },
         });
     }
@@ -943,6 +931,24 @@ pub(crate) trait ConfigString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "native-tls", feature = "vendored-openssl"))]
+    use secrecy::ExposeSecret;
+
+    #[test]
+    fn config_debug_redacts_connection_password() {
+        // The connection password lives inside `auth: AuthMethod`; the whole
+        // `Config` Debug must never print it.
+        let config = Config::builder()
+            .authentication(AuthMethod::sql_server("SA", "conn-str-secret"))
+            .build();
+
+        let dbg = format!("{config:?}");
+        assert!(
+            !dbg.contains("conn-str-secret"),
+            "connection password leaked in Config Debug: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"), "password not redacted: {dbg}");
+    }
 
     #[test]
     fn config_builder_constructs_config() {
@@ -1079,7 +1085,7 @@ mod tests {
         {
             ClientCertSource::Pkcs12 { path, password } => {
                 assert_eq!(path, &PathBuf::from("/tmp/identity.pfx"));
-                assert_eq!(password.as_str(), "s3cr3t");
+                assert_eq!(password.expose_secret(), "s3cr3t");
             }
             other => panic!("expected Pkcs12 source, got {other:?}"),
         }
@@ -1092,8 +1098,8 @@ mod tests {
         config.client_certificate_pkcs12("/tmp/identity.pfx", "topsecret");
 
         let dbg = format!("{:?}", config.get_client_certificate().unwrap());
-        assert!(dbg.contains("<redacted>"));
-        assert!(!dbg.contains("topsecret"));
+        assert!(dbg.contains("REDACTED"), "password not redacted: {dbg}");
+        assert!(!dbg.contains("topsecret"), "password leaked: {dbg}");
     }
 
     #[cfg(all(unix, feature = "sspi-rs"))]
@@ -1246,7 +1252,7 @@ mod tests {
         {
             ClientCertSource::Pkcs12 { path, password } => {
                 assert_eq!(path, &PathBuf::from("/tmp/identity.pfx"));
-                assert_eq!(password.as_str(), "s3cr3t");
+                assert_eq!(password.expose_secret(), "s3cr3t");
             }
             other => panic!("expected Pkcs12 source, got {other:?}"),
         }

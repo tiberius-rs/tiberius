@@ -32,6 +32,7 @@ use libgssapi::{
     oid::{OidSet, GSS_MECH_KRB5, GSS_NT_KRB5_PRINCIPAL},
 };
 use pretty_hex::*;
+use secrecy::ExposeSecret;
 #[cfg(all(unix, feature = "sspi-rs"))]
 use sspi::{
     AuthIdentity, BufferType, ClientRequestFlags, CredentialUse, DataRepresentation, Ntlm,
@@ -597,17 +598,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 let username =
                     Username::new(&auth.user, auth.domain.as_deref()).map_err(sspi::Error::from)?;
 
-                // `auth.password` is a `Zeroizing<String>`. We must hand sspi a
+                // `auth.password` is a `SecretString`; sspi requires a
                 // plaintext `String`, but that single copy is *moved* (not
                 // cloned again) into `AuthIdentity.password`, which is
                 // `sspi::Secret<String>` — a `#[derive(ZeroizeOnDrop)]` wrapper.
                 // The plaintext is therefore wiped when `identity` (and the
                 // credentials handle derived from it) is dropped; no
-                // un-zeroized copy is left behind. Keep this a single
-                // `to_string()` so no extra plaintext allocation is created.
+                // un-zeroized copy is left behind. Expose the secret once, for
+                // this single `to_string()`, so no extra plaintext lingers
+                // here (`auth.password` zeroizes when this arm's `auth`
+                // drops).
                 let identity = AuthIdentity {
                     username,
-                    password: auth.password.to_string().into(),
+                    password: auth.password.expose_secret().to_string().into(),
                 };
 
                 let mut creds = ntlm
@@ -680,16 +683,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             AuthMethod::Windows(auth) => {
                 let spn = self.context.spn().to_string();
                 let builder = winauth::NtlmV2ClientBuilder::new().target_spn(spn);
-                // `auth.password` is a `Zeroizing<String>`, but `winauth`
+                // `auth.password` is a `SecretString`, but `winauth`
                 // 0.0.5's `build` takes the password by value as a plain
                 // `String` and neither zeroizes it nor exposes it afterwards, so
-                // we cannot wipe it once handed over. We pass a single
-                // `to_string()` copy (no additional retained plaintext on our
-                // side) and accept a residual: the plaintext lives inside the
-                // `NtlmV2Client` until that value is dropped, un-zeroized.
+                // it cannot be wiped once handed over. Expose it once for a
+                // single `to_string()` copy (no additional retained plaintext
+                // here) and accept a residual: the plaintext lives inside
+                // the `NtlmV2Client` until that value is dropped, un-zeroized.
                 // Closing this fully requires zeroize support upstream in
                 // `winauth`.
-                let mut client = builder.build(auth.domain, auth.user, auth.password.to_string());
+                let mut client = builder.build(
+                    auth.domain,
+                    auth.user,
+                    auth.password.expose_secret().to_string(),
+                );
 
                 login_message.integrated_security(client.next_bytes(None)?);
 
@@ -726,8 +733,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 let (user, mut password) = auth.into_credentials();
 
                 login_message.user_name(user);
-                login_message.password(password.as_str());
+                // Expose the password only to hand it to the login message,
+                // which stores its own `SecretString` copy.
+                login_message.password(password.expose_secret());
                 let payload = login_message.encode_to_boxed_slice()?;
+                // Wipe the local copy immediately; `login_message` was consumed by
+                // `encode_to_boxed_slice` and its `SecretString` password was
+                // zeroized on drop there.
                 password.zeroize();
 
                 let id = self.context.next_packet_id();
@@ -736,9 +748,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 self = self.post_login_encryption(encryption);
             }
             AuthMethod::AADToken(token) => {
-                // Borrow the token so the `Zeroizing<String>` is wiped on drop at
-                // the end of this arm rather than being moved out un-zeroized.
-                login_message.aad_token(token.as_str(), prelogin.fed_auth_required, prelogin.nonce);
+                // Expose the token only to hand it to the login message; the
+                // `SecretString` here is wiped on drop at the end of this arm,
+                // and the login message stores its own `SecretString` copy.
+                login_message.aad_token(
+                    token.expose_secret(),
+                    prelogin.fed_auth_required,
+                    prelogin.nonce,
+                );
                 // Encode into a zeroizing buffer and use the sensitive-login
                 // path so the bearer token does not linger in freed heap memory.
                 let payload = login_message.encode_to_boxed_slice()?;

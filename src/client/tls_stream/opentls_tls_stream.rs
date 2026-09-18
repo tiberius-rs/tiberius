@@ -8,6 +8,7 @@ use crate::{
 use futures_util::io::{AsyncRead, AsyncWrite};
 pub(crate) use opentls::async_io::{TlsConnector, TlsStream};
 use opentls::{Certificate, Identity};
+use secrecy::ExposeSecret;
 use std::fs;
 use tracing::{event, Level};
 
@@ -27,7 +28,8 @@ fn load_identity(cert: &ClientCertificate) -> crate::Result<Identity> {
                     path.to_string_lossy()
                 ),
             })?;
-            Ok(Identity::from_pkcs12(&buf, password)?)
+            // Expose the PKCS#12 password only for the decryption call itself.
+            Ok(Identity::from_pkcs12(&buf, password.expose_secret())?)
         }
         ClientCertSource::CertAndKey { .. } => Err(Error::Tls(
             "The vendored-openssl (opentls) backend does not support separate \

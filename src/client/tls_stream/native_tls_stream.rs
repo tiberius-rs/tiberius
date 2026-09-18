@@ -8,6 +8,7 @@ use crate::{
 pub(crate) use async_native_tls::TlsStream;
 use async_native_tls::{Certificate, Identity, TlsConnector};
 use futures_util::io::{AsyncRead, AsyncWrite};
+use secrecy::ExposeSecret;
 use std::fs;
 use tracing::{event, Level};
 
@@ -66,7 +67,8 @@ fn load_identity(cert: &ClientCertificate) -> crate::Result<Identity> {
                     path.to_string_lossy()
                 ),
             })?;
-            Ok(Identity::from_pkcs12(&buf, password)?)
+            // Expose the PKCS#12 password only for the decryption call itself.
+            Ok(Identity::from_pkcs12(&buf, password.expose_secret())?)
         }
     }
 }

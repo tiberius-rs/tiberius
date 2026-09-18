@@ -3,6 +3,7 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use bytes::BytesMut;
 use enumflags2::{bitflags, BitFlags};
 use io::{Cursor, Write};
+use secrecy::{ExposeSecret, SecretString};
 use std::fmt::Debug;
 use std::{borrow::Cow, io};
 use zeroize::{Zeroize, Zeroizing};
@@ -131,21 +132,35 @@ pub(crate) const FED_AUTH_LIBRARYSECURITYTOKEN: u8 = 0x01;
 
 /// https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/773a62b6-ee89-4c02-9e5e-344882630aac
 #[derive(Clone, Default)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
-struct FedAuthExt<'a> {
+struct FedAuthExt {
     fed_auth_echo: bool,
-    fed_auth_token: Cow<'a, str>,
+    fed_auth_token: SecretString,
     nonce: Option<[u8; 32]>,
 }
 
-// Manual Debug so the AAD bearer token is never printed. `LoginMessage`'s own
-// Debug redacts the SQL password; this keeps the federated-auth token redacted
-// too (its derived Debug would otherwise leak the full token via that field).
-impl std::fmt::Debug for FedAuthExt<'_> {
+// `SecretString` has no `PartialEq`; this test-only impl compares the exposed
+// token so the round-trip tests keep working.
+#[cfg(test)]
+impl PartialEq for FedAuthExt {
+    fn eq(&self, other: &Self) -> bool {
+        self.fed_auth_echo == other.fed_auth_echo
+            && self.nonce == other.nonce
+            && self.fed_auth_token.expose_secret() == other.fed_auth_token.expose_secret()
+    }
+}
+
+#[cfg(test)]
+impl Eq for FedAuthExt {}
+
+// The `fed_auth_token` is a `secrecy::SecretString`, so it self-redacts in
+// `Debug` output; a derive would keep the AAD bearer token safe on that field.
+// This manual impl is retained only to summarize `nonce` as `<present>`/`None`
+// rather than dumping the raw nonce bytes a derive would print.
+impl std::fmt::Debug for FedAuthExt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FedAuthExt")
             .field("fed_auth_echo", &self.fed_auth_echo)
-            .field("fed_auth_token", &"<HIDDEN>")
+            .field("fed_auth_token", &self.fed_auth_token)
             .field("nonce", &self.nonce.map(|_| "<present>"))
             .finish()
     }
@@ -153,7 +168,6 @@ impl std::fmt::Debug for FedAuthExt<'_> {
 
 /// the login packet
 #[derive(Clone, Default)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct LoginMessage<'a> {
     /// the highest TDS version the client supports
     tds_version: FeatureLevel,
@@ -176,16 +190,51 @@ pub struct LoginMessage<'a> {
     client_lcid: u32,
     hostname: Cow<'a, str>,
     username: Cow<'a, str>,
-    password: Cow<'a, str>,
+    // Credentials are stored as `SecretString`: zeroized on drop and redacted
+    // from `Debug`. The plaintext is exposed only at the point its bytes are
+    // written into the LOGIN7 buffer (see `encode_to_boxed_slice`).
+    password: SecretString,
     app_name: Cow<'a, str>,
     server_name: Cow<'a, str>,
     /// the default database to connect to
     db_name: Cow<'a, str>,
-    fed_auth_ext: Option<FedAuthExt<'a>>,
+    fed_auth_ext: Option<FedAuthExt>,
 }
 
-// Manual Debug so the plaintext `password` is never printed (every other
-// credential-bearing type in the crate redacts it the same way).
+// `SecretString` has no `PartialEq`; this test-only impl compares the exposed
+// password so the encode/decode round-trip tests keep working.
+#[cfg(test)]
+impl PartialEq for LoginMessage<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.tds_version == other.tds_version
+            && self.packet_size == other.packet_size
+            && self.client_prog_ver == other.client_prog_ver
+            && self.client_pid == other.client_pid
+            && self.connection_id == other.connection_id
+            && self.option_flags_1 == other.option_flags_1
+            && self.option_flags_2 == other.option_flags_2
+            && self.integrated_security == other.integrated_security
+            && self.type_flags == other.type_flags
+            && self.option_flags_3 == other.option_flags_3
+            && self.client_timezone == other.client_timezone
+            && self.client_lcid == other.client_lcid
+            && self.hostname == other.hostname
+            && self.username == other.username
+            && self.app_name == other.app_name
+            && self.server_name == other.server_name
+            && self.db_name == other.db_name
+            && self.fed_auth_ext == other.fed_auth_ext
+            && self.password.expose_secret() == other.password.expose_secret()
+    }
+}
+
+#[cfg(test)]
+impl Eq for LoginMessage<'_> {}
+
+// Kept as a hand-written impl for defense-in-depth even though `password`
+// self-redacts via `SecretString` (`[REDACTED]`) and the output now matches a
+// derive. Enumerating every field explicitly forces any future field to be
+// consciously handled here; a derive would silently print a newly-added secret.
 impl std::fmt::Debug for LoginMessage<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoginMessage")
@@ -203,7 +252,7 @@ impl std::fmt::Debug for LoginMessage<'_> {
             .field("client_lcid", &self.client_lcid)
             .field("hostname", &self.hostname)
             .field("username", &self.username)
-            .field("password", &"<HIDDEN>")
+            .field("password", &self.password)
             .field("app_name", &self.app_name)
             .field("server_name", &self.server_name)
             .field("db_name", &self.db_name)
@@ -311,13 +360,13 @@ impl<'a> LoginMessage<'a> {
         self.username = user_name.into();
     }
 
-    pub fn password(&mut self, password: impl Into<Cow<'a, str>>) {
-        self.password = password.into();
+    pub fn password(&mut self, password: impl Into<String>) {
+        self.password = crate::client::auth::secret_from_string(password.into());
     }
 
     pub fn aad_token(
         &mut self,
-        token: impl Into<Cow<'a, str>>,
+        token: impl Into<String>,
         fed_auth_echo: bool,
         nonce: Option<[u8; 32]>,
     ) {
@@ -325,7 +374,7 @@ impl<'a> LoginMessage<'a> {
 
         self.fed_auth_ext = Some(FedAuthExt {
             fed_auth_echo,
-            fed_auth_token: token.into(),
+            fed_auth_token: crate::client::auth::secret_from_string(token.into()),
             nonce,
         })
     }
@@ -369,7 +418,7 @@ impl<'a> LoginMessage<'a> {
         let mut len = FIXED_OVERHEAD;
         len += utf16_bytes(&self.hostname);
         len += utf16_bytes(&self.username);
-        len += utf16_bytes(&self.password);
+        len += utf16_bytes(self.password.expose_secret());
         len += utf16_bytes(&self.app_name);
         len += utf16_bytes(&self.server_name);
         len += utf16_bytes(&self.db_name);
@@ -382,7 +431,7 @@ impl<'a> LoginMessage<'a> {
             // 4 (FeatureExt data offset) + 1 (FEA_EXT_FEDAUTH) + 4 (feature ext
             // length) + 1 (options) + 4 (token length) + token bytes + nonce
             // + 1 (FEA_EXT_TERMINATOR).
-            len += 15 + utf16_bytes(&ext.fed_auth_token);
+            len += 15 + utf16_bytes(ext.fed_auth_token.expose_secret());
             if ext.nonce.is_some() {
                 len += 32;
             }
@@ -427,21 +476,27 @@ impl<'a> LoginMessage<'a> {
         cursor.write_u32::<LittleEndian>(self.client_timezone as u32)?;
         cursor.write_u32::<LittleEndian>(self.client_lcid)?;
 
-        // variable length data (OffsetLength)
-        let var_data = [
+        // variable length data (OffsetLength). Expose the password only here, as
+        // a short-lived `&str` borrowed for the duration of this encode; the
+        // resulting bytes land in the `Zeroizing` buffer returned below.
+        let password = self.password.expose_secret();
+        // `13` is the number of TDS LOGIN7 variable-length `OffsetLength` fields
+        // assembled in `var_data`; it must equal the element count of the
+        // literal below. The annotation is kept for the mixed-element coercion.
+        let var_data: [&str; 13] = [
             &self.hostname,
             &self.username,
-            &self.password,
+            password,
             &self.app_name,
             &self.server_name,
-            &"".into(), // 5. ibExtension
-            &"".into(), // ibCltIntName
-            &"".into(), // ibLanguage
+            "", // 5. ibExtension
+            "", // ibCltIntName
+            "", // ibLanguage
             &self.db_name,
-            &"".into(), // 9. ClientId (6 bytes); this is included in var_data so we don't lack the bytes of cbSspiLong (4=2*2) and can insert it at the correct position
-            &"".into(), // 10. ibSSPI
-            &"".into(), // ibAtchDBFile
-            &"".into(), // ibChangePassword
+            "", // 9. ClientId (6 bytes); this is included in var_data so we don't lack the bytes of cbSspiLong (4=2*2) and can insert it at the correct position
+            "", // 10. ibSSPI
+            "", // ibAtchDBFile
+            "", // ibChangePassword
         ];
 
         let mut data_offset = cursor.position() as usize + var_data.len() * 2 * 2 + 6;
@@ -533,9 +588,13 @@ impl<'a> LoginMessage<'a> {
             // reallocates while holding the token — a realloc would free the old
             // allocation without zeroizing it, leaking a recoverable copy. It is
             // wrapped in `Zeroizing` so it is wiped on drop as well.
-            let token_capacity = fed_auth_ext.fed_auth_token.encode_utf16().count() * 2;
+            // Expose the fed-auth token only to size and write its bytes; they
+            // go into the `Zeroizing` buffer and the local `token` Vec is
+            // wrapped in `Zeroizing` below.
+            let fed_auth_token = fed_auth_ext.fed_auth_token.expose_secret();
+            let token_capacity = fed_auth_token.encode_utf16().count() * 2;
             let mut token = Cursor::new(Vec::with_capacity(token_capacity));
-            for codepoint in fed_auth_ext.fed_auth_token.encode_utf16() {
+            for codepoint in fed_auth_token.encode_utf16() {
                 token.write_u16::<LittleEndian>(codepoint)?;
             }
             // Wrap in `Zeroizing` so the finished token buffer is also wiped on
@@ -949,7 +1008,7 @@ mod tests {
         let decoded = LoginMessage::decode(&mut buf).expect("decode should succeed");
 
         let ext = decoded.fed_auth_ext.expect("fed_auth_ext must be present");
-        assert_eq!(ext.fed_auth_token, Cow::Borrowed(token));
+        assert_eq!(ext.fed_auth_token.expose_secret(), token);
         assert!(ext.fed_auth_echo);
         assert_eq!(ext.nonce, Some(nonce));
     }
@@ -1041,13 +1100,46 @@ mod tests {
     #[test]
     fn debug_redacts_fed_auth_token() {
         let mut login = LoginMessage::new();
-        login.aad_token("super-secret-aad-token", true, Some([9u8; 32]));
+        // Distinctive plaintext so the assertion is load-bearing: a generic
+        // "REDACTED" check is vacuous because the always-present `password:
+        // SecretString` field prints "REDACTED" regardless of the fed-auth
+        // token. Asserting this exact plaintext is absent fails iff the token
+        // leaks.
+        let token = "fed-auth-token-PLAINTEXT-XYZ";
+        login.aad_token(token, true, Some([9u8; 32]));
+        assert!(
+            login.fed_auth_ext.is_some(),
+            "test must exercise a LoginMessage whose fed_auth_ext is Some"
+        );
 
         let dbg = format!("{login:?}");
         assert!(
-            !dbg.contains("super-secret-aad-token"),
+            !dbg.contains(token),
             "AAD token leaked in Debug output: {dbg}"
         );
-        assert!(dbg.contains("HIDDEN"));
+    }
+
+    #[test]
+    fn debug_redacts_login_password() {
+        let mut login = LoginMessage::new();
+        login.user_name("some-user");
+        login.password("super-secret-login-pw");
+
+        let dbg = format!("{login:?}");
+        assert!(
+            !dbg.contains("super-secret-login-pw"),
+            "password leaked in Debug output: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"), "password not redacted: {dbg}");
+        // Non-secret fields remain visible for diagnostics.
+        assert!(dbg.contains("some-user"), "username should be shown: {dbg}");
+    }
+
+    #[test]
+    fn password_setter_stores_exposable_secret() {
+        let mut login = LoginMessage::new();
+        login.password("hunter2");
+        // The stored `SecretString` exposes exactly the plaintext provided.
+        assert_eq!(login.password.expose_secret(), "hunter2");
     }
 }

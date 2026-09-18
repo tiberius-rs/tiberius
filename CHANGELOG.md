@@ -17,6 +17,14 @@
 - feat: client-certificate authentication, including PEM/DER key files
   (`Config::client_certificate`) and PKCS#12 bundles
   (`Config::client_certificate_pkcs12`).
+- BREAKING: credentials (SQL Server / Windows passwords, the AAD bearer token
+  and the PKCS#12 password) are now stored as `secrecy::SecretString` instead of
+  `zeroize::Zeroizing<String>`. They are still zeroized on drop, and their
+  `Debug` now renders as `SecretBox<str>([REDACTED])` (was `<HIDDEN>`). The
+  `AuthMethod::AADToken` tuple variant consequently holds a `SecretString`: code
+  that pattern-matched it and read the token via `Deref`/`Display` must now call
+  `secrecy::ExposeSecret::expose_secret`. Constructing auth via
+  `AuthMethod::aad_token`/`sql_server`/`windows` is unchanged.
 - chore: upgraded the rustls stack to 0.23 (tokio-rustls 0.26) and resolved the
   associated advisories.
 - fix: numerous decode-path hardening fixes (protocol errors instead of panics

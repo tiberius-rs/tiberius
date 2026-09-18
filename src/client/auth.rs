@@ -1,28 +1,44 @@
-use std::fmt::Debug;
-use zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString};
+use zeroize::Zeroize;
 
-#[derive(Clone, PartialEq, Eq)]
+/// Build a `SecretString` from owned bytes without leaving an un-zeroized copy
+/// in freed heap. `SecretString::from(String)` routes through
+/// `String::into_boxed_str()`, which reallocates and frees the source buffer
+/// *without zeroizing* when the string has spare capacity. Copy the bytes into
+/// an exact-sized `Box<str>` and wipe the original.
+pub(crate) fn secret_from_string(mut s: String) -> SecretString {
+    let boxed: Box<str> = s.as_str().into();
+    s.zeroize();
+    SecretString::new(boxed)
+}
+
+// Credentials are stored as `secrecy::SecretString`, which zeroizes the
+// plaintext on drop and redacts it from `Debug`, so these types can derive
+// `Debug` and still never print a secret. `SecretString` does not implement
+// `PartialEq`/`Eq` (comparing secrets is deliberately opt-in), so the equality
+// impls below are hand-written; they compare the exposed plaintext to preserve
+// the previous derived behaviour (and the public `AuthMethod: Eq` bound).
+#[derive(Clone, Debug)]
 pub struct SqlServerAuth {
     user: String,
-    password: Zeroizing<String>,
+    password: SecretString,
 }
 
 impl SqlServerAuth {
-    pub(crate) fn into_credentials(self) -> (String, Zeroizing<String>) {
+    pub(crate) fn into_credentials(self) -> (String, SecretString) {
         (self.user, self.password)
     }
 }
 
-impl Debug for SqlServerAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SqlServerAuth")
-            .field("user", &self.user)
-            .field("password", &"<HIDDEN>")
-            .finish()
+impl PartialEq for SqlServerAuth {
+    fn eq(&self, other: &Self) -> bool {
+        self.user == other.user && self.password.expose_secret() == other.password.expose_secret()
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+impl Eq for SqlServerAuth {}
+
+#[derive(Clone, Debug)]
 #[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"), doc))]
 #[cfg_attr(
     docsrs,
@@ -30,27 +46,24 @@ impl Debug for SqlServerAuth {
 )]
 pub struct WindowsAuth {
     pub(crate) user: String,
-    pub(crate) password: Zeroizing<String>,
+    pub(crate) password: SecretString,
     pub(crate) domain: Option<String>,
 }
 
 #[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"), doc))]
-#[cfg_attr(
-    docsrs,
-    doc(cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"))))
-)]
-impl Debug for WindowsAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WindowsAuth")
-            .field("user", &self.user)
-            .field("password", &"<HIDDEN>")
-            .field("domain", &self.domain)
-            .finish()
+impl PartialEq for WindowsAuth {
+    fn eq(&self, other: &Self) -> bool {
+        self.user == other.user
+            && self.domain == other.domain
+            && self.password.expose_secret() == other.password.expose_secret()
     }
 }
 
+#[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"), doc))]
+impl Eq for WindowsAuth {}
+
 /// Defines the method of authentication to the server.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum AuthMethod {
     /// Authenticate directly with SQL Server.
     SqlServer(SqlServerAuth),
@@ -77,37 +90,41 @@ pub enum AuthMethod {
     Integrated,
     /// Authenticate with an AAD token. The token should encode an AAD user/service principal
     /// which has access to SQL Server.
-    AADToken(Zeroizing<String>),
+    AADToken(SecretString),
     #[doc(hidden)]
     None,
 }
 
-// Manual Debug so the AAD bearer token is never printed. The credential-bearing
-// SqlServer/Windows variants delegate to their inner types, which already redact.
-impl Debug for AuthMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SqlServer(a) => f.debug_tuple("SqlServer").field(a).finish(),
+// `SecretString` has no `PartialEq`, so `AuthMethod`'s public equality is
+// hand-written. It mirrors the old derived behaviour: same variant + equal
+// fields (secrets compared via their exposed plaintext).
+impl PartialEq for AuthMethod {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::SqlServer(a), Self::SqlServer(b)) => a == b,
             #[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"), doc))]
-            Self::Windows(a) => f.debug_tuple("Windows").field(a).finish(),
+            (Self::Windows(a), Self::Windows(b)) => a == b,
             #[cfg(any(
                 all(windows, feature = "winauth"),
                 all(unix, feature = "integrated-auth-gssapi"),
                 doc
             ))]
-            Self::Integrated => f.write_str("Integrated"),
-            Self::AADToken(_) => f.debug_tuple("AADToken").field(&"<HIDDEN>").finish(),
-            Self::None => f.write_str("None"),
+            (Self::Integrated, Self::Integrated) => true,
+            (Self::AADToken(a), Self::AADToken(b)) => a.expose_secret() == b.expose_secret(),
+            (Self::None, Self::None) => true,
+            _ => false,
         }
     }
 }
+
+impl Eq for AuthMethod {}
 
 impl AuthMethod {
     /// Construct a new SQL Server authentication configuration.
     pub fn sql_server(user: impl ToString, password: impl ToString) -> Self {
         Self::SqlServer(SqlServerAuth {
             user: user.to_string(),
-            password: Zeroizing::new(password.to_string()),
+            password: secret_from_string(password.to_string()),
         })
     }
 
@@ -125,46 +142,76 @@ impl AuthMethod {
 
         Self::Windows(WindowsAuth {
             user: user.to_string(),
-            password: Zeroizing::new(password.to_string()),
+            password: secret_from_string(password.to_string()),
             domain: domain.map(|s| s.to_string()),
         })
     }
 
     /// Construct a new configuration with AAD auth token.
     pub fn aad_token(token: impl ToString) -> Self {
-        Self::AADToken(Zeroizing::new(token.to_string()))
+        Self::AADToken(secret_from_string(token.to_string()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::AuthMethod;
-    use zeroize::Zeroize;
+    use secrecy::ExposeSecret;
+
+    // Compile-time proof that the stored credential zeroizes its plaintext on
+    // drop: `secrecy::SecretString` implements `ZeroizeOnDrop`.
+    #[test]
+    fn stored_credentials_are_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<secrecy::SecretString>();
+    }
 
     #[test]
-    fn sql_server_password_can_be_consumed_and_zeroized() {
+    fn sql_server_password_can_be_consumed_and_exposed() {
         let AuthMethod::SqlServer(auth) = AuthMethod::sql_server("sa", "secret") else {
             unreachable!();
         };
 
-        let (user, mut password) = auth.into_credentials();
+        let (user, password) = auth.into_credentials();
 
         assert_eq!("sa", user);
-        assert_eq!("secret", password.as_str());
+        // `expose_secret()` yields exactly the plaintext that was provided.
+        assert_eq!("secret", password.expose_secret());
+        // The credential is dropped (and zeroized) at the end of this scope.
+    }
 
-        password.zeroize();
-
-        assert!(password.is_empty());
+    #[test]
+    fn aad_token_exposes_the_right_value() {
+        let AuthMethod::AADToken(token) = AuthMethod::aad_token("aad-secret-token") else {
+            unreachable!();
+        };
+        assert_eq!("aad-secret-token", token.expose_secret());
     }
 
     #[test]
     fn debug_redacts_credentials() {
         let sql = format!("{:?}", AuthMethod::sql_server("sa", "sql-secret"));
         assert!(!sql.contains("sql-secret"), "SQL password leaked: {sql}");
+        // The non-secret user is still visible for diagnostics.
+        assert!(sql.contains("sa"), "user should be shown: {sql}");
+        assert!(sql.contains("REDACTED"), "password not redacted: {sql}");
 
         let aad = format!("{:?}", AuthMethod::aad_token("aad-secret-token"));
         assert!(!aad.contains("aad-secret-token"), "AAD token leaked: {aad}");
-        assert!(aad.contains("HIDDEN"));
+        assert!(aad.contains("REDACTED"), "AAD token not redacted: {aad}");
+    }
+
+    #[test]
+    fn secret_from_string_preserves_value_with_spare_capacity() {
+        // A `String` with spare capacity is exactly the input shape that would
+        // trigger the leaky `SecretString::from(String)` reallocation path. This
+        // test verifies the helper preserves the value for that shape. The
+        // zeroization of the freed source is guaranteed by construction
+        // (`s.zeroize()` before drop) and is not directly unit-observable in
+        // safe Rust, so it is not asserted here.
+        let mut s = String::with_capacity(64);
+        s.push_str("pw");
+        assert_eq!(super::secret_from_string(s).expose_secret(), "pw");
     }
 
     #[test]
@@ -182,6 +229,7 @@ mod tests {
         assert!(dbg.contains("DOMAIN"), "domain not preserved: {dbg}");
         assert!(dbg.contains("user"), "user not preserved: {dbg}");
         assert!(!dbg.contains("win-secret"), "password leaked: {dbg}");
+        assert!(dbg.contains("REDACTED"), "password not redacted: {dbg}");
 
         // No backslash exercises the domain-less branch.
         let plain = AuthMethod::windows("plainuser", "pw");
