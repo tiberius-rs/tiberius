@@ -58,6 +58,33 @@ jobs:
       - name: Check on MSRV
         run: cargo check --features all
 
+  # The `rustls-webpki-roots` feature (and the rustls trust-store code paths in
+  # general) are excluded from `--features=all` because the three TLS backends
+  # are mutually exclusive, so neither the clippy nor the MSRV job above builds
+  # them. This server-less lane keeps them clippy-clean, buildable, and unit-
+  # tested so a regression (e.g. a `webpki-roots` major bump changing
+  # `TLS_SERVER_ROOTS`) is caught in CI.
+  rustls-features:
+    name: rustls trust-store (unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
+      # Build + unit-test both rustls feature sets. `--lib` needs no live server.
+      # (Strict `-D warnings` clippy is deferred repo-wide until the baseline
+      # lints land, matching the advisory `clippy` job above.)
+      - name: Unit tests (rustls)
+        run: cargo test --no-default-features --features rustls,chrono,time,tds73 --lib
+      - name: Unit tests (rustls-webpki-roots)
+        run: cargo test --no-default-features --features rustls-webpki-roots,chrono,time,tds73 --lib
+
   semver:
     name: semver-checks (advisory)
     if: github.event_name == 'pull_request'

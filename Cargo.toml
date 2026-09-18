@@ -150,6 +150,22 @@ version = "0.103.13"
 optional = true
 default-features = false
 
+# Shared certificate DER/PEM types used by the backend-agnostic CA loader
+# (`src/client/tls_stream/certs.rs`). Enabled by every TLS backend so all three
+# parse trust anchors through one code path. This is the same `rustls-pki-types`
+# crate `tokio-rustls` re-exports, so the `CertificateDer` handed to rustls is
+# the exact same type.
+[dependencies.rustls-pki-types]
+version = "1"
+optional = true
+
+# Compiled-in Mozilla root CA bundle for the `rustls-webpki-roots` feature.
+# Pinned to its current major (1.x). Note: this is a *pinned snapshot* that goes
+# stale unless the dependency is updated.
+[dependencies.webpki-roots]
+version = "1"
+optional = true
+
 [dependencies.opentls]
 version = "0.2.1"
 optional = true
@@ -232,9 +248,13 @@ sql-browser-tokio = ["tokio", "tokio-util"]
 sql-browser-smol = ["async-io", "async-net", "futures-lite"]
 integrated-auth-gssapi = ["libgssapi"]
 bigdecimal = ["bigdecimal_"]
-rustls = ["tokio-rustls", "tokio-util", "rustls-native-certs", "rustls-webpki"]
-native-tls = ["async-native-tls"]
-vendored-openssl = ["opentls"]
+rustls = ["tokio-rustls", "tokio-util", "rustls-native-certs", "rustls-webpki", "rustls-pki-types"]
+# Bundle a compiled-in snapshot of Mozilla's root CA store, selectable via
+# `Config::trust_webpki_roots()` (rustls only). Implies `rustls`; the bundled
+# roots are a pinned snapshot that goes stale without dependency updates.
+rustls-webpki-roots = ["rustls", "dep:webpki-roots"]
+native-tls = ["async-native-tls", "rustls-pki-types"]
+vendored-openssl = ["opentls", "rustls-pki-types"]
 # Enables Windows-style SSPI/NTLM authentication (`AuthMethod::Windows`) on Unix
 # platforms without requiring Kerberos, via the pure-Rust `sspi` crate. On
 # Windows the same authentication is provided by the `winauth` feature.

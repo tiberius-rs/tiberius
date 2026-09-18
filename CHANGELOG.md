@@ -2,6 +2,32 @@
 
 ## Version 0.13.0
 
+- feat: TLS trust configuration is revamped around two orthogonal axes plus a
+  bypass, unifying community PRs #330 and #290:
+  - `Config::trust_cert_ca_bundle(bytes)` (and the `ConfigBuilder` mirror) trusts
+    additional CA certificates supplied as in-memory bytes, without writing them
+    to a temporary file. The bytes are auto-detected: a `-----BEGIN` marker is
+    parsed as a multi-certificate PEM bundle (e.g. the AWS RDS root bundle),
+    otherwise they are treated as a single DER certificate.
+  - `Config::trust_webpki_roots()` (and the `ConfigBuilder` mirror) bases trust
+    on a compiled-in snapshot of Mozilla's root CA store instead of the OS trust
+    store. rustls-only, behind the new `rustls-webpki-roots` feature. Note: the
+    bundled roots are a pinned snapshot that goes stale (missing newly added or
+    newly distrusted CAs) unless the dependency is updated and the app rebuilt.
+  - `Config::trust_cert_ca(path)` now accepts **multi-certificate** files (the
+    previous "exactly one certificate" restriction is lifted); every certificate
+    in the file is trusted, on all three TLS backends.
+- BREAKING: repeated `trust_cert_ca` calls now **accumulate** rather than
+  replace-last-wins. `trust_cert_ca(a); trust_cert_ca(b)` (and any mix with
+  `trust_cert_ca_bundle`) trusts every supplied CA, layered on top of the base
+  trust anchors. Code that relied on a later call overriding an earlier one must
+  now set the CA only once.
+- fix: a CA source (file or in-memory bundle) that yields zero usable
+  certificates is now a hard error naming the source, on every backend, instead
+  of silently degrading to base-roots-only trust. The `native-tls` and
+  `vendored-openssl` backends also now load *all* certificates from a
+  multi-certificate CA file/bundle (previously only the first was used) and
+  preserve the path plus underlying I/O error in load failures, matching rustls.
 - BREAKING: the connection-string `encrypt` default is now `Required` (was
   `Off`) when a TLS backend is enabled, matching modern ADO.NET; without a TLS
   backend it remains `NotSupported`.

@@ -1,6 +1,7 @@
+use super::certs;
 use crate::{
     client::{
-        config::{ClientCertSource, ClientCertificate, Config},
+        config::{ClientCertSource, ClientCertificate, Config, RootSource},
         TrustConfig,
     },
     error::IoErrorKind,
@@ -23,7 +24,7 @@ use tokio_rustls::{
         crypto::{aws_lc_rs, CryptoProvider},
         pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime},
         ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore,
-        SignatureScheme, WantsVerifier,
+        SignatureScheme,
     },
     TlsConnector,
 };
@@ -74,7 +75,7 @@ impl ServerCertVerifier for NoCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        // Advertised only; TrustAll stubs verification to always succeed.
+        // Advertised only; the trust bypass stubs verification to always succeed.
         vec![
             SignatureScheme::RSA_PKCS1_SHA256,
             SignatureScheme::RSA_PKCS1_SHA384,
@@ -94,17 +95,16 @@ impl ServerCertVerifier for NoCertVerifier {
 fn get_server_name(config: &Config) -> crate::Result<ServerName<'static>> {
     match (
         ServerName::try_from(config.get_hostname_in_certificate()),
-        &config.trust,
+        config.trust.bypass,
     ) {
         (Ok(sn), _) => Ok(sn.to_owned()),
-        // Under TrustAll the certificate (and thus its name) is not validated, so
-        // the SNI value is irrelevant; use a syntactically-valid placeholder when
-        // the configured hostname can't be parsed as a `ServerName`. The literal
-        // is a valid DNS name, so `try_from(...).unwrap()` cannot panic.
-        (Err(_), TrustConfig::TrustAll) => {
-            Ok(ServerName::try_from("placeholder.domain.com").unwrap())
-        }
-        (Err(e), _) => Err(crate::Error::Tls(e.to_string())),
+        // Under the trust bypass the certificate (and thus its name) is not
+        // validated, so the SNI value is irrelevant; use a syntactically-valid
+        // placeholder when the configured hostname can't be parsed as a
+        // `ServerName`. The literal is a valid DNS name, so
+        // `try_from(...).unwrap()` cannot panic.
+        (Err(_), true) => Ok(ServerName::try_from("placeholder.domain.com").unwrap()),
+        (Err(e), false) => Err(crate::Error::Tls(e.to_string())),
     }
 }
 
@@ -120,14 +120,14 @@ fn get_server_name(config: &Config) -> crate::Result<ServerName<'static>> {
 /// still flows through `From<io::Error>` as an [`Error::Io`]).
 ///
 /// The message is only added for genuine certificate-validation failures under
-/// a *validating* trust config; `TrustConfig::TrustAll` already short-circuits
-/// certificate checks in [`NoCertVerifier`], so a cert error cannot originate
-/// there.
+/// a *validating* trust config; the trust bypass (`trust_cert`) already
+/// short-circuits certificate checks in [`NoCertVerifier`], so a cert error
+/// cannot originate there.
 fn map_handshake_error(err: io::Error, trust: &TrustConfig) -> crate::Error {
-    // Only certificate-*validation* failures get the extra guidance. Under
-    // TrustAll the verifier never rejects a cert, so any error there is
+    // Only certificate-*validation* failures get the extra guidance. Under the
+    // trust bypass the verifier never rejects a cert, so any error there is
     // genuinely transport-level and should pass through unchanged.
-    if !matches!(trust, TrustConfig::TrustAll) {
+    if !trust.bypass {
         if let Some(RustlsError::InvalidCertificate(cert_err)) =
             err.get_ref().and_then(|e| e.downcast_ref::<RustlsError>())
         {
@@ -148,12 +148,15 @@ fn map_handshake_error(err: io::Error, trust: &TrustConfig) -> crate::Error {
             return Error::Tls(format!(
                 "the server's certificate was rejected during the TLS handshake: {cert_err}.{hint} \
                  To connect anyway you can: (1) trust a specific CA certificate with \
-                 `Config::trust_cert_ca(path)`; (2) skip certificate validation entirely with \
-                 `Config::trust_cert()` (accepts any certificate — only safe on a trusted \
-                 network); or (3) build tiberius with the `native-tls` backend, which is more \
-                 lenient toward legacy certificates. Note: SQL Server always performs a TLS \
-                 handshake during login even when `Encrypt=false`, so this can occur regardless \
-                 of the encryption setting."
+                 `Config::trust_cert_ca(path)`, or an in-memory CA bundle with \
+                 `Config::trust_cert_ca_bundle(bytes)`; (2) if the OS trust store is unusable, \
+                 base trust on the bundled Mozilla roots with `Config::trust_webpki_roots()` \
+                 (requires the `rustls-webpki-roots` feature); (3) skip certificate validation \
+                 entirely with `Config::trust_cert()` (accepts any certificate and also disables \
+                 hostname verification — only safe on a trusted network); or (4) build tiberius \
+                 with the `native-tls` backend, which is more lenient toward legacy certificates. \
+                 Note: SQL Server always performs a TLS handshake during login even when \
+                 `Encrypt=false`, so this can occur regardless of the encryption setting."
             ));
         }
     }
@@ -175,27 +178,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
 
         // First select the server-certificate verification strategy, yielding a
         // builder that still awaits the client-authentication decision.
-        let cc_builder: ConfigBuilder<ClientConfig, WantsClientCert> = match &config.trust {
-            TrustConfig::CaCertificateLocation(path) => {
-                // Trust the supplied CA *in addition to* the system trust store
-                // (see `build_ca_trust_store`), matching the documented
-                // `trust_cert_ca` contract and the native-tls backend.
-                let store = build_ca_trust_store(read_cert_chain(path)?, path)?;
-                builder.with_root_certificates(store)
-            }
-            TrustConfig::TrustAll => {
-                event!(
-                    Level::WARN,
-                    "Trusting the server certificate without validation."
-                );
-                builder
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
-            }
-            TrustConfig::Default => {
-                event!(Level::DEBUG, "Using default trust configuration.");
-                builder.with_native_roots()?
-            }
+        let cc_builder: ConfigBuilder<ClientConfig, WantsClientCert> = if config.trust.bypass {
+            event!(
+                Level::WARN,
+                "Trusting the server certificate without validation."
+            );
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+        } else {
+            // Build the root store from the configured base source plus any
+            // accumulated extra CAs, then validate against it.
+            let store = build_trust_store(&config.trust)?;
+            builder.with_root_certificates(store)
         };
 
         // Present a client certificate (mutual TLS / TDS 8.0
@@ -292,39 +287,6 @@ fn resolve_crypto_provider(installed: Option<Arc<CryptoProvider>>) -> Arc<Crypto
     }
 }
 
-/// Read a certificate file into a chain of DER certificates, dispatching on the
-/// file extension: `pem`/`crt` parse as (possibly multi-cert) PEM, `der` as a
-/// single DER certificate. The underlying I/O error is preserved in the message
-/// so callers can tell missing-file / permission / parse failures apart.
-fn read_cert_chain(path: &Path) -> crate::Result<Vec<CertificateDer<'static>>> {
-    let buf = fs::read(path).map_err(|e| crate::Error::Io {
-        kind: IoErrorKind::InvalidData,
-        message: format!("Could not read certificate {}: {e}", path.to_string_lossy()),
-    })?;
-
-    match path.extension() {
-        Some(ext) if ext.eq_ignore_ascii_case("pem") || ext.eq_ignore_ascii_case("crt") => {
-            CertificateDer::pem_slice_iter(&buf)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| crate::Error::Io {
-                    kind: IoErrorKind::InvalidData,
-                    message: format!(
-                        "Failed to parse PEM certificate {}: {e}",
-                        path.to_string_lossy()
-                    ),
-                })
-        }
-        Some(ext) if ext.eq_ignore_ascii_case("der") => Ok(vec![CertificateDer::from(buf)]),
-        Some(_) | None => Err(crate::Error::Io {
-            kind: IoErrorKind::InvalidInput,
-            message: format!(
-                "Certificate {} has an unsupported file-extension! Supported types are pem, crt and der.",
-                path.to_string_lossy()
-            ),
-        }),
-    }
-}
-
 /// Load the OS trust store's certificates into `roots`, returning
 /// `(added, had_load_errors)`.
 fn load_native_roots_into(roots: &mut RootCertStore) -> (usize, bool) {
@@ -353,33 +315,82 @@ fn load_native_roots_into(roots: &mut RootCertStore) -> (usize, bool) {
     (added, had_load_errors)
 }
 
-/// Build the root-certificate store for `TrustConfig::CaCertificateLocation`:
-/// the system trust store (best-effort) **plus** the user-supplied CA. Exactly
-/// one certificate is expected in `certs`. Augmenting rather than replacing the
-/// system roots is what makes `trust_cert_ca` additive, per its docs and the
-/// native-tls backend.
-fn build_ca_trust_store(
-    certs: Vec<CertificateDer<'static>>,
-    path: &Path,
-) -> crate::Result<RootCertStore> {
-    if certs.len() != 1 {
-        return Err(crate::Error::Io {
-            kind: IoErrorKind::InvalidInput,
-            message: format!(
-                "CA certificate file {} must contain exactly one certificate, found {}",
-                path.to_string_lossy(),
-                certs.len()
-            ),
-        });
-    }
+/// Build the root-certificate store for a validating [`TrustConfig`]: the base
+/// trust anchors (the OS store, or the bundled Mozilla roots) **plus** every
+/// accumulated extra CA.
+///
+/// Fail-closed invariant (rule 7): when there are no extra CAs, an empty base
+/// store is fatal — `Native` with an unusable OS store fails to connect rather
+/// than trusting nothing. When extra CAs *are* supplied they provide trust on
+/// their own, so an empty/best-effort base is tolerated (matching the additive
+/// `trust_cert_ca` contract). Every extra source must yield at least one usable
+/// certificate (enforced in [`certs::trust_anchors`]).
+fn build_trust_store(trust: &TrustConfig) -> crate::Result<RootCertStore> {
     let mut store = RootCertStore::empty();
-    load_native_roots_into(&mut store);
-    store.add(certs.into_iter().next().unwrap())?;
+
+    // Base trust anchors from the configured source.
+    let (base_added, base_had_errors) = match &trust.source {
+        RootSource::Native => {
+            let (added, had_errors) = load_native_roots_into(&mut store);
+            event!(Level::TRACE, "native trust store added {added} certs");
+            (added, had_errors)
+        }
+        #[cfg(feature = "rustls-webpki-roots")]
+        RootSource::WebpkiRoots => {
+            let before = store.roots.len();
+            store
+                .roots
+                .extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let added = store.roots.len() - before;
+            event!(Level::TRACE, "webpki-roots added {added} certs");
+            (added, false)
+        }
+    };
+
+    // Layer the accumulated extra CAs on top. A DER blob that parses as bytes
+    // but is not a valid certificate is rejected by `store.add`; name the
+    // offending source so the failure is as actionable as the read/parse/zero
+    // errors from `certs::trust_anchors`.
+    for extra in &trust.extra_cas {
+        for cert in certs::trust_anchors(extra)? {
+            store
+                .add(cert)
+                .map_err(|e| certs::invalid_cert_error(extra, e))?;
+        }
+    }
+
+    // Fail closed only when nothing else provides trust.
+    ensure_base_or_extra(base_added, base_had_errors, !trust.extra_cas.is_empty())?;
+
     Ok(store)
 }
 
+/// Fail-closed decision for a validating trust store (rule 7): with no extra
+/// CAs, an empty base store is fatal — `Native` with an unusable OS store must
+/// fail to connect rather than silently trust nothing. When extra CAs *are*
+/// present they provide trust on their own, so a best-effort/empty base is
+/// tolerated. Factored out so the invariant is unit-testable without needing to
+/// simulate an empty OS trust store.
+fn ensure_base_or_extra(
+    base_added: usize,
+    base_had_errors: bool,
+    has_extras: bool,
+) -> crate::Result<()> {
+    if base_added == 0 && !has_extras {
+        return Err(crate::Error::Io {
+            kind: IoErrorKind::NotFound,
+            message: if base_had_errors {
+                "could not load platform certificates".to_string()
+            } else {
+                "no usable CA certificates found in the platform trust store".to_string()
+            },
+        });
+    }
+    Ok(())
+}
+
 /// Read a private-key file, dispatching on the extension: `pem`/`key` parse as
-/// PEM (PKCS#8, PKCS#1 or SEC1), `der` as DER (PKCS#8). Mirrors `read_cert_chain`
+/// PEM (PKCS#8, PKCS#1 or SEC1), `der` as DER (PKCS#8). Mirrors `certs::certs_from_file`
 /// and preserves the underlying I/O error in the message.
 fn read_private_key(path: &Path) -> crate::Result<PrivateKeyDer<'static>> {
     let buf = fs::read(path).map_err(|e| crate::Error::Io {
@@ -418,7 +429,7 @@ fn load_client_auth(
     match &cert.source {
         ClientCertSource::CertAndKey { cert, key } => {
             // Certificate chain: PEM (possibly multiple) or a single DER cert.
-            let chain = read_cert_chain(cert)?;
+            let chain = certs::certs_from_file(cert)?;
 
             if chain.is_empty() {
                 return Err(crate::Error::Io {
@@ -444,39 +455,16 @@ fn load_client_auth(
     }
 }
 
-trait ConfigBuilderExt {
-    fn with_native_roots(self) -> crate::Result<ConfigBuilder<ClientConfig, WantsClientCert>>;
-}
-
-impl ConfigBuilderExt for ConfigBuilder<ClientConfig, WantsVerifier> {
-    fn with_native_roots(self) -> crate::Result<ConfigBuilder<ClientConfig, WantsClientCert>> {
-        // The default trust path relies solely on the OS store, so — unlike the
-        // best-effort CA-augment path — an empty result is fatal (fail closed).
-        let mut roots = RootCertStore::empty();
-        let (added, had_load_errors) = load_native_roots_into(&mut roots);
-        event!(Level::TRACE, "with_native_roots added {added} certs");
-
-        if roots.is_empty() {
-            return Err(crate::Error::Io {
-                kind: IoErrorKind::NotFound,
-                message: if had_load_errors {
-                    "could not load platform certificates".to_string()
-                } else {
-                    "no usable CA certificates found in the platform trust store".to_string()
-                },
-            });
-        }
-
-        Ok(self.with_root_certificates(roots))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::config::{ClientCertSource, ClientCertificate, Config};
     use std::path::PathBuf;
     use tokio_rustls::rustls::CertificateError;
+
+    use crate::client::config::ExtraCa;
+    #[cfg(feature = "rustls-webpki-roots")]
+    use crate::client::config::RootSource;
 
     fn make_config(host: Option<&str>, cert_host: Option<&str>, trust: TrustConfig) -> Config {
         let mut c = Config::new();
@@ -488,6 +476,27 @@ mod tests {
             c.hostname_in_certificate = Some(hc.to_string());
         }
         c
+    }
+
+    /// The validating default trust config (OS store, no extras, no bypass).
+    fn default_trust() -> TrustConfig {
+        TrustConfig::default()
+    }
+
+    /// The trust-everything bypass (`trust_cert`).
+    fn bypass_trust() -> TrustConfig {
+        TrustConfig {
+            bypass: true,
+            ..TrustConfig::default()
+        }
+    }
+
+    /// Native source plus a single extra CA file.
+    fn ca_file_trust(path: &str) -> TrustConfig {
+        TrustConfig {
+            extra_cas: vec![ExtraCa::File(PathBuf::from(path))],
+            ..TrustConfig::default()
+        }
     }
 
     #[test]
@@ -511,86 +520,31 @@ mod tests {
 
     #[test]
     fn server_name_valid_host_is_ok() {
-        let c = make_config(Some("localhost"), None, TrustConfig::Default);
+        let c = make_config(Some("localhost"), None, default_trust());
         assert!(get_server_name(&c).is_ok());
     }
 
     #[test]
-    fn server_name_invalid_host_trust_all_uses_placeholder() {
-        let c = make_config(None, Some("inv al id"), TrustConfig::TrustAll);
-        let got = get_server_name(&c).expect("TrustAll must fall back to the placeholder SNI");
+    fn server_name_invalid_host_bypass_uses_placeholder() {
+        let c = make_config(None, Some("inv al id"), bypass_trust());
+        let got = get_server_name(&c).expect("the bypass must fall back to the placeholder SNI");
         assert!(format!("{got:?}").contains("placeholder.domain.com"));
     }
 
     #[test]
-    fn server_name_invalid_host_non_trustall_errors() {
-        let c = make_config(None, Some("inv al id"), TrustConfig::Default);
+    fn server_name_invalid_host_validating_errors() {
+        let c = make_config(None, Some("inv al id"), default_trust());
         assert!(get_server_name(&c).is_err());
     }
 
     #[test]
-    fn read_cert_chain_reads_single_pem() {
-        let chain = read_cert_chain(Path::new("docker/certs/server.crt")).unwrap();
-        assert_eq!(chain.len(), 1);
-    }
-
-    #[test]
-    fn read_cert_chain_reads_multi_pem_chain() {
-        let chain = read_cert_chain(Path::new("docker/certs/server-full.crt")).unwrap();
-        assert!(
-            chain.len() >= 2,
-            "server-full.crt is a multi-certificate chain"
-        );
-    }
-
-    #[test]
-    fn read_cert_chain_missing_file_preserves_io_error() {
-        let err = read_cert_chain(Path::new("docker/certs/does-not-exist.crt")).unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("Could not read certificate"),
-            "error should name the read failure, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn read_cert_chain_unsupported_extension_errors() {
-        // README.md exists under docker/certs but isn't a supported cert type.
-        assert!(read_cert_chain(Path::new("docker/certs/README.md")).is_err());
-    }
-
-    #[test]
-    fn read_cert_chain_reads_der() {
-        // No .der fixture is checked in, so derive one from the PEM CA and write
-        // it to a temp file to exercise the `der` branch.
-        let der = read_cert_chain(Path::new("docker/certs/customCA.crt"))
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
-            .as_ref()
-            .to_vec();
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "tiberius_read_cert_chain_{}.der",
-            std::process::id()
-        ));
-        std::fs::write(&path, &der).unwrap();
-        let chain = read_cert_chain(&path);
-        std::fs::remove_file(&path).ok();
-        assert_eq!(chain.unwrap().len(), 1);
-    }
-
-    #[test]
-    fn ca_trust_store_augments_system_roots_with_custom_ca() {
-        let certs = read_cert_chain(Path::new("docker/certs/customCA.crt")).unwrap();
-
+    fn build_trust_store_augments_system_roots_with_custom_ca() {
         // Independently measure this machine's native root count using the same
-        // loader `build_ca_trust_store` uses, so the comparison holds on any host.
+        // loader `build_trust_store` uses, so the comparison holds on any host.
         let mut native_only = RootCertStore::empty();
         let (native, _) = load_native_roots_into(&mut native_only);
 
-        let store = build_ca_trust_store(certs, Path::new("docker/certs/customCA.crt")).unwrap();
+        let store = build_trust_store(&ca_file_trust("docker/certs/customCA.crt")).unwrap();
 
         // Custom CA must augment, not replace, the system roots (native + 1).
         assert_eq!(
@@ -601,9 +555,132 @@ mod tests {
     }
 
     #[test]
-    fn build_ca_trust_store_rejects_multi_cert_file() {
-        let certs = read_cert_chain(Path::new("docker/certs/server-full.crt")).unwrap();
-        assert!(build_ca_trust_store(certs, Path::new("docker/certs/server-full.crt")).is_err());
+    fn build_trust_store_accepts_multi_cert_ca_file() {
+        // The pre-0.13 single-certificate restriction is relaxed: every cert in
+        // a multi-cert CA file is trusted (rule 4).
+        let mut native_only = RootCertStore::empty();
+        let (native, _) = load_native_roots_into(&mut native_only);
+
+        let n_certs = certs::certs_from_file(Path::new("docker/certs/server-full.crt"))
+            .unwrap()
+            .len();
+        assert!(n_certs >= 2);
+
+        let store = build_trust_store(&ca_file_trust("docker/certs/server-full.crt")).unwrap();
+        assert_eq!(
+            store.len(),
+            native + n_certs,
+            "all certs in a multi-cert CA file must be added"
+        );
+    }
+
+    #[test]
+    fn build_trust_store_accumulates_multiple_extra_cas() {
+        // Accumulate semantics at the store level: two extra CAs => both added.
+        let mut native_only = RootCertStore::empty();
+        let (native, _) = load_native_roots_into(&mut native_only);
+
+        let trust = TrustConfig {
+            extra_cas: vec![
+                ExtraCa::File(PathBuf::from("docker/certs/customCA.crt")),
+                ExtraCa::Bundle(std::fs::read("docker/certs/customCA.crt").unwrap()),
+            ],
+            ..TrustConfig::default()
+        };
+        let store = build_trust_store(&trust).unwrap();
+        assert_eq!(
+            store.len(),
+            native + 2,
+            "both accumulated extra CAs must be trusted"
+        );
+    }
+
+    #[test]
+    fn build_trust_store_propagates_zero_cert_extra_ca_error() {
+        // Rule 2: an extra CA that yields zero usable certs is fatal, naming it.
+        let mut path = std::env::temp_dir();
+        path.push(format!("tiberius_bts_zero_{}.pem", std::process::id()));
+        std::fs::write(&path, b"# no certificates here\n").unwrap();
+        let trust = TrustConfig {
+            extra_cas: vec![ExtraCa::File(path.clone())],
+            ..TrustConfig::default()
+        };
+        let err = build_trust_store(&trust);
+        std::fs::remove_file(&path).ok();
+        let msg = format!("{:?}", err.unwrap_err());
+        assert!(
+            msg.contains("contained no usable certificates"),
+            "error should name the empty source, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_trust_store_names_source_on_invalid_der_cert() {
+        // A DER extra-CA whose bytes are not a valid certificate must fail with a
+        // message naming the offending source, not an anonymous backend error.
+        let trust = TrustConfig {
+            extra_cas: vec![ExtraCa::Bundle(vec![0x30, 0x03, 0x02, 0x01, 0x7f])],
+            ..TrustConfig::default()
+        };
+        let msg = format!("{:?}", build_trust_store(&trust).unwrap_err());
+        assert!(
+            msg.contains("in-memory CA bundle") && msg.contains("invalid certificate"),
+            "invalid DER must name the source, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ensure_base_or_extra_enforces_fail_closed_rule7() {
+        // Rule 7, tested directly (an empty OS store can't be simulated in-process):
+        // no base + no extras => fail closed, with the message distinguishing a
+        // load error from a genuinely empty store.
+        let empty_store = ensure_base_or_extra(0, false, false).unwrap_err();
+        assert!(
+            format!("{empty_store:?}").contains("no usable CA certificates found"),
+            "empty store must fail closed, got: {empty_store:?}"
+        );
+        let load_err = ensure_base_or_extra(0, true, false).unwrap_err();
+        assert!(
+            format!("{load_err:?}").contains("could not load platform certificates"),
+            "load failure must be reported distinctly, got: {load_err:?}"
+        );
+        // Extras present => tolerate an empty/best-effort base (additive contract).
+        assert!(ensure_base_or_extra(0, true, true).is_ok());
+        assert!(ensure_base_or_extra(0, false, true).is_ok());
+        // A non-empty base is always fine.
+        assert!(ensure_base_or_extra(5, false, false).is_ok());
+    }
+
+    #[cfg(feature = "rustls-webpki-roots")]
+    #[test]
+    fn build_trust_store_uses_bundled_webpki_roots() {
+        // The webpki source seeds a non-empty store from the compiled-in Mozilla
+        // snapshot, independent of the OS trust store.
+        let trust = TrustConfig {
+            source: RootSource::WebpkiRoots,
+            ..TrustConfig::default()
+        };
+        let store = build_trust_store(&trust).unwrap();
+        assert_eq!(
+            store.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "the store must be seeded from the bundled Mozilla roots"
+        );
+        assert!(!store.is_empty());
+    }
+
+    #[cfg(feature = "rustls-webpki-roots")]
+    #[test]
+    fn build_trust_store_webpki_roots_plus_extra_ca() {
+        // Extras still layer on top of the webpki source.
+        let base = webpki_roots::TLS_SERVER_ROOTS.len();
+        let trust = TrustConfig {
+            source: RootSource::WebpkiRoots,
+            extra_cas: vec![ExtraCa::File(PathBuf::from("docker/certs/customCA.crt"))],
+            ..TrustConfig::default()
+        };
+        let store = build_trust_store(&trust).unwrap();
+        assert_eq!(store.len(), base + 1);
     }
 
     #[test]
@@ -696,39 +773,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_cert_chain_zero_cert_pem_is_empty() {
-        // A PEM file with no certificate blocks parses to zero certificates.
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "tiberius_read_cert_chain_zero_{}.pem",
-            std::process::id()
-        ));
-        std::fs::write(&path, b"# no certificates here\n").unwrap();
-        let chain = read_cert_chain(&path);
-        std::fs::remove_file(&path).ok();
-        assert_eq!(chain.unwrap().len(), 0);
-    }
-
-    #[test]
-    fn build_ca_trust_store_rejects_zero_cert_file() {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "tiberius_build_ca_trust_store_zero_{}.pem",
-            std::process::id()
-        ));
-        std::fs::write(&path, b"# no certificates here\n").unwrap();
-        let certs = read_cert_chain(&path).unwrap();
-        assert_eq!(certs.len(), 0);
-        let err = build_ca_trust_store(certs, &path);
-        std::fs::remove_file(&path).ok();
-        let msg = format!("{:?}", err.unwrap_err());
-        assert!(
-            msg.contains("found 0"),
-            "error should mention the zero-cert count, got: {msg}"
-        );
-    }
-
     fn cert_io_error(cert_err: CertificateError) -> io::Error {
         // Mirror how tokio-rustls wraps a rustls handshake failure: the
         // `RustlsError` is carried as the inner error of an `io::Error`.
@@ -767,7 +811,7 @@ mod tests {
     fn map_handshake_error_annotates_unsupported_cert_version() {
         let err = map_handshake_error(
             cert_io_error(unsupported_cert_version_error()),
-            &TrustConfig::Default,
+            &default_trust(),
         );
         let msg = format!("{err}");
         // Must be a TLS error (not the opaque Io variant) and name each remedy.
@@ -802,7 +846,7 @@ mod tests {
     fn map_handshake_error_annotates_other_cert_errors_without_version_hint() {
         let err = map_handshake_error(
             cert_io_error(CertificateError::NotValidForName),
-            &TrustConfig::Default,
+            &default_trust(),
         );
         let msg = format!("{err}");
         assert!(
@@ -824,7 +868,7 @@ mod tests {
     fn map_handshake_error_passes_through_non_cert_io_errors() {
         let err = map_handshake_error(
             io::Error::new(io::ErrorKind::UnexpectedEof, "connection reset"),
-            &TrustConfig::Default,
+            &default_trust(),
         );
         // Non-certificate transport failures keep the generic Io mapping.
         match err {
@@ -844,7 +888,7 @@ mod tests {
         let inner = RustlsError::General("handshake alert".to_string());
         let err = map_handshake_error(
             io::Error::new(io::ErrorKind::InvalidData, inner),
-            &TrustConfig::Default,
+            &default_trust(),
         );
         assert!(
             matches!(err, Error::Io { .. }),
@@ -860,7 +904,7 @@ mod tests {
         // certificate the default verifier rejects in
         // `default_verifier_rejects_untrusted_certificate` below, so the pair
         // proves the bypass is opt-in rather than the default.
-        let leaf = read_cert_chain(Path::new("docker/certs/server.crt")).unwrap();
+        let leaf = certs::certs_from_file(Path::new("docker/certs/server.crt")).unwrap();
         let leaf = leaf.into_iter().next().unwrap();
         let verifier = NoCertVerifier;
         let name = ServerName::try_from("legacy.sql.example.com").unwrap();
@@ -886,7 +930,7 @@ mod tests {
         // so the leaf's real issuer is untrusted and path building must fail — this
         // exercises chain-of-trust enforcement, which a malformed blob would never
         // reach (it would be rejected at DER parsing instead).
-        let leaf = read_cert_chain(Path::new("docker/certs/server.crt")).unwrap();
+        let leaf = certs::certs_from_file(Path::new("docker/certs/server.crt")).unwrap();
         let leaf = leaf.into_iter().next().unwrap();
 
         let mut roots = RootCertStore::empty();
@@ -928,7 +972,7 @@ mod tests {
         // error must pass through unchanged rather than gaining misleading advice.
         let err = map_handshake_error(
             cert_io_error(unsupported_cert_version_error()),
-            &TrustConfig::TrustAll,
+            &bypass_trust(),
         );
         assert!(
             matches!(err, Error::Io { .. }),
@@ -943,7 +987,7 @@ mod tests {
         // wholesale, regardless of the error's shape).
         let err = map_handshake_error(
             io::Error::new(io::ErrorKind::ConnectionReset, "reset by peer"),
-            &TrustConfig::TrustAll,
+            &bypass_trust(),
         );
         match err {
             Error::Io { kind, message } => {

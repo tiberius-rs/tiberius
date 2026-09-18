@@ -70,12 +70,111 @@ pub struct Config {
     pub(crate) client_cert: Option<ClientCertificate>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum TrustConfig {
-    #[allow(dead_code)]
-    CaCertificateLocation(PathBuf),
-    TrustAll,
-    Default,
+/// How the server certificate is trusted.
+///
+/// Two orthogonal axes plus a bypass:
+///
+/// - [`source`](TrustConfig::source): the base set of trust anchors (mutually
+///   exclusive — the OS store or a bundled Mozilla snapshot).
+/// - [`extra_cas`](TrustConfig::extra_cas): additional CA certificates layered
+///   *on top of* the source. This **accumulates**: every `trust_cert_ca` /
+///   `trust_cert_ca_bundle` call appends one entry (composable), rather than the
+///   pre-0.13 replace-last-wins behaviour.
+/// - [`bypass`](TrustConfig::bypass): skip certificate validation entirely
+///   (`trust_cert`). Mutually exclusive with configuring a `source` or
+///   `extra_cas` — mixing them panics (or, from a connection string, errors)
+///   rather than letting the bypass silently win.
+///
+/// `bypass` is deliberately a distinct axis (not folded into `source`) so a
+/// future, narrower "relax hostname verification only" mode can be
+/// added later without a public-API rewrite.
+#[derive(Clone)]
+pub(crate) struct TrustConfig {
+    /// Base trust anchors. Mutually exclusive; defaults to [`RootSource::Native`].
+    pub(crate) source: RootSource,
+    /// Extra CA certificates added on top of `source`. Accumulates in call order.
+    pub(crate) extra_cas: Vec<ExtraCa>,
+    /// If set, certificate validation (and hostname verification) is skipped
+    /// entirely. See [`Config::trust_cert`].
+    pub(crate) bypass: bool,
+}
+
+impl Default for TrustConfig {
+    fn default() -> Self {
+        Self {
+            source: RootSource::Native,
+            extra_cas: Vec::new(),
+            bypass: false,
+        }
+    }
+}
+
+impl TrustConfig {
+    /// True when nothing has been customised: the OS trust store, no extra CAs,
+    /// no bypass. Used by tests to assert the default trust posture.
+    #[cfg(test)]
+    pub(crate) fn is_default(&self) -> bool {
+        matches!(self.source, RootSource::Native) && self.extra_cas.is_empty() && !self.bypass
+    }
+}
+
+// Manual `Debug` following the crate's curated-Debug convention: never dump raw
+// certificate bytes. `ExtraCa::Bundle` is summarised as `Bundle { len: N }`.
+impl std::fmt::Debug for TrustConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrustConfig")
+            .field("source", &self.source)
+            .field("extra_cas", &self.extra_cas)
+            .field("bypass", &self.bypass)
+            .finish()
+    }
+}
+
+/// The base set of trust anchors used to validate the server certificate.
+/// Mutually exclusive.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RootSource {
+    /// The operating system's trust store (the default).
+    #[default]
+    Native,
+    /// A compiled-in snapshot of Mozilla's root CA store (`webpki-roots`).
+    ///
+    /// rustls-only, and gated on the `rustls-webpki-roots` feature so the
+    /// variant cannot exist without the crate that consumes it. Selected via
+    /// [`Config::trust_webpki_roots`].
+    #[cfg(feature = "rustls-webpki-roots")]
+    WebpkiRoots,
+}
+
+/// An additional CA certificate source layered on top of [`RootSource`].
+#[derive(Clone)]
+#[cfg_attr(
+    not(any(
+        feature = "rustls",
+        feature = "native-tls",
+        feature = "vendored-openssl"
+    )),
+    allow(dead_code)
+)]
+pub(crate) enum ExtraCa {
+    /// A certificate file on disk (PEM `.pem`/`.crt`, or DER `.der`). May hold
+    /// multiple certificates when PEM.
+    File(PathBuf),
+    /// In-memory certificate bytes. Multi-certificate: sniffed as PEM (all
+    /// blocks parsed) when the bytes contain a `-----BEGIN` marker at the start
+    /// of a line, otherwise treated as a single DER certificate.
+    Bundle(Vec<u8>),
+}
+
+// Manual `Debug`: summarise `Bundle` as `Bundle { len: N }` so raw certificate
+// bytes are never dumped.
+impl std::fmt::Debug for ExtraCa {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtraCa::File(path) => f.debug_tuple("File").field(path).finish(),
+            ExtraCa::Bundle(bytes) => f.debug_struct("Bundle").field("len", &bytes.len()).finish(),
+        }
+    }
 }
 
 /// A client certificate and its private key, presented to the server during the
@@ -146,7 +245,7 @@ impl Default for Config {
                 feature = "vendored-openssl"
             )))]
             encryption: EncryptionLevel::NotSupported,
-            trust: TrustConfig::Default,
+            trust: TrustConfig::default(),
             auth: AuthMethod::None,
             readonly: false,
             packet_size: None,
@@ -279,34 +378,120 @@ impl Config {
     /// `Encrypt=false`, so certificate errors can surface regardless of the
     /// encryption level.
     ///
+    /// # Security
+    ///
+    /// This accepts **any** certificate: it disables both certificate-chain
+    /// validation *and* hostname verification, so it provides no protection
+    /// against a man-in-the-middle. Only use it on a network you already trust.
+    /// Prefer [`trust_cert_ca`] / [`trust_cert_ca_bundle`] to pin the server's
+    /// CA instead.
+    ///
     /// [`trust_cert_ca`]: Self::trust_cert_ca
+    /// [`trust_cert_ca_bundle`]: Self::trust_cert_ca_bundle
     ///
     /// # Panics
-    /// Will panic in case `trust_cert_ca` was called before.
+    /// Will panic if any of [`trust_cert_ca`], [`trust_cert_ca_bundle`] or
+    /// [`trust_webpki_roots`] was called before — the trust bypass is mutually
+    /// exclusive with configuring trust anchors.
+    ///
+    /// [`trust_webpki_roots`]: Self::trust_webpki_roots
     ///
     /// - Defaults to `default`, meaning server certificate is validated against system-truststore.
     pub fn trust_cert(&mut self) {
-        if let TrustConfig::CaCertificateLocation(_) = &self.trust {
-            panic!("'trust_cert' and 'trust_cert_ca' are mutual exclusive! Only use one.")
+        if !self.trust.extra_cas.is_empty() || !matches!(self.trust.source, RootSource::Native) {
+            panic!(
+                "'trust_cert' and 'trust_cert_ca'/'trust_cert_ca_bundle'/'trust_webpki_roots' \
+                 are mutual exclusive! Only use one."
+            )
         }
-        self.trust = TrustConfig::TrustAll;
+        self.trust.bypass = true;
     }
 
-    /// If set, the server certificate will be validated against the given CA certificate in
-    /// in addition to the system-truststore.
+    /// Trust an additional CA certificate (from a file) *in addition to* the
+    /// base trust anchors (the system trust store by default).
     /// Useful when using self-signed certificates on the server without having to disable the
     /// trust-chain.
     ///
+    /// The file may be PEM (`.pem`/`.crt`) or DER (`.der`); a PEM file may
+    /// contain **multiple** certificates and all of them are trusted.
+    ///
+    /// This **accumulates**: calling it more than once (or alongside
+    /// [`trust_cert_ca_bundle`]) trusts every supplied CA. This is a behaviour
+    /// change from pre-0.13, where a second call replaced the first.
+    ///
     /// # Panics
-    /// Will panic in case `trust_cert` was called before.
+    /// Will panic in case [`trust_cert`] was called before.
+    ///
+    /// [`trust_cert`]: Self::trust_cert
+    /// [`trust_cert_ca_bundle`]: Self::trust_cert_ca_bundle
     ///
     /// - Defaults to validating the server certificate is validated against system's certificate storage.
     pub fn trust_cert_ca(&mut self, path: impl ToString) {
-        if let TrustConfig::TrustAll = &self.trust {
+        if self.trust.bypass {
             panic!("'trust_cert' and 'trust_cert_ca' are mutual exclusive! Only use one.")
-        } else {
-            self.trust = TrustConfig::CaCertificateLocation(PathBuf::from(path.to_string()))
         }
+        self.trust
+            .extra_cas
+            .push(ExtraCa::File(PathBuf::from(path.to_string())));
+    }
+
+    /// Trust additional CA certificates supplied as in-memory bytes, *in
+    /// addition to* the base trust anchors. This avoids having to write an
+    /// in-memory certificate out to a temporary file, and — unlike the pre-0.13
+    /// single-certificate `trust_cert_ca` — accepts a whole **bundle** of CA
+    /// certificates (for example the AWS RDS root bundle).
+    ///
+    /// The byte format is auto-detected: if the bytes contain a `-----BEGIN`
+    /// marker at the start of a line they are parsed as PEM (every certificate
+    /// block is trusted), otherwise they are treated as a single DER
+    /// certificate. A leading UTF-8 byte-order mark is tolerated.
+    ///
+    /// Like [`trust_cert_ca`], this **accumulates**: each call appends to the
+    /// set of trusted CAs.
+    ///
+    /// # Panics
+    /// Will panic in case [`trust_cert`] was called before.
+    ///
+    /// [`trust_cert`]: Self::trust_cert
+    /// [`trust_cert_ca`]: Self::trust_cert_ca
+    pub fn trust_cert_ca_bundle(&mut self, bundle: impl Into<Vec<u8>>) {
+        if self.trust.bypass {
+            panic!("'trust_cert' and 'trust_cert_ca_bundle' are mutual exclusive! Only use one.")
+        }
+        self.trust.extra_cas.push(ExtraCa::Bundle(bundle.into()));
+    }
+
+    /// Use a compiled-in snapshot of Mozilla's root CA store (via the
+    /// `webpki-roots` crate) as the base trust anchors instead of the operating
+    /// system's trust store. Any CAs added with [`trust_cert_ca`] /
+    /// [`trust_cert_ca_bundle`] are still layered on top.
+    ///
+    /// This is useful on platforms with no usable OS trust store. It is only
+    /// available with the `rustls` backend (via the `rustls-webpki-roots`
+    /// feature); with any other backend the method does not exist, so misuse is
+    /// a compile error.
+    ///
+    /// # Security
+    ///
+    /// The bundled roots are a **pinned snapshot** taken when this crate's
+    /// `webpki-roots` dependency was last updated. Unlike the OS trust store
+    /// they do not receive security updates on their own — they go stale (newly
+    /// distrusted or newly added CAs are missed) unless the dependency is
+    /// updated and the application rebuilt.
+    ///
+    /// # Panics
+    /// Will panic in case [`trust_cert`] was called before.
+    ///
+    /// [`trust_cert`]: Self::trust_cert
+    /// [`trust_cert_ca`]: Self::trust_cert_ca
+    /// [`trust_cert_ca_bundle`]: Self::trust_cert_ca_bundle
+    #[cfg(feature = "rustls-webpki-roots")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-webpki-roots")))]
+    pub fn trust_webpki_roots(&mut self) {
+        if self.trust.bypass {
+            panic!("'trust_cert' and 'trust_webpki_roots' are mutual exclusive! Only use one.")
+        }
+        self.trust.source = RootSource::WebpkiRoots;
     }
 
     /// Sets the hostname that the server certificate is validated against,
@@ -889,17 +1074,42 @@ impl ConfigBuilder {
         self
     }
 
-    /// If set, the server certificate will be validated against the given CA certificate in
-    /// in addition to the system-truststore.
-    /// Useful when using self-signed certificates on the server without having to disable the
-    /// trust-chain.
+    /// Trust an additional CA certificate (from a file), in addition to the base
+    /// trust anchors. Accumulates across calls.
+    ///
+    /// See [`Config::trust_cert_ca`] for details.
     ///
     /// # Panics
     /// Will panic in case `trust_cert` was called before.
-    ///
-    /// - Defaults to validating the server certificate is validated against system's certificate storage.
     pub fn trust_cert_ca(mut self, path: impl ToString) -> Self {
         self.inner.trust_cert_ca(path);
+        self
+    }
+
+    /// Trust additional CA certificates supplied as in-memory bytes (a
+    /// PEM/DER bundle), in addition to the base trust anchors. Accumulates
+    /// across calls.
+    ///
+    /// See [`Config::trust_cert_ca_bundle`] for details.
+    ///
+    /// # Panics
+    /// Will panic in case `trust_cert` was called before.
+    pub fn trust_cert_ca_bundle(mut self, bundle: impl Into<Vec<u8>>) -> Self {
+        self.inner.trust_cert_ca_bundle(bundle);
+        self
+    }
+
+    /// Use the compiled-in Mozilla root CA snapshot as the base trust anchors
+    /// (rustls only).
+    ///
+    /// See [`Config::trust_webpki_roots`] for details and the staleness caveat.
+    ///
+    /// # Panics
+    /// Will panic in case `trust_cert` was called before.
+    #[cfg(feature = "rustls-webpki-roots")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-webpki-roots")))]
+    pub fn trust_webpki_roots(mut self) -> Self {
+        self.inner.trust_webpki_roots();
         self
     }
 
@@ -1275,7 +1485,7 @@ mod tests {
         assert_eq!(Some("my-app"), config.application_name.as_deref());
         assert!(config.readonly);
         assert!(matches!(config.auth, AuthMethod::SqlServer(_)));
-        assert!(matches!(config.trust, TrustConfig::Default));
+        assert!(config.trust.is_default());
     }
 
     #[test]
@@ -1598,19 +1808,111 @@ mod tests {
         let mut config = Config::new();
         config.trust_cert_ca("/tmp/ca.crt");
         assert!(matches!(
-            config.trust,
-            TrustConfig::CaCertificateLocation(_)
+            config.trust.extra_cas.as_slice(),
+            [ExtraCa::File(_)]
         ));
+        assert!(!config.trust.bypass);
+        assert!(matches!(config.trust.source, RootSource::Native));
     }
 
     #[test]
-    fn trust_cert_sets_trust_all() {
+    fn trust_cert_ca_accumulates_across_calls() {
+        // Behaviour change from pre-0.13 replace-last-wins: repeated calls must
+        // trust BOTH CAs (composable), across file + bundle sources.
+        let mut config = Config::new();
+        config.trust_cert_ca("/tmp/a.crt");
+        config.trust_cert_ca("/tmp/b.crt");
+        config.trust_cert_ca_bundle(b"----- not really a cert -----".to_vec());
+
+        assert_eq!(config.trust.extra_cas.len(), 3);
+        match &config.trust.extra_cas[0] {
+            ExtraCa::File(p) => assert_eq!(p, &PathBuf::from("/tmp/a.crt")),
+            other => panic!("expected File, got {other:?}"),
+        }
+        match &config.trust.extra_cas[1] {
+            ExtraCa::File(p) => assert_eq!(p, &PathBuf::from("/tmp/b.crt")),
+            other => panic!("expected File, got {other:?}"),
+        }
+        assert!(matches!(config.trust.extra_cas[2], ExtraCa::Bundle(_)));
+    }
+
+    #[test]
+    fn trust_cert_ca_bundle_pushes_bundle() {
+        let mut config = Config::new();
+        config.trust_cert_ca_bundle(vec![1u8, 2, 3]);
+        match config.trust.extra_cas.as_slice() {
+            [ExtraCa::Bundle(bytes)] => assert_eq!(bytes, &[1, 2, 3]),
+            other => panic!("expected a single Bundle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trust_config_debug_redacts_bundle_bytes() {
+        // Rule 6: the bundle's raw bytes must never appear in Debug; only a
+        // length summary.
+        let mut config = Config::new();
+        config.trust_cert_ca_bundle(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let dbg = format!("{:?}", config.trust);
+        assert!(dbg.contains("Bundle { len: 4 }"), "got: {dbg}");
+        assert!(
+            !dbg.contains("222") && !dbg.contains("0xde"),
+            "bytes leaked: {dbg}"
+        );
+    }
+
+    #[cfg(feature = "rustls-webpki-roots")]
+    #[test]
+    fn trust_webpki_roots_sets_source_and_is_mutually_exclusive_with_extras() {
+        let mut config = Config::new();
+        config.trust_webpki_roots();
+        assert!(matches!(config.trust.source, RootSource::WebpkiRoots));
+        // Extra CAs still layer on top of the webpki source.
+        config.trust_cert_ca("/tmp/extra.crt");
+        assert_eq!(config.trust.extra_cas.len(), 1);
+    }
+
+    #[cfg(feature = "rustls-webpki-roots")]
+    #[test]
+    #[should_panic(expected = "mutual exclusive")]
+    fn trust_cert_after_trust_webpki_roots_panics() {
+        let mut config = Config::new();
+        config.trust_webpki_roots();
+        config.trust_cert();
+    }
+
+    #[cfg(feature = "rustls-webpki-roots")]
+    #[test]
+    #[should_panic(expected = "mutual exclusive")]
+    fn trust_webpki_roots_after_trust_cert_panics() {
+        let mut config = Config::new();
+        config.trust_cert();
+        config.trust_webpki_roots();
+    }
+
+    #[test]
+    #[should_panic(expected = "mutual exclusive")]
+    fn trust_cert_after_trust_cert_ca_bundle_panics() {
+        let mut config = Config::new();
+        config.trust_cert_ca_bundle(vec![1, 2, 3]);
+        config.trust_cert();
+    }
+
+    #[test]
+    #[should_panic(expected = "mutual exclusive")]
+    fn trust_cert_ca_bundle_after_trust_cert_panics() {
+        let mut config = Config::new();
+        config.trust_cert();
+        config.trust_cert_ca_bundle(vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn trust_cert_sets_bypass() {
         // The default must be a validating config; `trust_cert()` is the explicit
         // opt-in that switches to bypass validation.
         let mut config = Config::new();
-        assert!(matches!(config.trust, TrustConfig::Default));
+        assert!(config.trust.is_default());
         config.trust_cert();
-        assert!(matches!(config.trust, TrustConfig::TrustAll));
+        assert!(config.trust.bypass);
     }
 
     #[test]
@@ -1625,15 +1927,31 @@ mod tests {
         assert_eq!(Some("SQLEXPRESS"), config.instance_name.as_deref());
         assert!(matches!(config.encryption, EncryptionLevel::Off));
         assert!(matches!(
-            config.trust,
-            TrustConfig::CaCertificateLocation(_)
+            config.trust.extra_cas.as_slice(),
+            [ExtraCa::File(_)]
         ));
     }
 
     #[test]
-    fn config_builder_trust_cert_sets_trust_all() {
+    fn config_builder_trust_cert_sets_bypass() {
         let config = Config::builder().trust_cert().build();
-        assert!(matches!(config.trust, TrustConfig::TrustAll));
+        assert!(config.trust.bypass);
+    }
+
+    #[test]
+    fn config_builder_trust_cert_ca_bundle_accumulates() {
+        let config = Config::builder()
+            .trust_cert_ca("/tmp/a.crt")
+            .trust_cert_ca_bundle(vec![1, 2, 3])
+            .build();
+        assert_eq!(config.trust.extra_cas.len(), 2);
+    }
+
+    #[cfg(feature = "rustls-webpki-roots")]
+    #[test]
+    fn config_builder_trust_webpki_roots_sets_source() {
+        let config = Config::builder().trust_webpki_roots().build();
+        assert!(matches!(config.trust.source, RootSource::WebpkiRoots));
     }
 
     #[test]
@@ -1661,6 +1979,44 @@ mod tests {
         assert_eq!(Some("northwind"), config.database.as_deref());
         assert_eq!(Some("cert.host"), config.hostname_in_certificate.as_deref());
         assert_eq!(Some("ws-1"), config.client_name.as_deref());
+    }
+
+    #[test]
+    fn from_ado_string_trust_cert_ca_populates_extra_cas() {
+        let config = Config::from_ado_string(
+            "server=tcp:localhost,1433;TrustServerCertificateCA=/tmp/ca.crt",
+        )
+        .expect("valid ado string");
+        match config.trust.extra_cas.as_slice() {
+            [ExtraCa::File(p)] => assert_eq!(p, &PathBuf::from("/tmp/ca.crt")),
+            other => panic!("expected a single File CA, got {other:?}"),
+        }
+        assert!(!config.trust.bypass);
+    }
+
+    #[test]
+    fn from_ado_string_trust_cert_populates_bypass() {
+        let config =
+            Config::from_ado_string("server=tcp:localhost,1433;TrustServerCertificate=true")
+                .expect("valid ado string");
+        assert!(config.trust.bypass);
+    }
+
+    #[test]
+    fn from_ado_string_trust_cert_and_ca_conflict_errors() {
+        // Rule 1: the conflict must surface as a hard error, never silently let
+        // the bypass win. From a connection string it is an `Err`, not a panic.
+        let err = Config::from_ado_string(
+            "server=tcp:localhost,1433;TrustServerCertificate=true;\
+             TrustServerCertificateCA=/tmp/ca.crt",
+        )
+        .expect_err("conflicting trust settings must error");
+        match err {
+            crate::Error::Conversion(msg) => {
+                assert!(msg.contains("mutually exclusive"), "got: {msg}")
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
     }
 
     #[cfg(any(

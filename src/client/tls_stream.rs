@@ -12,6 +12,14 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 #[allow(dead_code)]
 pub(crate) const TDS_ALPN_PROTOCOL_NAME: &str = "tds/8.0";
 
+// Backend-agnostic CA loader shared by all three TLS backends.
+#[cfg(any(
+    feature = "rustls",
+    feature = "native-tls",
+    feature = "vendored-openssl"
+))]
+mod certs;
+
 #[cfg(feature = "native-tls")]
 mod native_tls_stream;
 
