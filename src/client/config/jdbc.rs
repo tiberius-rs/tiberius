@@ -11,7 +11,14 @@ impl FromStr for JdbcConfig {
     type Err = Error;
 
     fn from_str(s: &str) -> crate::Result<Self> {
-        let config = s.parse()?;
+        let config = s.parse().map_err(|e| {
+            super::connection_string_error(
+                e,
+                "wrap the value in braces (e.g. `password={p@ss;word}`); single \
+                 and double quotes are ordinary characters in JDBC, not escapes",
+                "Config::from_jdbc_string",
+            )
+        })?;
         Ok(Self { config })
     }
 }
@@ -257,6 +264,141 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn parsing_password_special_characters() -> crate::Result<()> {
+        // (value as written after `Password=`, exact parsed password). Unlike
+        // ADO.NET, the JDBC parser only supports brace (`{...}`) quoting — not
+        // single or double quotes — so `'` and `"` are ordinary characters.
+        let cases: &[(&str, &str)] = &[
+            // Braces are required for structural characters.
+            ("{a;b}", "a;b"),
+            ("{a=b}", "a=b"),
+            ("{a:b}", "a:b"),
+            ("{a b}", "a b"),
+            ("{a$b}", "a$b"),
+            ("{a'b}", "a'b"),
+            ("{a\"b}", "a\"b"),
+            // `\`, `/`, `[` and `]` are structural in JDBC values and need
+            // braces (they would otherwise terminate the value).
+            ("{a\\b}", "a\\b"),
+            ("{a/b}", "a/b"),
+            ("{a[b]}", "a[b]"),
+            // Non-structural characters pass through unquoted, including `}`,
+            // `'` and `"` (which are not special to the JDBC parser).
+            ("a$b", "a$b"),
+            ("a@b", "a@b"),
+            ("a!b", "a!b"),
+            ("a#b", "a#b"),
+            ("a%b", "a%b"),
+            ("a&b", "a&b"),
+            ("a,b", "a,b"),
+            ("a'b", "a'b"),
+            ("a\"b", "a\"b"),
+            ("a}b", "a}b"),
+            ("a b", "a b"),
+            // Percent-encoding is NOT decoded: `%24` stays literal.
+            ("a%24b", "a%24b"),
+        ];
+
+        for (value, expected) in cases {
+            let s = format!("jdbc:sqlserver://host.com:1433;User ID=sa;Password={value}");
+            let jdbc: JdbcConfig = s.parse()?;
+            assert_eq!(
+                AuthMethod::sql_server("sa", *expected),
+                jdbc.authentication()?,
+                "value `{value}` should parse to password `{expected}`"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_password_preserves_surrounding_whitespace() -> crate::Result<()> {
+        // Unlike the ADO parser, JDBC does not trim; braced whitespace is kept.
+        let jdbc: JdbcConfig =
+            "jdbc:sqlserver://host.com:1433;User ID=sa;Password={ a }".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", " a "), jdbc.authentication()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_password_brace_cannot_hold_close_brace() -> crate::Result<()> {
+        // Like ADO.NET, JDBC brace quoting has no `}}` doubling: the brace
+        // closes at the first `}`, so the inner `}` is consumed as the
+        // terminator. Since JDBC has no quote escaping, a value needing braces
+        // that also contains `}` cannot be represented — document the limit.
+        let jdbc: JdbcConfig =
+            "jdbc:sqlserver://host.com:1433;User ID=sa;Password={a}b}".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", "ab}"), jdbc.authentication()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_password_non_ascii_is_rejected() {
+        // The JDBC parser only accepts ASCII, in every position; non-ASCII
+        // passwords must use the programmatic `Config` API instead.
+        assert!("jdbc:sqlserver://host.com:1433;User ID=sa;Password=café"
+            .parse::<JdbcConfig>()
+            .is_err());
+        // Braces are JDBC's only quoting mechanism; non-ASCII is rejected there
+        // too (mirrors the ADO quoted-value test).
+        assert!("jdbc:sqlserver://host.com:1433;User ID=sa;Password={café}"
+            .parse::<JdbcConfig>()
+            .is_err());
+    }
+
+    #[test]
+    fn empty_password_is_rejected() {
+        // Unlike the ADO parser (which accepts an empty value), the JDBC parser
+        // requires a non-empty property value, so `Password=` fails to parse.
+        assert!("jdbc:sqlserver://host.com:1433;User ID=sa;Password="
+            .parse::<JdbcConfig>()
+            .is_err());
+    }
+
+    #[test]
+    fn unquoted_special_char_password_error_has_hint() {
+        // An unquoted `;` in a password breaks parsing. The error must guide
+        // the user toward brace quoting (JDBC's only escape) or the programmatic
+        // API, while preserving the underlying parser message.
+        let err = "jdbc:sqlserver://host.com:1433;User ID=sa;Password=a;b"
+            .parse::<JdbcConfig>()
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        // Underlying terse parser message is preserved (not replaced).
+        assert!(msg.contains("must be joined"), "message was: {msg}");
+        // JDBC guidance must steer toward braces and its own constructor docs.
+        assert!(msg.contains("braces"), "message was: {msg}");
+        assert!(
+            msg.contains("Config::from_jdbc_string"),
+            "message was: {msg}"
+        );
+        // The `Conversion error:` prefix must not be doubled.
+        assert!(
+            !msg.contains("Conversion error: Conversion error:"),
+            "message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn unclosed_brace_error_has_hint() {
+        // An unclosed brace is a quoting mistake; the hint should attach.
+        let err = "jdbc:sqlserver://host.com:1433;User ID=sa;Password={abc"
+            .parse::<JdbcConfig>()
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("must be quoted"), "message was: {msg}");
+        assert!(
+            !msg.contains("Conversion error: Conversion error:"),
+            "message was: {msg}"
+        );
     }
 
     #[test]

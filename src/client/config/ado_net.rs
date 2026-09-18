@@ -9,7 +9,15 @@ impl FromStr for AdoNetConfig {
     type Err = crate::error::Error;
 
     fn from_str(s: &str) -> crate::Result<Self> {
-        let dict = s.parse()?;
+        let dict = s.parse().map_err(|e| {
+            super::connection_string_error(
+                e,
+                "wrap the value in single quotes (e.g. `password='p@ss;word'`), \
+                 double quotes, or braces (e.g. `password={p@ss;word}`), and \
+                 quote leading spaces too",
+                "Config::from_ado_string",
+            )
+        })?;
         Ok(Self { dict })
     }
 }
@@ -441,6 +449,150 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn parsing_password_special_characters() -> crate::Result<()> {
+        // (value as written in the connection string, exact parsed password).
+        // The user and password must both round-trip exactly.
+        let cases: &[(&str, &str)] = &[
+            // Single quotes: the most general escape; any ASCII char except a
+            // literal single quote can appear verbatim.
+            ("'a;b'", "a;b"),
+            ("'a=b'", "a=b"),
+            ("'a{b'", "a{b"),
+            ("'a}b'", "a}b"),
+            ("'a b'", "a b"),
+            ("'a$b'", "a$b"),
+            ("'a@b'", "a@b"),
+            ("'a!b'", "a!b"),
+            ("'a#b'", "a#b"),
+            ("'a%b'", "a%b"),
+            ("'a&b'", "a&b"),
+            ("'a,b'", "a,b"),
+            ("'a\"b'", "a\"b"), // a double quote inside single quotes
+            ("'p@ss;w{}rd=42'", "p@ss;w{}rd=42"),
+            // Double quotes: same idea, and lets a single quote appear.
+            ("\"a'b\"", "a'b"),
+            ("\"a;b=c\"", "a;b=c"),
+            // Braces (`{...}`): handy for `;` and `=`, but cannot hold a `}`.
+            ("{a;b}", "a;b"),
+            ("{a=b}", "a=b"),
+            ("{a$b}", "a$b"),
+            // Unquoted: non-structural characters pass through untouched.
+            ("a$b", "a$b"),
+            ("a@b", "a@b"),
+            ("a!b", "a!b"),
+            ("a#b", "a#b"),
+            ("a%b", "a%b"),
+            ("a&b", "a&b"),
+            ("a,b", "a,b"),
+            // A bare `}` is not structural: it passes through unquoted.
+            ("a}b", "a}b"),
+            // Percent-encoding is NOT decoded: `%24` stays literal, it does
+            // not become `$`.
+            ("a%24b", "a%24b"),
+            // An empty password is accepted by the ADO parser.
+            ("", ""),
+        ];
+
+        for (value, expected) in cases {
+            let s = format!("User Id=sa;Password={value};");
+            let ado: AdoNetConfig = s.parse()?;
+            assert_eq!(
+                AuthMethod::sql_server("sa", *expected),
+                ado.authentication()?,
+                "value `{value}` should parse to password `{expected}`"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_password_whitespace_quirks() -> crate::Result<()> {
+        // Trailing whitespace is always trimmed, even inside quotes.
+        let ado: AdoNetConfig = "User Id=sa;Password='a '".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", "a"), ado.authentication()?);
+
+        // Leading whitespace is preserved when the value is quoted.
+        let ado: AdoNetConfig = "User Id=sa;Password=' a'".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", " a"), ado.authentication()?);
+
+        // Internal tabs survive.
+        let ado: AdoNetConfig = "User Id=sa;Password='a\tb'".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", "a\tb"), ado.authentication()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_password_brace_cannot_hold_close_brace() -> crate::Result<()> {
+        // ADO.NET brace quoting has no `}}` doubling: the brace closes at the
+        // first `}`, so the `}` between `a` and `b` is consumed as the
+        // terminator and lost. This documents the limitation.
+        let ado: AdoNetConfig = "User Id=sa;Password={a}b}".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", "ab}"), ado.authentication()?);
+
+        // Use single or double quotes for passwords that contain `}`.
+        let ado: AdoNetConfig = "User Id=sa;Password='a}b}'".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", "a}b}"), ado.authentication()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_password_non_ascii_is_rejected() {
+        // The ADO parser only accepts ASCII; non-ASCII passwords must use the
+        // programmatic `Config` API instead.
+        assert!("User Id=sa;Password=café".parse::<AdoNetConfig>().is_err());
+        assert!("User Id=sa;Password='café'"
+            .parse::<AdoNetConfig>()
+            .is_err());
+    }
+
+    #[test]
+    fn unquoted_special_char_password_error_has_hint() {
+        // An unquoted `;` in a password breaks parsing. The error must guide
+        // the user toward quoting or the programmatic API while preserving the
+        // underlying parser message.
+        let err = "User Id=sa;Password=a;b"
+            .parse::<AdoNetConfig>()
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        // Underlying terse parser message is preserved (not replaced).
+        assert!(msg.contains("must be joined"), "message was: {msg}");
+        // Hint mentions the ADO quoting styles and the programmatic API.
+        assert!(msg.contains("single quotes"), "message was: {msg}");
+        assert!(msg.contains("braces"), "message was: {msg}");
+        assert!(
+            msg.contains("Config::from_ado_string"),
+            "message was: {msg}"
+        );
+        // The `Conversion error:` prefix must not be doubled.
+        assert!(
+            !msg.contains("Conversion error: Conversion error:"),
+            "message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn unclosed_quote_and_brace_errors_have_hint() {
+        // Unclosed quote/brace are quoting mistakes; the hint should attach.
+        for input in [
+            "User Id=sa;Password='abc",  // unclosed single quote
+            "User Id=sa;Password=\"abc", // unclosed double quote
+            "User Id=sa;Password={abc",  // unclosed brace
+        ] {
+            let err = input.parse::<AdoNetConfig>().err().unwrap();
+            let msg = err.to_string();
+            assert!(msg.contains("must be quoted"), "message was: {msg}");
+            assert!(
+                !msg.contains("Conversion error: Conversion error:"),
+                "message was: {msg}"
+            );
+        }
     }
 
     #[test]

@@ -485,6 +485,43 @@ impl Config {
     /// |`WorkstationID`, `Workstation ID`|`<string>`|The client / workstation name reported to the server.|
     /// |`MultiSubnetFailover`|`true`,`false`,`yes`,`no`|When enabled, connections are attempted in parallel to all IP addresses the server resolves to, and the first to succeed is used.|
     ///
+    /// # Special characters in values
+    ///
+    /// Characters with a structural meaning in a connection string — `;`, `=`,
+    /// `{`, `'`, `"` and leading spaces — must be quoted when they appear in a
+    /// value such as a password. Wrap the value in single quotes, double
+    /// quotes, or braces (`{...}`), choosing a style the value does not itself
+    /// contain (braces carry both quote characters):
+    ///
+    /// - `password='p@ss;word=42'`
+    /// - `password="p@ss;word=42"`
+    /// - `password={p@ss;word=42}`
+    ///
+    /// Do **not** URL-encode the value: `%24` is sent to the server literally,
+    /// not decoded back to `$`, which is a common cause of login failures.
+    /// A bare `}` needs no quoting, but note that brace quoting cannot hold a
+    /// literal `}` (there is no `}}` doubling), so a value that must be quoted
+    /// *and* contains a `}` has to use single or double quotes. Only ASCII
+    /// values are accepted by the parser.
+    ///
+    /// For non-ASCII passwords, or to avoid escaping entirely, build the
+    /// [`Config`] programmatically — the values are passed verbatim:
+    ///
+    /// ```
+    /// # use tiberius::{Config, AuthMethod};
+    /// // Quoted in an ADO.NET string: the `;`, `=` and `{}` are preserved.
+    /// let _config = Config::from_ado_string(
+    ///     r#"server=tcp:localhost,1433;user=sa;password='p@ss;w{}rd=42'"#,
+    /// )?;
+    ///
+    /// // The programmatic API needs no escaping and accepts any value.
+    /// let mut config = Config::new();
+    /// config.host("localhost");
+    /// config.port(1433);
+    /// config.authentication(AuthMethod::sql_server("sa", "p@ss;w{}rd=42"));
+    /// # Ok::<(), tiberius::error::Error>(())
+    /// ```
+    ///
     /// [ADO.NET connection string]: https://docs.microsoft.com/en-us/dotnet/framework/data/adonet/connection-strings
     pub fn from_ado_string(s: &str) -> crate::Result<Self> {
         let ado: AdoNetConfig = s.parse()?;
@@ -494,6 +531,20 @@ impl Config {
     /// Creates a new `Config` from a [JDBC connection string].
     ///
     /// See [`from_ado_string`] method for supported parameters.
+    ///
+    /// # Special characters in values
+    ///
+    /// The JDBC parser understands only brace quoting: wrap a value that
+    /// contains `;`, `=`, `:`, `{`, `\`, `/`, `[` or `]` in braces, e.g.
+    /// `password={p@ss;word}`.
+    /// Unlike ADO.NET, single and double quotes are **not** escape characters
+    /// here — they are ordinary value characters, and spaces are kept verbatim
+    /// without quoting (JDBC does not trim). Brace quoting cannot hold a literal
+    /// `}` (there is no `}}` doubling), though a bare `}` needs no quoting. Do
+    /// not URL-encode values, and note that only ASCII is accepted.
+    /// For non-ASCII values, or to avoid escaping entirely, build the
+    /// [`Config`] programmatically as shown in [`from_ado_string`]; the values
+    /// are passed verbatim.
     ///
     /// [JDBC connection string]: https://docs.microsoft.com/en-us/sql/connect/jdbc/building-the-connection-url?view=sql-server-ver15
     /// [`from_ado_string`]: #method.from_ado_string
@@ -760,6 +811,46 @@ pub(crate) struct ServerDefinition {
     host: Option<String>,
     port: Option<u16>,
     instance: Option<String>,
+}
+
+/// Wrap a [`connection_string`] parse failure with actionable guidance.
+///
+/// The underlying ADO.NET / JDBC parser fails with a terse, low-level message
+/// (for example "key-value pairs must be joined by a =") when a value contains
+/// an unescaped special character such as `;`, `=` or `{` — a very common
+/// cause of "cannot connect" reports for passwords with special characters.
+/// Append a hint describing how to quote such values so the message is
+/// self-explanatory. `quoting` spells out the escaping styles the specific
+/// parser accepts (they differ between ADO.NET and JDBC) and `docs` names the
+/// constructor whose rustdoc carries the full rules and the programmatic-build
+/// workaround.
+///
+/// The hint is phrased conditionally because `connection_string::Error` is an
+/// opaque string with no error kind, so this wrapper cannot tell a quoting
+/// failure apart from an unrelated one (a bad port, a mistyped sub-protocol,
+/// …); "if a value … contains a special character" keeps the guidance honest
+/// for every failure while still solving the common quoting case.
+fn connection_string_error(
+    err: connection_string::Error,
+    quoting: &str,
+    docs: &str,
+) -> crate::Error {
+    // `connection_string::Error`'s `Display` already prefixes `Conversion
+    // error: `; strip it so wrapping the text in `Error::Conversion` does not
+    // duplicate the prefix.
+    let err = err.to_string();
+    let detail = err.strip_prefix("Conversion error: ").unwrap_or(&err);
+    crate::Error::Conversion(
+        format!(
+            "{detail}. hint: if a value such as a password contains a special \
+             character (for example `;`, `=` or `{{`), it must be quoted — \
+             {quoting}. Do not URL-encode the value (`%24` is sent literally, \
+             not decoded to `$`). Non-ASCII values are not accepted by the \
+             connection-string parser; build the `Config` programmatically \
+             (see `{docs}`) to pass any value without escaping."
+        )
+        .into(),
+    )
 }
 
 pub(crate) trait ConfigString {
