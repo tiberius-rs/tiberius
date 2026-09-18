@@ -38,14 +38,19 @@ where
         }
         // NTEXT
         None => {
-            let text_len = src.read_u32_le().await? as usize / 2;
+            let text_len = src.read_u32_le().await? as usize;
+            if text_len % 2 != 0 {
+                return Err(Error::Protocol("ntext: invalid length".into()));
+            }
+
+            let text_len = text_len / 2;
             let mut buf = Vec::with_capacity(text_len);
 
             for _ in 0..text_len {
                 buf.push(src.read_u16_le().await?);
             }
 
-            String::from_utf16(&buf[..])?
+            String::from_utf16_lossy(&buf[..])
         }
     };
 

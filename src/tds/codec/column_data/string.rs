@@ -37,7 +37,11 @@ where
             }
 
             let buf: Vec<_> = buf.chunks(2).map(LittleEndian::read_u16).collect();
-            Ok(Some(String::from_utf16(&buf)?.into()))
+            let value = match ty {
+                NChar | NVarchar => String::from_utf16_lossy(&buf),
+                _ => String::from_utf16(&buf)?,
+            };
+            Ok(Some(value.into()))
         }
         _ => Ok(None),
     }

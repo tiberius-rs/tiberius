@@ -799,7 +799,181 @@ mod tests {
     use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
     use crate::tds::Collation;
     use crate::{Error, VarLenContext};
-    use bytes::BytesMut;
+    use bytes::{BufMut, BytesMut};
+
+    async fn decode_wire(
+        ty: VarLenType,
+        len: usize,
+        collation: Option<Collation>,
+        wire: &[u8],
+    ) -> crate::Result<ColumnData<'static>> {
+        let reader = &mut BytesMut::from(wire).into_sql_read_bytes();
+        ColumnData::decode(
+            reader,
+            &TypeInfo::VarLenSized(VarLenContext::new(ty, len, collation)),
+        )
+        .await
+    }
+
+    fn short_string_wire(payload: &[u8]) -> BytesMut {
+        let mut wire = BytesMut::new();
+        wire.put_u16_le(payload.len() as u16);
+        wire.extend_from_slice(payload);
+        wire
+    }
+
+    fn ntext_wire(payload: &[u8]) -> BytesMut {
+        let mut wire = BytesMut::new();
+        wire.put_u8(1);
+        wire.put_u8(0);
+        wire.put_i32_le(0);
+        wire.put_u32_le(0);
+        wire.put_u32_le(payload.len() as u32);
+        wire.extend_from_slice(payload);
+        wire
+    }
+
+    fn decoded_string(value: ColumnData<'static>) -> Option<String> {
+        match value {
+            ColumnData::String(value) => value.map(Cow::into_owned),
+            other => panic!("expected string column data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nvarchar_replaces_lone_surrogates() {
+        for payload in [[0x00, 0xd8], [0x00, 0xdc]] {
+            let value = decode_wire(
+                VarLenType::NVarchar,
+                40,
+                Some(Collation::new(13632521, 52)),
+                &short_string_wire(&payload),
+            )
+            .await
+            .expect("malformed UTF-16 row values must remain readable");
+
+            assert_eq!(decoded_string(value).as_deref(), Some("\u{fffd}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn nchar_replaces_lone_surrogates() {
+        for payload in [[0x00, 0xd8], [0x00, 0xdc]] {
+            let value = decode_wire(
+                VarLenType::NChar,
+                40,
+                Some(Collation::new(13632521, 52)),
+                &short_string_wire(&payload),
+            )
+            .await
+            .expect("malformed UTF-16 row values must remain readable");
+
+            assert_eq!(decoded_string(value).as_deref(), Some("\u{fffd}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ntext_replaces_lone_surrogates() {
+        for payload in [[0x00, 0xd8], [0x00, 0xdc]] {
+            let value = decode_wire(VarLenType::NText, 0, None, &ntext_wire(&payload))
+                .await
+                .expect("malformed UTF-16 row values must remain readable");
+
+            assert_eq!(decoded_string(value).as_deref(), Some("\u{fffd}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unicode_row_values_preserve_valid_text() {
+        let cases: &[(&[u8], &str)] = &[
+            (&[0x2d, 0x4e, 0x87, 0x65], "中文"),
+            (&[0x3d, 0xd8, 0x00, 0xde], "😀"),
+        ];
+
+        for (payload, expected) in cases {
+            let nvarchar = decode_wire(
+                VarLenType::NVarchar,
+                40,
+                Some(Collation::new(13632521, 52)),
+                &short_string_wire(payload),
+            )
+            .await
+            .expect("valid UTF-16 must decode");
+            let ntext = decode_wire(VarLenType::NText, 0, None, &ntext_wire(payload))
+                .await
+                .expect("valid NTEXT UTF-16 must decode");
+
+            assert_eq!(decoded_string(nvarchar).as_deref(), Some(*expected));
+            assert_eq!(decoded_string(ntext).as_deref(), Some(*expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn unicode_row_values_preserve_nulls() {
+        let nvarchar = decode_wire(
+            VarLenType::NVarchar,
+            40,
+            Some(Collation::new(13632521, 52)),
+            &[0xff, 0xff],
+        )
+        .await
+        .expect("NULL nvarchar must decode");
+        let ntext = decode_wire(VarLenType::NText, 0, None, &[0])
+            .await
+            .expect("NULL ntext must decode");
+
+        assert_eq!(decoded_string(nvarchar), None);
+        assert_eq!(decoded_string(ntext), None);
+    }
+
+    #[tokio::test]
+    async fn unicode_row_values_reject_odd_byte_lengths() {
+        let nvarchar = decode_wire(
+            VarLenType::NVarchar,
+            40,
+            Some(Collation::new(13632521, 52)),
+            &short_string_wire(&[0x41, 0x00, 0x42]),
+        )
+        .await
+        .expect_err("odd nvarchar length must be a protocol error");
+        let ntext = decode_wire(VarLenType::NText, 0, None, &ntext_wire(&[0x41, 0x00, 0x42]))
+            .await
+            .expect_err("odd ntext length must be a protocol error");
+
+        assert!(matches!(nvarchar, Error::Protocol(_)));
+        assert!(matches!(ntext, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn bigvarchar_keeps_codepage_decoding() {
+        let value = decode_wire(
+            VarLenType::BigVarChar,
+            40,
+            Some(Collation::new(13632521, 52)),
+            &short_string_wire(b"plain varchar"),
+        )
+        .await
+        .expect("varchar must keep using its codepage decoder");
+
+        assert_eq!(decoded_string(value).as_deref(), Some("plain varchar"));
+    }
+
+    #[cfg(feature = "tds73")]
+    #[tokio::test]
+    async fn xml_keeps_strict_utf16_decoding() {
+        let reader = &mut short_string_wire(&[0x00, 0xd8]).into_sql_read_bytes();
+        let error = ColumnData::decode(
+            reader,
+            &TypeInfo::Xml {
+                schema: None,
+                size: 40,
+            },
+        )
+        .await
+        .expect_err("malformed XML must retain strict UTF-16 decoding");
+
+        assert!(matches!(error, Error::Utf16));
+    }
 
     async fn test_round_trip(ti: TypeInfo, d: ColumnData<'_>) {
         let mut buf = BytesMut::new();
