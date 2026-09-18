@@ -61,6 +61,7 @@ connection-string = "0.2"
 num-traits = "0.2"
 uuid = "1.0"
 zeroize = "1.8.2"
+secrecy = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 winauth = { version = "0.0.5", optional = true }
