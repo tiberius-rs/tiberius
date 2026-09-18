@@ -104,11 +104,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     ///
     /// The handshake performed here (prelogin, TLS negotiation and login) is
     /// bounded by [`Config::handshake_timeout`]: if the server accepts the TCP
-    /// connection but then stalls mid-handshake — the failure mode seen with
-    /// `azure-sql-edge` on macOS, where the TLS handshake never
-    /// completes — the connect future fails with a [`std::io::ErrorKind::TimedOut`]
-    /// error instead of hanging forever. Enable `tracing` at `DEBUG` to see
-    /// which stage was last reached.
+    /// connection but then stalls mid-handshake (for example a TLS handshake
+    /// that never completes), the connect future fails with a
+    /// [`std::io::ErrorKind::TimedOut`] error instead of hanging forever. Enable
+    /// `tracing` at `DEBUG` to see which stage was last reached.
     pub(crate) async fn connect(config: Config, tcp_stream: S) -> crate::Result<Connection<S>> {
         let handshake_timeout = config.handshake_timeout;
         with_optional_timeout(handshake_timeout, Self::establish(config, tcp_stream)).await

@@ -38,7 +38,7 @@ pub(crate) fn trust_anchors(extra: &ExtraCa) -> crate::Result<Vec<CertificateDer
         ExtraCa::Bundle(bytes) => certs_from_bundle(bytes)?,
     };
 
-    // Rule 2: zero usable certificates is fatal and names the source — never a
+    // Zero usable certificates is fatal and names the source — never a
     // silent degrade to base-roots-only.
     if certs.is_empty() {
         return Err(crate::Error::Io {
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn certs_from_file_reads_multi_pem_chain() {
-        // Rule 4: multi-cert files must load ALL certs, never truncate.
+        // Multi-cert files must load ALL certs, never truncate.
         let chain = certs_from_file(Path::new("docker/certs/server-full.crt")).unwrap();
         assert!(
             chain.len() >= 2,
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn certs_from_bundle_sniffs_pem_and_reads_all() {
-        // Rule 3 + 4: a PEM bundle sniffed by `-----BEGIN`, all blocks parsed.
+        // A PEM bundle sniffed by `-----BEGIN`, all blocks parsed.
         let bytes = std::fs::read("docker/certs/server-full.crt").unwrap();
         let certs = certs_from_bundle(&bytes).unwrap();
         assert!(certs.len() >= 2, "PEM bundle must yield every block");
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn certs_from_bundle_sniffs_der() {
-        // Rule 3: no `-----BEGIN` marker => treated as a single DER certificate.
+        // No `-----BEGIN` marker => treated as a single DER certificate.
         let der = certs_from_file(Path::new("docker/certs/customCA.crt"))
             .unwrap()
             .into_iter()
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn trust_anchors_file_zero_certs_errors_naming_source() {
-        // Rule 2: a zero-cert file is a hard error naming the source path.
+        // A zero-cert file is a hard error naming the source path.
         let mut path = std::env::temp_dir();
         path.push(format!(
             "tiberius_trust_anchors_zero_{}.pem",
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn trust_anchors_bundle_no_certificate_blocks_errors_naming_source() {
-        // Rule 2: a PEM bundle that contains no CERTIFICATE blocks (here only a
+        // A PEM bundle that contains no CERTIFICATE blocks (here only a
         // PRIVATE KEY) yields zero certs and must be a hard error naming the
         // in-memory source, never a silent degrade to base-roots-only.
         let bundle = b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n".to_vec();
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn empty_der_bundle_is_zero_certs_naming_source() {
-        // Rule 2: a zero-byte DER-sniffed bundle must be a hard error naming the
+        // A zero-byte DER-sniffed bundle must be a hard error naming the
         // source, not a bogus 1-element vec of an empty "certificate" that only
         // fails later at the backend with an anonymous error.
         assert_eq!(certs_from_bundle(&[]).unwrap().len(), 0);
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn empty_der_file_is_zero_certs_naming_source() {
-        // Rule 2: a zero-byte `.der` file, same as above but the file shape.
+        // A zero-byte `.der` file, same as above but the file shape.
         let mut path = std::env::temp_dir();
         path.push(format!("tiberius_empty_{}.der", std::process::id()));
         std::fs::write(&path, b"").unwrap();

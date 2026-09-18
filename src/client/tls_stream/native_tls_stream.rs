@@ -137,7 +137,7 @@ mod tests {
     use crate::client::config::{ClientCertSource, ExtraCa};
     use std::path::PathBuf;
 
-    // Cross-backend loading (rule 4): a multi-cert CA file must yield every
+    // Cross-backend loading: a multi-cert CA file must yield every
     // certificate, and each must convert into a native-tls `Certificate`. This
     // exercises the same shared loader + per-cert `Certificate::from_der`
     // conversion the connect path uses, without needing a live server.
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn empty_ca_file_is_hard_error_naming_source() {
-        // Rule 2: a zero-cert CA never silently degrades to platform-only trust.
+        // A zero-cert CA never silently degrades to platform-only trust.
         let mut path = std::env::temp_dir();
         path.push(format!("tiberius_nt_zero_{}.pem", std::process::id()));
         std::fs::write(&path, b"# no certs\n").unwrap();
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn multi_cert_extra_cas_load_all_via_helper() {
-        // The helper loads every cert from a multi-cert file (rule 4) through the
+        // The helper loads every cert from a multi-cert file through the
         // real connect-path code, converting each to a native-tls Certificate.
         let certs = load_extra_cas(&[ExtraCa::File(PathBuf::from("docker/certs/server-full.crt"))])
             .expect("multi-cert file loads");

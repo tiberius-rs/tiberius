@@ -78,8 +78,8 @@ pub struct Config {
 ///   exclusive — the OS store or a bundled Mozilla snapshot).
 /// - [`extra_cas`](TrustConfig::extra_cas): additional CA certificates layered
 ///   *on top of* the source. This **accumulates**: every `trust_cert_ca` /
-///   `trust_cert_ca_bundle` call appends one entry (composable), rather than the
-///   pre-0.13 replace-last-wins behaviour.
+///   `trust_cert_ca_bundle` call appends one entry (composable) rather than
+///   replacing the previous one.
 /// - [`bypass`](TrustConfig::bypass): skip certificate validation entirely
 ///   (`trust_cert`). Mutually exclusive with configuring a `source` or
 ///   `extra_cas` — mixing them panics (or, from a connection string, errors)
@@ -416,8 +416,8 @@ impl Config {
     /// contain **multiple** certificates and all of them are trusted.
     ///
     /// This **accumulates**: calling it more than once (or alongside
-    /// [`trust_cert_ca_bundle`]) trusts every supplied CA. This is a behaviour
-    /// change from pre-0.13, where a second call replaced the first.
+    /// [`trust_cert_ca_bundle`]) trusts every supplied CA — repeated calls are
+    /// additive, not replace-last-wins.
     ///
     /// # Panics
     /// Will panic in case [`trust_cert`] was called before.
@@ -437,9 +437,8 @@ impl Config {
 
     /// Trust additional CA certificates supplied as in-memory bytes, *in
     /// addition to* the base trust anchors. This avoids having to write an
-    /// in-memory certificate out to a temporary file, and — unlike the pre-0.13
-    /// single-certificate `trust_cert_ca` — accepts a whole **bundle** of CA
-    /// certificates (for example the AWS RDS root bundle).
+    /// in-memory certificate out to a temporary file, and accepts a whole
+    /// **bundle** of CA certificates (for example the AWS RDS root bundle).
     ///
     /// The byte format is auto-detected: if the bytes contain a `-----BEGIN`
     /// marker at the start of a line they are parsed as PEM (every certificate
@@ -553,10 +552,9 @@ impl Config {
     /// The handshake covers everything [`Client::connect`] does after it is
     /// handed a connected TCP stream: the TDS prelogin exchange, the TLS
     /// negotiation and the login. If the server accepts the TCP connection but
-    /// then stops responding mid-handshake — as observed against
-    /// `azure-sql-edge` on macOS, where the TLS handshake can stall
-    /// indefinitely — the connect future would otherwise hang
-    /// forever with no error. This bound makes such a stall surface as a
+    /// then stops responding mid-handshake (for example a TLS handshake that
+    /// stalls indefinitely), the connect future would otherwise hang forever
+    /// with no error. This bound makes such a stall surface as a
     /// [`Error::Io`] with [`std::io::ErrorKind::TimedOut`] instead.
     ///
     /// The timer is runtime-agnostic (it does not depend on tokio or smol), so
@@ -569,8 +567,8 @@ impl Config {
     /// reached, which pinpoints where a stall occurred.
     ///
     /// - Defaults to 15 seconds, matching ADO.NET's `Connect Timeout`. Pass
-    ///   `None` to wait indefinitely (the pre-0.13 behaviour). A zero duration
-    ///   is a degenerate bound that fails as soon as the handshake would block.
+    ///   `None` to wait indefinitely. A zero duration is a degenerate bound
+    ///   that fails as soon as the handshake would block.
     ///
     /// # Example
     ///
@@ -619,9 +617,9 @@ impl Config {
     /// pool should discard the connection) rather than reuse it.
     ///
     /// - Defaults to 30 seconds, matching ADO.NET's `Command Timeout`. Pass
-    ///   `None` to wait indefinitely (the pre-0.13 behaviour). A zero duration
-    ///   is a degenerate bound that trips on the first server round-trip that
-    ///   is not answered immediately.
+    ///   `None` to wait indefinitely. A zero duration is a degenerate bound
+    ///   that trips on the first server round-trip that is not answered
+    ///   immediately.
     ///
     /// # Example
     ///
@@ -1848,8 +1846,8 @@ mod tests {
 
     #[test]
     fn trust_cert_ca_accumulates_across_calls() {
-        // Behaviour change from pre-0.13 replace-last-wins: repeated calls must
-        // trust BOTH CAs (composable), across file + bundle sources.
+        // Repeated calls are additive (not replace-last-wins): both CAs must
+        // be trusted, across file + bundle sources.
         let mut config = Config::new();
         config.trust_cert_ca("/tmp/a.crt");
         config.trust_cert_ca("/tmp/b.crt");
@@ -1879,7 +1877,7 @@ mod tests {
 
     #[test]
     fn trust_config_debug_redacts_bundle_bytes() {
-        // Rule 6: the bundle's raw bytes must never appear in Debug; only a
+        // The bundle's raw bytes must never appear in Debug; only a
         // length summary.
         let mut config = Config::new();
         config.trust_cert_ca_bundle(vec![0xDE, 0xAD, 0xBE, 0xEF]);
@@ -2035,7 +2033,7 @@ mod tests {
 
     #[test]
     fn from_ado_string_trust_cert_and_ca_conflict_errors() {
-        // Rule 1: the conflict must surface as a hard error, never silently let
+        // The conflict must surface as a hard error, never silently let
         // the bypass win. From a connection string it is an `Err`, not a panic.
         let err = Config::from_ado_string(
             "server=tcp:localhost,1433;TrustServerCertificate=true;\

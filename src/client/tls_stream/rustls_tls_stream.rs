@@ -319,7 +319,7 @@ fn load_native_roots_into(roots: &mut RootCertStore) -> (usize, bool) {
 /// trust anchors (the OS store, or the bundled Mozilla roots) **plus** every
 /// accumulated extra CA.
 ///
-/// Fail-closed invariant (rule 7): when there are no extra CAs, an empty base
+/// Fail-closed invariant: when there are no extra CAs, an empty base
 /// store is fatal — `Native` with an unusable OS store fails to connect rather
 /// than trusting nothing. When extra CAs *are* supplied they provide trust on
 /// their own, so an empty/best-effort base is tolerated (matching the additive
@@ -365,7 +365,7 @@ fn build_trust_store(trust: &TrustConfig) -> crate::Result<RootCertStore> {
     Ok(store)
 }
 
-/// Fail-closed decision for a validating trust store (rule 7): with no extra
+/// Fail-closed decision for a validating trust store: with no extra
 /// CAs, an empty base store is fatal — `Native` with an unusable OS store must
 /// fail to connect rather than silently trust nothing. When extra CAs *are*
 /// present they provide trust on their own, so a best-effort/empty base is
@@ -557,7 +557,7 @@ mod tests {
     #[test]
     fn build_trust_store_accepts_multi_cert_ca_file() {
         // The pre-0.13 single-certificate restriction is relaxed: every cert in
-        // a multi-cert CA file is trusted (rule 4).
+        // a multi-cert CA file is trusted.
         let mut native_only = RootCertStore::empty();
         let (native, _) = load_native_roots_into(&mut native_only);
 
@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn build_trust_store_propagates_zero_cert_extra_ca_error() {
-        // Rule 2: an extra CA that yields zero usable certs is fatal, naming it.
+        // An extra CA that yields zero usable certs is fatal, naming it.
         let mut path = std::env::temp_dir();
         path.push(format!("tiberius_bts_zero_{}.pem", std::process::id()));
         std::fs::write(&path, b"# no certificates here\n").unwrap();
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn ensure_base_or_extra_enforces_fail_closed_rule7() {
-        // Rule 7, tested directly (an empty OS store can't be simulated in-process):
+        // Fail-closed empty-base behaviour, tested directly (an empty OS store can't be simulated in-process):
         // no base + no extras => fail closed, with the message distinguishing a
         // load error from a genuinely empty store.
         let empty_store = ensure_base_or_extra(0, false, false).unwrap_err();

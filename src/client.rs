@@ -1525,9 +1525,8 @@ mod tests {
     fn rejects_unbalanced_closing_paren_and_top_level_comma() {
         // Order-hint columns are interpolated verbatim into `ORDER( ... )`, so a
         // value the guard accepts must not be able to close that paren early or
-        // splice a second column. A lone trailing `)` (no matching `(`) used to
-        // slip through `saturating_sub`; a top-level comma used to be accepted
-        // for parameterized types. Both must now be rejected.
+        // splice a second column: a lone trailing `)` (no matching `(`) and a
+        // top-level comma are both rejected.
         assert!(validate_bulk_column_identifier("col)").is_err());
         assert!(validate_bulk_column_identifier(")").is_err());
         assert!(validate_bulk_column_identifier("a,b").is_err());
