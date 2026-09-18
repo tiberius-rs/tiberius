@@ -10,10 +10,111 @@ use crate::{
 };
 use futures_util::{
     io::{AsyncRead, AsyncWrite},
-    stream::{BoxStream, TryStreamExt},
+    stream::{BoxStream, Stream, StreamExt, TryStreamExt},
 };
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 use std::{convert::TryFrom, sync::Arc};
 use tracing::{event, Level};
+
+/// Wraps a token stream so each server round-trip is bounded by a deadline.
+///
+/// The timer only runs while an item is *in flight* — i.e. while the inner
+/// stream is `Pending` waiting on the server — and is reset the moment a token
+/// is delivered. A slow consumer (which simply stops polling between items)
+/// therefore never trips it; only a stalled server does. This backs
+/// [`Config::command_timeout`](crate::Config::command_timeout), whose rustdoc
+/// documents the exact semantics.
+struct RoundTripTimeout<'a> {
+    inner: BoxStream<'a, crate::Result<ReceivedToken>>,
+    /// `None` disables the bound entirely (unbounded reads).
+    timeout: Option<Duration>,
+    /// The deadline for the token currently being awaited. Created lazily when
+    /// the inner stream first parks on the server and cleared on every delivery,
+    /// so it measures per-round-trip stall rather than consumer pace.
+    delay: Option<futures_timer::Delay>,
+    /// Shared with the owning [`Connection`], which flips it when this deadline
+    /// fires so the now-desynced connection is rejected on any subsequent use
+    /// (its `flush_stream` would otherwise block forever on the still-pending
+    /// previous response). `None` in the combinator's own unit tests, which run
+    /// without a connection.
+    ///
+    /// [`Connection`]: crate::client::Connection
+    poison: Option<Arc<AtomicBool>>,
+}
+
+impl<'a> RoundTripTimeout<'a> {
+    fn new(
+        timeout: Option<Duration>,
+        poison: Option<Arc<AtomicBool>>,
+        inner: BoxStream<'a, crate::Result<ReceivedToken>>,
+    ) -> Self {
+        Self {
+            inner,
+            timeout,
+            delay: None,
+            poison,
+        }
+    }
+}
+
+impl Stream for RoundTripTimeout<'_> {
+    type Item = crate::Result<ReceivedToken>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        // Both `inner` (a `BoxStream`) and `Delay` are `Unpin`, so they can be
+        // polled through `&mut` without structural pin projection.
+        let this = self.get_mut();
+
+        match this.inner.poll_next_unpin(cx) {
+            // A token arrived (or the stream ended / errored): reset the deadline
+            // so the next round-trip is timed afresh.
+            Poll::Ready(item) => {
+                this.delay = None;
+                Poll::Ready(item)
+            }
+            Poll::Pending => {
+                let Some(timeout) = this.timeout else {
+                    // Unbounded: never start a timer.
+                    return Poll::Pending;
+                };
+
+                let delay = this
+                    .delay
+                    .get_or_insert_with(|| futures_timer::Delay::new(timeout));
+
+                match Pin::new(delay).poll(cx) {
+                    Poll::Ready(()) => {
+                        // Clear the fired timer and mark the connection desynced:
+                        // the tail of this response is still unread on the wire,
+                        // so it must not be reused. Flipping the shared flag makes
+                        // `Connection::ensure_not_poisoned` reject the next use
+                        // (fast, deterministic) instead of `flush_stream` blocking
+                        // forever on the still-pending previous response.
+                        this.delay = None;
+                        if let Some(poison) = &this.poison {
+                            poison.store(true, Ordering::Release);
+                        }
+                        Poll::Ready(Some(Err(crate::Error::Io {
+                            kind: std::io::ErrorKind::TimedOut,
+                            message: format!(
+                                "the server did not send the next part of the command result \
+                                 within {timeout:?} (it may have stalled, or be responding too \
+                                 slowly for the configured bound); the connection is now out of \
+                                 sync and must be dropped. Adjust the bound with \
+                                 `Config::command_timeout`, or pass `None` to wait indefinitely."
+                            ),
+                        })))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ReceivedToken {
@@ -355,6 +456,17 @@ where
     }
 
     pub fn try_unfold(self) -> BoxStream<'a, crate::Result<ReceivedToken>> {
+        // Read the per-response command timeout before `self` is moved into the
+        // unfold closure. Every command result-read path funnels through here
+        // (query/execute/simple_query result streams, the bulk-insert server
+        // acknowledgement and column-metadata), so bounding each round-trip once
+        // at this choke point covers them all.
+        let command_timeout = self.conn.context().command_timeout();
+        // Shared handle so the timeout, when it fires, can mark the underlying
+        // connection desynced (it is moved into the unfold closure below and is
+        // otherwise unreachable from `RoundTripTimeout`).
+        let poison = self.conn.command_desync_flag();
+
         let stream = futures_util::stream::try_unfold(self, |mut this| async move {
             if this.conn.is_eof() {
                 match this.last_error {
@@ -400,7 +512,11 @@ where
             Ok(Some((token, this)))
         });
 
-        Box::pin(stream)
+        Box::pin(RoundTripTimeout::new(
+            command_timeout,
+            Some(poison),
+            Box::pin(stream),
+        ))
     }
 }
 
@@ -696,5 +812,355 @@ mod tests {
             Error::Protocol(msg) => assert!(msg.contains("before any COLMETADATA")),
             other => panic!("expected Error::Protocol, got {other:?}"),
         }
+    }
+
+    // --- (d) command timeout end-to-end -------------------------------------
+    //
+    // A server that answers with a first packet and then goes silent mid-result
+    // must surface a prompt TimedOut error through the whole
+    // Connection -> TokenStream -> RoundTripTimeout read path, rather than
+    // hanging (command-timeout arm).
+
+    // Frame a token payload into a single *non-final* (NormalMessage) TDS
+    // packet, so the connection expects at least one more packet afterwards.
+    fn normal_packet_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut header = PacketHeader::batch(1);
+        header.set_status(PacketStatus::NormalMessage);
+        let packet = Packet::new(header, BytesMut::from(payload));
+
+        let mut buf = BytesMut::new();
+        packet.encode(&mut buf).unwrap();
+        buf.to_vec()
+    }
+
+    // Serves a fixed script of bytes once, then parks every subsequent read
+    // forever — a server that answers and then stalls mid-response. Distinct
+    // from `MockStream`, which reports clean EOF once its script is exhausted.
+    struct AnswerThenSilent {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl AsyncRead for AnswerThenSilent {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pos >= self.data.len() {
+                // Script exhausted: the server has gone silent. Only the command
+                // timeout can unblock the reader now.
+                return Poll::Pending;
+            }
+            let remaining = &self.data[self.pos..];
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.pos += n;
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    impl AsyncWrite for AnswerThenSilent {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn is_timed_out(err: &Error) -> bool {
+        matches!(err, Error::Io { kind, .. } if *kind == io::ErrorKind::TimedOut)
+    }
+
+    #[tokio::test]
+    async fn command_timeout_fires_when_server_stalls_mid_stream() {
+        use crate::SqlReadBytes;
+        use std::time::{Duration, Instant};
+
+        // First (non-final) packet carries a valid ENVCHANGE but no DONE, then
+        // the stream goes silent — so the reader must wait for a packet that
+        // never comes.
+        let script = normal_packet_bytes(&envchange_packet_size("8192", "4096"));
+        let mut conn = Connection::test_over(
+            AnswerThenSilent {
+                data: script,
+                pos: 0,
+            },
+            false,
+        );
+        conn.context_mut()
+            .set_command_timeout(Some(Duration::from_millis(100)));
+
+        let started = Instant::now();
+        let err = TokenStream::new(&mut conn)
+            .flush_done()
+            .await
+            .expect_err("a server that stalls mid-result must not hang the read");
+
+        assert!(
+            is_timed_out(&err),
+            "expected a TimedOut error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("did not send the next part")
+                && err.to_string().contains("out of sync"),
+            "command timeout error should be diagnosable, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the command timeout must fire promptly, took {:?}",
+            started.elapsed()
+        );
+        // The token that *did* arrive before the stall was still processed.
+        assert_eq!(conn.context().packet_size(), 8192);
+        // The connection is now desynced (the tail of the timed-out response is
+        // still unread): it must be poisoned so a pool cannot silently reuse it
+        // and re-hang in `flush_stream` on the still-pending response.
+        let reuse = conn.ensure_not_poisoned();
+        assert!(
+            reuse.is_err(),
+            "a command timeout must leave the connection unusable, got: {reuse:?}"
+        );
+        assert!(
+            reuse.unwrap_err().to_string().contains("out of sync"),
+            "reuse should be rejected with a command-timeout desync error"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_command_timeout_keeps_waiting_on_a_stalled_server() {
+        // With no command timeout configured, a mid-result stall keeps the read
+        // pending; an outer guard proves no internal timeout fires.
+        let script = normal_packet_bytes(&envchange_packet_size("8192", "4096"));
+        let mut conn = Connection::test_over(
+            AnswerThenSilent {
+                data: script,
+                pos: 0,
+            },
+            false,
+        );
+        // command_timeout defaults to None on a bare Context.
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+            TokenStream::new(&mut conn).flush_done().await
+        })
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "with no command timeout the read should stay pending on the stalled server"
+        );
+    }
+}
+
+// Server-free tests for the `RoundTripTimeout` stream combinator that backs
+// `Config::command_timeout`. They assert the per-round-trip semantics directly:
+// a stalled server times out promptly, responsive reads pass through, `None`
+// disables the bound, and — critically — a slow *consumer* never trips it.
+#[cfg(test)]
+mod round_trip_timeout_tests {
+    use super::{ReceivedToken, RoundTripTimeout};
+    use futures_util::stream::{self, BoxStream, StreamExt};
+    use std::time::{Duration, Instant};
+
+    fn token() -> ReceivedToken {
+        ReceivedToken::ReturnStatus(0)
+    }
+
+    fn is_timed_out(err: &crate::Error) -> bool {
+        matches!(err, crate::Error::Io { kind, .. } if *kind == std::io::ErrorKind::TimedOut)
+    }
+
+    #[tokio::test]
+    async fn stalled_server_times_out_promptly() {
+        // Inner stream never yields: a server that stops responding mid-result.
+        let inner: BoxStream<'static, crate::Result<ReceivedToken>> = stream::pending().boxed();
+        let mut s = RoundTripTimeout::new(Some(Duration::from_millis(50)), None, inner);
+
+        let started = Instant::now();
+        let item = s.next().await.expect("must yield a timeout error, not end");
+        let err = item.expect_err("a stalled server must produce an error");
+        assert!(is_timed_out(&err), "expected TimedOut, got: {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must fire promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn responsive_reads_pass_through_under_the_bound() {
+        let inner: BoxStream<'static, crate::Result<ReceivedToken>> =
+            stream::iter(vec![Ok(token()), Ok(token()), Ok(token())]).boxed();
+        let mut s = RoundTripTimeout::new(Some(Duration::from_secs(30)), None, inner);
+
+        let mut count = 0;
+        while let Some(item) = s.next().await {
+            item.expect("responsive reads must not error");
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn none_timeout_never_injects_a_deadline() {
+        // A permanently pending inner stream with no bound must stay pending —
+        // the outer guard elapsing proves no internal timeout fired.
+        let inner: BoxStream<'static, crate::Result<ReceivedToken>> = stream::pending().boxed();
+        let mut s = RoundTripTimeout::new(None, None, inner);
+
+        let outcome = tokio::time::timeout(Duration::from_millis(100), s.next()).await;
+        assert!(
+            outcome.is_err(),
+            "with no bound the stream must keep waiting, not time out"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_consumer_does_not_trip_the_timeout() {
+        // The server answers each round-trip with a genuine `Pending` gap that
+        // stays *under* the bound (so the timer really is armed and reset on
+        // each delivery), but the consumer then idles far *longer* than the
+        // bound between pulls. Because the timer only runs while a read is in
+        // flight — never between the consumer's polls — this must NOT time out,
+        // proving the bound measures server latency, not consumer pace. Using a
+        // real slow server (not an always-ready `stream::iter`) means the
+        // `Pending`/timer arm is actually exercised, so the test would fail if
+        // the timer wrongly counted consumer idle time.
+        let mut s = RoundTripTimeout::new(
+            Some(Duration::from_millis(100)),
+            None,
+            slow_server(Duration::from_millis(30), 3),
+        );
+
+        for _ in 0..3 {
+            s.next()
+                .await
+                .expect("item expected")
+                .expect("a responsive server must not time out");
+            // Idle far longer than the 100ms bound between consuming items.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(s.next().await.is_none(), "stream should end cleanly");
+    }
+
+    // An inner stream whose every item is delivered only after a genuine
+    // `Pending` gap of `gap`, driven by a real timer. Unlike `stream::iter`
+    // (always immediately `Ready`), this forces `RoundTripTimeout` down its
+    // `Pending` arm on every round-trip, so the lazy-create / reset-on-delivery
+    // logic is actually exercised.
+    fn slow_server(
+        gap: Duration,
+        count: usize,
+    ) -> BoxStream<'static, crate::Result<ReceivedToken>> {
+        stream::unfold(0usize, move |i| async move {
+            if i >= count {
+                return None;
+            }
+            tokio::time::sleep(gap).await;
+            Some((Ok(token()), i + 1))
+        })
+        .boxed()
+    }
+
+    #[tokio::test]
+    async fn bounds_each_round_trip_not_total_enumeration() {
+        // Five genuine round-trips, each 50ms (well under the 200ms bound), for a
+        // total enumeration of ~250ms — longer than the bound. A correct
+        // per-round-trip timer resets on each delivery and never trips; a broken
+        // one that measured total stream lifetime (delay created once, never
+        // reset) would fire partway through. All five tokens must arrive.
+        let mut s = RoundTripTimeout::new(
+            Some(Duration::from_millis(200)),
+            None,
+            slow_server(Duration::from_millis(50), 5),
+        );
+
+        let mut count = 0;
+        while let Some(item) = s.next().await {
+            item.expect("no round-trip exceeds the bound, so none must time out");
+            count += 1;
+        }
+        assert_eq!(count, 5, "all tokens must be delivered across genuine gaps");
+    }
+
+    #[tokio::test]
+    async fn deadline_resets_after_delivery_then_a_later_stall_trips() {
+        // One token arrives after a short gap (under the bound), then the server
+        // goes silent forever. The first item must be delivered (proving the
+        // pre-stall token survives), and the *next* poll must arm a fresh timer
+        // and trip (proving the deadline re-arms after a delivery rather than
+        // being consumed once).
+        let inner = stream::unfold(0usize, |i| async move {
+            match i {
+                0 => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Some((Ok(token()), 1usize))
+                }
+                _ => std::future::pending().await,
+            }
+        })
+        .boxed();
+        let mut s = RoundTripTimeout::new(Some(Duration::from_millis(80)), None, inner);
+
+        s.next()
+            .await
+            .expect("first token expected")
+            .expect("the first round-trip is under the bound and must not time out");
+
+        let err = s
+            .next()
+            .await
+            .expect("a second item (the timeout error) is expected")
+            .expect_err("the second, stalled round-trip must trip the re-armed deadline");
+        assert!(is_timed_out(&err), "expected TimedOut, got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn poison_flag_is_flipped_when_the_deadline_fires() {
+        // The shared poison handle must be set when the timer fires, so the
+        // owning connection can reject reuse.
+        let poison = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inner: BoxStream<'static, crate::Result<ReceivedToken>> = stream::pending().boxed();
+        let mut s =
+            RoundTripTimeout::new(Some(Duration::from_millis(50)), Some(poison.clone()), inner);
+
+        assert!(!poison.load(std::sync::atomic::Ordering::Acquire));
+        let err = s
+            .next()
+            .await
+            .expect("a timeout error is expected")
+            .expect_err("a stalled server must produce an error");
+        assert!(is_timed_out(&err));
+        assert!(
+            poison.load(std::sync::atomic::Ordering::Acquire),
+            "the poison flag must be set when the command timeout fires"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_duration_trips_on_the_first_stall() {
+        // A zero-duration bound is a degenerate but valid setting: the first time
+        // the server is not immediately ready, the deadline is already elapsed,
+        // so the read fails fast rather than hanging.
+        let inner: BoxStream<'static, crate::Result<ReceivedToken>> = stream::pending().boxed();
+        let mut s = RoundTripTimeout::new(Some(Duration::ZERO), None, inner);
+
+        let err = s
+            .next()
+            .await
+            .expect("a timeout error is expected")
+            .expect_err("a zero bound must trip on the first stall");
+        assert!(is_timed_out(&err), "expected TimedOut, got: {err:?}");
     }
 }

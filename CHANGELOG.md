@@ -25,6 +25,28 @@
   that pattern-matched it and read the token via `Deref`/`Display` must now call
   `secrecy::ExposeSecret::expose_secret`. Constructing auth via
   `AuthMethod::aad_token`/`sql_server`/`windows` is unchanged.
+- feat: connection & command timeouts (closes #375 and #360), matching
+  ADO.NET's two-knob model and backed by a runtime-agnostic timer so they apply
+  under any async runtime:
+  - `Config::handshake_timeout` bounds the whole post-TCP handshake (prelogin,
+    TLS negotiation and login), surfacing a `TimedOut` error instead of hanging
+    forever when a server accepts the TCP connection and then stalls
+    mid-handshake — the reported failure against `azure-sql-edge` on macOS
+    (#375) and the stalled-peer case in #360. Defaults to 15s (ADO.NET
+    `Connect Timeout` parity). The handshake also emits per-stage `tracing`
+    DEBUG events so a stall can be pinpointed.
+  - `Config::command_timeout` bounds each server round-trip while reading
+    command results (`query`/`execute`/`simple_query`, the `bulk_insert`
+    acknowledgement and `column_metadata`). It measures per-round-trip stall,
+    not total enumeration: the deadline resets on every delivered token, so a
+    slow consumer never trips it — only a stalled server does. Defaults to 30s
+    (ADO.NET `Command Timeout` parity).
+  - BREAKING: both knobs now default to a bounded value (15s handshake / 30s
+    command) where pre-0.13 they were effectively unbounded. A command that
+    legitimately runs longer than 30s between server round-trips (e.g. a long
+    `WAITFOR`, a big sort/aggregate or a slow stored procedure) will now fail
+    with a `TimedOut` error unless you raise or disable `command_timeout`. Pass
+    `None` to either knob to restore the pre-0.13 wait-indefinitely behaviour.
 - chore: upgraded the rustls stack to 0.23 (tokio-rustls 0.26) and resolved the
   associated advisories.
 - fix: numerous decode-path hardening fixes (protocol errors instead of panics

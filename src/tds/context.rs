@@ -1,6 +1,7 @@
 use super::codec::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Context, that might be required to make sure we understand and are understood by the server
 #[derive(Debug)]
@@ -14,6 +15,11 @@ pub(crate) struct Context {
     /// COMPUTE clause id that the matching `ALTROW` rows refer back to.
     alt_metas: HashMap<u16, Arc<TokenAltMetaData<'static>>>,
     spn: Option<String>,
+    /// Per-response deadline for reading command results, propagated from
+    /// [`Config::command_timeout`](crate::Config::command_timeout) at connect
+    /// time. `None` means unbounded. Read by the token stream to bound each
+    /// server round-trip (see `TokenStream::try_unfold`).
+    command_timeout: Option<Duration>,
 }
 
 impl Context {
@@ -34,6 +40,7 @@ impl Context {
             last_meta: None,
             alt_metas: HashMap::new(),
             spn: None,
+            command_timeout: None,
         }
     }
 
@@ -68,6 +75,20 @@ impl Context {
 
     pub fn set_packet_size(&mut self, new_size: u32) {
         self.packet_size = new_size;
+    }
+
+    /// The per-response command timeout, if any. See
+    /// [`Config::command_timeout`](crate::Config::command_timeout).
+    pub(crate) fn command_timeout(&self) -> Option<Duration> {
+        self.command_timeout
+    }
+
+    /// Records the per-response command timeout negotiated from the [`Config`]
+    /// at connect time.
+    ///
+    /// [`Config`]: crate::Config
+    pub(crate) fn set_command_timeout(&mut self, timeout: Option<Duration>) {
+        self.command_timeout = timeout;
     }
 
     pub fn transaction_descriptor(&self) -> [u8; 8] {
@@ -135,6 +156,18 @@ mod tests {
         let mut ctx = Context::new();
         ctx.set_packet_size(8192);
         assert_eq!(ctx.packet_size(), 8192);
+    }
+
+    #[test]
+    fn command_timeout_defaults_to_none_and_roundtrips() {
+        let mut ctx = Context::new();
+        assert_eq!(ctx.command_timeout(), None);
+
+        ctx.set_command_timeout(Some(Duration::from_secs(5)));
+        assert_eq!(ctx.command_timeout(), Some(Duration::from_secs(5)));
+
+        ctx.set_command_timeout(None);
+        assert_eq!(ctx.command_timeout(), None);
     }
 
     #[test]

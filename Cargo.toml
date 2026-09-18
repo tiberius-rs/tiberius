@@ -99,6 +99,13 @@ version = "0.3"
 default-features = false
 features = ["io", "sink"]
 
+# Runtime-agnostic timer used to bound the connection handshake (see
+# `Config::handshake_timeout`). Its `Delay` future works under any executor, so
+# the generic, runtime-agnostic `Connection::connect` path can enforce a timeout
+# without depending on tokio/smol timers.
+[dependencies.futures-timer]
+version = "3"
+
 [dependencies.tracing]
 features = ["log"]
 version = "0.1"

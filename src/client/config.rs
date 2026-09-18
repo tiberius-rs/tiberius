@@ -3,6 +3,20 @@ mod jdbc;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Default upper bound on how long the connection handshake (TDS prelogin, TLS
+/// negotiation and login) may take before [`Connection::connect`] gives up with
+/// a timeout error. Matches the 15-second `Connect Timeout` default used by
+/// ADO.NET / the Microsoft SQL Server drivers.
+///
+/// [`Connection::connect`]: crate::Client::connect
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Default per-response deadline applied while reading command results (see
+/// [`Config::command_timeout`]). Matches the 30-second `Command Timeout` /
+/// `CommandTimeout` default used by ADO.NET / the Microsoft SQL Server drivers.
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 use super::AuthMethod;
 use crate::EncryptionLevel;
@@ -45,6 +59,8 @@ pub struct Config {
     pub(crate) hostname_in_certificate: Option<String>,
     pub(crate) client_name: Option<String>,
     pub(crate) multi_subnet_failover: bool,
+    pub(crate) handshake_timeout: Option<Duration>,
+    pub(crate) command_timeout: Option<Duration>,
     #[cfg(any(
         feature = "rustls",
         feature = "native-tls",
@@ -136,6 +152,8 @@ impl Default for Config {
             hostname_in_certificate: None,
             client_name: None,
             multi_subnet_failover: false,
+            handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
+            command_timeout: Some(DEFAULT_COMMAND_TIMEOUT),
             #[cfg(any(
                 feature = "rustls",
                 feature = "native-tls",
@@ -341,6 +359,106 @@ impl Config {
     /// Returns whether multi-subnet failover is enabled.
     pub fn get_multi_subnet_failover(&self) -> bool {
         self.multi_subnet_failover
+    }
+
+    /// Sets an upper bound on how long the connection handshake may take.
+    ///
+    /// The handshake covers everything [`Client::connect`] does after it is
+    /// handed a connected TCP stream: the TDS prelogin exchange, the TLS
+    /// negotiation and the login. If the server accepts the TCP connection but
+    /// then stops responding mid-handshake — as observed against
+    /// `azure-sql-edge` on macOS, where the TLS handshake can stall
+    /// indefinitely — the connect future would otherwise hang
+    /// forever with no error. This bound makes such a stall surface as a
+    /// [`Error::Io`] with [`std::io::ErrorKind::TimedOut`] instead.
+    ///
+    /// The timer is runtime-agnostic (it does not depend on tokio or smol), so
+    /// it applies regardless of the async runtime driving the connection. Note
+    /// that it does **not** cover establishing the TCP connection itself, which
+    /// happens before the stream is passed to [`Client::connect`]; bound that
+    /// with your runtime's own connect timeout (e.g. `tokio::time::timeout`).
+    ///
+    /// Enable `tracing` at the `DEBUG` level to see which handshake stage was
+    /// reached, which pinpoints where a stall occurred.
+    ///
+    /// - Defaults to 15 seconds, matching ADO.NET's `Connect Timeout`. Pass
+    ///   `None` to wait indefinitely (the pre-0.13 behaviour). A zero duration
+    ///   is a degenerate bound that fails as soon as the handshake would block.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tiberius::Config;
+    /// # use std::time::Duration;
+    /// let mut config = Config::new();
+    /// // Fail fast if the handshake stalls.
+    /// config.handshake_timeout(Some(Duration::from_secs(5)));
+    /// ```
+    ///
+    /// [`Client::connect`]: crate::Client::connect
+    /// [`Error::Io`]: crate::error::Error::Io
+    pub fn handshake_timeout(&mut self, timeout: Option<Duration>) {
+        self.handshake_timeout = timeout;
+    }
+
+    /// Returns the configured connection-handshake timeout, if any.
+    ///
+    /// See [`handshake_timeout`](Config::handshake_timeout).
+    pub fn get_handshake_timeout(&self) -> Option<Duration> {
+        self.handshake_timeout
+    }
+
+    /// Sets a per-response deadline applied while reading command results
+    /// (`query`, `execute`, `simple_query`, the `bulk_insert` server
+    /// acknowledgement and `column_metadata`).
+    ///
+    /// # Semantics
+    ///
+    /// This bounds **each server round-trip**, not the total time to enumerate a
+    /// result stream. Query results are lazy, caller-driven streams: the timer
+    /// only runs while the client is actively waiting on the server for the next
+    /// chunk of the response, and it is **reset every time a token is
+    /// delivered**. A slow *consumer* (code that pauses between pulling rows)
+    /// therefore never trips it — only a stalled *server* does. Concretely, if
+    /// the gap between the client asking for more data and the server delivering
+    /// the next token exceeds the deadline, the stream yields an [`Error::Io`]
+    /// with [`std::io::ErrorKind::TimedOut`]. This covers both the
+    /// time-to-first-response and any mid-stream stall.
+    ///
+    /// The timer is runtime-agnostic (it does not depend on tokio or smol).
+    ///
+    /// Note: once a command times out, its connection is left mid-response and
+    /// out of sync with the server; drop the [`Client`] and open a new one (a
+    /// pool should discard the connection) rather than reuse it.
+    ///
+    /// - Defaults to 30 seconds, matching ADO.NET's `Command Timeout`. Pass
+    ///   `None` to wait indefinitely (the pre-0.13 behaviour). A zero duration
+    ///   is a degenerate bound that trips on the first server round-trip that
+    ///   is not answered immediately.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tiberius::Config;
+    /// # use std::time::Duration;
+    /// let mut config = Config::new();
+    /// // Fail a query if the server stops responding for 10s mid-result.
+    /// config.command_timeout(Some(Duration::from_secs(10)));
+    /// // Or wait forever (e.g. for a deliberately long-running batch):
+    /// config.command_timeout(None);
+    /// ```
+    ///
+    /// [`Client`]: crate::Client
+    /// [`Error::Io`]: crate::error::Error::Io
+    pub fn command_timeout(&mut self, timeout: Option<Duration>) {
+        self.command_timeout = timeout;
+    }
+
+    /// Returns the configured per-response command timeout, if any.
+    ///
+    /// See [`command_timeout`](Config::command_timeout).
+    pub fn get_command_timeout(&self) -> Option<Duration> {
+        self.command_timeout
     }
 
     /// Supplies a client certificate and private key used to authenticate the
@@ -748,6 +866,28 @@ impl ConfigBuilder {
         self
     }
 
+    /// Sets an upper bound on how long the connection handshake may take.
+    ///
+    /// See [`Config::handshake_timeout`] for details. Pass `None` to wait
+    /// indefinitely.
+    ///
+    /// - Defaults to 15 seconds.
+    pub fn handshake_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.inner.handshake_timeout = timeout;
+        self
+    }
+
+    /// Sets a per-response deadline applied while reading command results.
+    ///
+    /// See [`Config::command_timeout`] for the exact (per-round-trip)
+    /// semantics. Pass `None` to wait indefinitely.
+    ///
+    /// - Defaults to 30 seconds.
+    pub fn command_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.inner.command_timeout = timeout;
+        self
+    }
+
     /// Supplies a client certificate and private key for mutual TLS.
     ///
     /// See [`Config::client_certificate`] for details and backend support.
@@ -1089,6 +1229,103 @@ mod tests {
         let config: Config = Config::builder().host("db.internal").port(2020).into();
         assert_eq!("db.internal", config.get_host());
         assert_eq!(2020, config.get_port());
+    }
+
+    #[test]
+    fn handshake_timeout_defaults_to_fifteen_seconds() {
+        // A sensible, ADO.NET-matching default so a stalled handshake surfaces
+        // an error instead of hanging forever.
+        let config = Config::new();
+        assert_eq!(
+            config.get_handshake_timeout(),
+            Some(Duration::from_secs(15))
+        );
+    }
+
+    #[test]
+    fn handshake_timeout_setter_roundtrips() {
+        // Table-driven over the values a caller can set, including opting out.
+        let cases = [
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_secs(30)),
+            None,
+        ];
+        for want in cases {
+            let mut config = Config::new();
+            config.handshake_timeout(want);
+            assert_eq!(config.get_handshake_timeout(), want, "for {want:?}");
+        }
+    }
+
+    #[test]
+    fn config_builder_sets_handshake_timeout() {
+        let config = Config::builder()
+            .handshake_timeout(Some(Duration::from_secs(3)))
+            .build();
+        assert_eq!(config.get_handshake_timeout(), Some(Duration::from_secs(3)));
+
+        // And can disable it.
+        let config = Config::builder().handshake_timeout(None).build();
+        assert_eq!(config.get_handshake_timeout(), None);
+    }
+
+    #[test]
+    fn config_builder_defaults_handshake_timeout() {
+        // The builder starts from `Config::default()`, so it inherits the bound.
+        let config = Config::builder().build();
+        assert_eq!(
+            config.get_handshake_timeout(),
+            Some(Duration::from_secs(15))
+        );
+    }
+
+    #[test]
+    fn command_timeout_defaults_to_thirty_seconds() {
+        // ADO.NET-matching default so a mid-result server stall surfaces an
+        // error instead of hanging forever.
+        let config = Config::new();
+        assert_eq!(config.get_command_timeout(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn command_timeout_setter_roundtrips() {
+        let cases = [
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_secs(60)),
+            None,
+        ];
+        for want in cases {
+            let mut config = Config::new();
+            config.command_timeout(want);
+            assert_eq!(config.get_command_timeout(), want, "for {want:?}");
+        }
+    }
+
+    #[test]
+    fn config_builder_sets_command_timeout() {
+        let config = Config::builder()
+            .command_timeout(Some(Duration::from_secs(7)))
+            .build();
+        assert_eq!(config.get_command_timeout(), Some(Duration::from_secs(7)));
+
+        let config = Config::builder().command_timeout(None).build();
+        assert_eq!(config.get_command_timeout(), None);
+    }
+
+    #[test]
+    fn config_builder_defaults_command_timeout() {
+        let config = Config::builder().build();
+        assert_eq!(config.get_command_timeout(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn timeouts_are_independent() {
+        // The two knobs must not alias one another.
+        let mut config = Config::new();
+        config.handshake_timeout(Some(Duration::from_secs(1)));
+        config.command_timeout(Some(Duration::from_secs(2)));
+        assert_eq!(config.get_handshake_timeout(), Some(Duration::from_secs(1)));
+        assert_eq!(config.get_command_timeout(), Some(Duration::from_secs(2)));
     }
 
     #[test]

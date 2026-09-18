@@ -40,6 +40,8 @@ use sspi::{
 };
 #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::{cmp, fmt::Debug, io, pin::Pin, task};
 use task::Poll;
 use tracing::{event, Level};
@@ -71,6 +73,16 @@ where
     /// the same connection fails cleanly instead of appending a second message
     /// after a half-sent one and silently desyncing the server.
     poisoned: bool,
+    /// Set when a `command_timeout` fires mid-response. The tail of the
+    /// timed-out response is then still unread on the wire, so the connection is
+    /// out of sync with the server and must not be reused. This handle is shared
+    /// with the token stream's `RoundTripTimeout`, which flips it when its
+    /// deadline elapses; [`ensure_not_poisoned`] rejects every subsequent use so
+    /// a pool discards the connection instead of hanging in `flush_stream` on
+    /// the still-pending previous response.
+    ///
+    /// [`ensure_not_poisoned`]: Self::ensure_not_poisoned
+    command_desync: Arc<AtomicBool>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Debug for Connection<S> {
@@ -85,11 +97,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Debug for Connection<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
-    /// Creates a new connection
+    /// Creates a new connection.
     ///
     /// Note: `tcp_stream` is a connected stream, so some parts of the
     /// [`Config`] need to be handled outside of this method.
+    ///
+    /// The handshake performed here (prelogin, TLS negotiation and login) is
+    /// bounded by [`Config::handshake_timeout`]: if the server accepts the TCP
+    /// connection but then stalls mid-handshake — the failure mode seen with
+    /// `azure-sql-edge` on macOS, where the TLS handshake never
+    /// completes — the connect future fails with a [`std::io::ErrorKind::TimedOut`]
+    /// error instead of hanging forever. Enable `tracing` at `DEBUG` to see
+    /// which stage was last reached.
     pub(crate) async fn connect(config: Config, tcp_stream: S) -> crate::Result<Connection<S>> {
+        let handshake_timeout = config.handshake_timeout;
+        with_optional_timeout(handshake_timeout, Self::establish(config, tcp_stream)).await
+    }
+
+    /// Performs the full connection handshake (prelogin, TLS negotiation and
+    /// login) over an already-connected `tcp_stream`.
+    ///
+    /// Split out from [`connect`](Self::connect) so the whole handshake can be
+    /// wrapped in a single [`Config::handshake_timeout`] bound; on its own it
+    /// runs unbounded and would block forever if the server stalls.
+    async fn establish(config: Config, tcp_stream: S) -> crate::Result<Connection<S>> {
+        // Captured before `config` is consumed below and applied to the
+        // `Context` only *after* the handshake completes (see the end of this
+        // method). Arming it up front would also bound the login-ack/SSPI drain
+        // that runs through the same token stream (`flush_done`/`flush_sspi`)
+        // during connect, which is wrong: that whole handshake is governed by
+        // `handshake_timeout` alone, so `handshake_timeout(None)` must genuinely
+        // wait indefinitely regardless of `command_timeout`.
+        let command_timeout = config.command_timeout;
+
         let context = {
             let mut context = Context::new();
             context.set_spn(config.get_host(), config.get_port());
@@ -132,10 +172,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             flushed: false,
             buf: BytesMut::new(),
             poisoned: false,
+            command_desync: Arc::new(AtomicBool::new(false)),
         };
 
         let fed_auth_required = matches!(config.auth, AuthMethod::AADToken(_));
 
+        event!(Level::DEBUG, "Handshake stage: sending TDS prelogin");
         let prelogin = connection
             .prelogin(
                 config.encryption,
@@ -145,9 +187,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             .await?;
 
         let encryption = prelogin.negotiated_encryption(config.encryption)?;
+        event!(
+            Level::DEBUG,
+            "Handshake stage: prelogin complete, negotiated encryption = {:?}",
+            encryption
+        );
 
         let connection = connection.tls_handshake(&config, encryption).await?;
 
+        event!(Level::DEBUG, "Handshake stage: sending login");
         let mut connection = connection
             .login(
                 config.auth,
@@ -163,6 +211,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             .await?;
 
         connection.flush_done().await?;
+        event!(Level::DEBUG, "Handshake stage: login complete");
+
+        // The handshake is done; arm the per-response command timeout now so it
+        // only ever bounds command result reads, never the handshake above.
+        connection
+            .context_mut()
+            .set_command_timeout(command_timeout);
 
         Ok(connection)
     }
@@ -265,7 +320,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                     .into(),
             ));
         }
+        if self.command_desync.load(Ordering::Acquire) {
+            return Err(crate::Error::Protocol(
+                "connection was left out of sync with the server by a command timeout (the previous response is only partly read) and can no longer be used; open a new connection"
+                    .into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// A handle to the command-timeout desync flag, shared with the token stream
+    /// so it can mark the connection unusable when a `command_timeout` fires
+    /// mid-response. See the `command_desync` field.
+    pub(crate) fn command_desync_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.command_desync)
     }
 
     /// Marks the connection poisoned for the duration of a multi-packet write.
@@ -803,7 +871,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 event!(Level::DEBUG, "Performing a TLS handshake");
 
                 let Self {
-                    transport, context, ..
+                    transport,
+                    context,
+                    command_desync,
+                    ..
                 } = self;
                 let mut stream = match transport.into_inner() {
                     MaybeTlsStream::Raw(tcp) => {
@@ -823,6 +894,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                     flushed: false,
                     buf: BytesMut::new(),
                     poisoned: false,
+                    command_desync,
                 })
             }
         }
@@ -868,6 +940,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             context: Context::new(),
             buf: BytesMut::new(),
             poisoned,
+            command_desync: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -890,6 +963,47 @@ fn check_tls_backend_available(encryption: EncryptionLevel) -> crate::Result<()>
     }
 
     Ok(())
+}
+
+/// Runs `fut` to completion, but fails with a clear [`crate::Error::Io`] of
+/// kind [`io::ErrorKind::TimedOut`] if it does not finish within `timeout`.
+///
+/// A `None` timeout runs the future unbounded (the pre-0.13 behaviour). The
+/// timer comes from `futures-timer`, whose `Delay` is runtime-agnostic, so this
+/// works under any executor driving the generic [`Connection::connect`] path —
+/// it does not assume tokio or smol. Used to bound the connection handshake so
+/// a server that accepts the TCP connection and then stalls yields
+/// a diagnosable error instead of an indefinite hang.
+async fn with_optional_timeout<F, T>(
+    timeout: Option<std::time::Duration>,
+    fut: F,
+) -> crate::Result<T>
+where
+    F: std::future::Future<Output = crate::Result<T>>,
+{
+    match timeout {
+        None => fut.await,
+        Some(timeout) => {
+            // `pin!` makes the future `Unpin` so `select` can take it by value;
+            // `Delay` is already `Unpin`. Whichever finishes first wins the
+            // race and the loser is dropped.
+            let fut = std::pin::pin!(fut);
+            match futures_util::future::select(fut, futures_timer::Delay::new(timeout)).await {
+                futures_util::future::Either::Left((res, _)) => res,
+                futures_util::future::Either::Right(((), _)) => Err(crate::Error::Io {
+                    kind: io::ErrorKind::TimedOut,
+                    message: format!(
+                        "the connection handshake (prelogin, TLS negotiation and login) did not \
+                         complete within {timeout:?}; the server accepted the TCP connection but \
+                         did not finish the handshake in time (it may have stalled, or be \
+                         responding too slowly for the configured bound). Enable `tracing` at \
+                         DEBUG to see which stage was last reached, or change the bound with \
+                         `Config::handshake_timeout`."
+                    ),
+                }),
+            }
+        }
+    }
 }
 
 /// Frame a login message into one or more login packets, each no larger than
@@ -1352,5 +1466,279 @@ mod poison_tests {
             "a failed bulk write must poison the connection"
         );
         assert!(is_poison_error(&conn.ensure_not_poisoned().unwrap_err()));
+    }
+}
+
+// Server-free tests for the handshake timeout helper (`with_optional_timeout`)
+// and its wiring into `Connection::connect`. A future that never completes must
+// surface a `TimedOut` error rather than hang, a `None` bound must run
+// unbounded, and inner results (both `Ok` and `Err`) must pass through
+// untouched when the future wins the race.
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::future;
+    use std::pin::Pin;
+    use std::time::{Duration, Instant};
+
+    fn is_timed_out(err: &crate::Error) -> bool {
+        matches!(
+            err,
+            crate::Error::Io {
+                kind: io::ErrorKind::TimedOut,
+                ..
+            }
+        )
+    }
+
+    #[tokio::test]
+    async fn none_timeout_runs_unbounded_and_returns_inner_ok() {
+        let out: crate::Result<u8> =
+            with_optional_timeout(None, async { Ok::<_, crate::Error>(7u8) }).await;
+        assert_eq!(out.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn future_completing_before_bound_returns_its_ok() {
+        let out: crate::Result<&str> =
+            with_optional_timeout(Some(Duration::from_secs(30)), async {
+                Ok::<_, crate::Error>("done")
+            })
+            .await;
+        assert_eq!(out.unwrap(), "done");
+    }
+
+    #[tokio::test]
+    async fn future_completing_before_bound_propagates_its_err() {
+        // A fast inner error must be surfaced as-is, not masked as a timeout.
+        let out: crate::Result<()> = with_optional_timeout(Some(Duration::from_secs(30)), async {
+            Err::<(), _>(crate::Error::Protocol("boom".into()))
+        })
+        .await;
+        let err = out.unwrap_err();
+        assert!(
+            !is_timed_out(&err),
+            "fast inner error must not be a timeout"
+        );
+        assert!(matches!(err, crate::Error::Protocol(msg) if msg == "boom"));
+    }
+
+    #[tokio::test]
+    async fn stalled_future_times_out_with_diagnosable_error() {
+        let started = Instant::now();
+        // A future that never resolves models a server that accepts the TCP
+        // connection and then stops responding mid-handshake.
+        let never = future::pending::<crate::Result<()>>();
+        let out = with_optional_timeout(Some(Duration::from_millis(50)), never).await;
+
+        let err = out.expect_err("a stalled handshake must not hang; it must error");
+        assert!(
+            is_timed_out(&err),
+            "expected a TimedOut error, got: {err:?}"
+        );
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not complete") && msg.contains("handshake"),
+            "timeout error should explain the stalled handshake, got: {msg}"
+        );
+        // The bound is honoured: returns promptly rather than blocking.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout should fire promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // A stream that accepts (swallows) every write but never yields any bytes on
+    // read, modelling a server that completes the TCP connection and then goes
+    // silent during the prelogin/TLS handshake.
+    struct SilentServer;
+
+    impl AsyncRead for SilentServer {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut task::Context<'_>,
+            _: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            // Never ready: the read half hangs forever. The handshake timeout,
+            // not this stream, is what must unblock the connect future.
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for SilentServer {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_times_out_when_server_stalls_after_tcp() {
+        // Full `Connection::connect` wiring: the prelogin is written (swallowed)
+        // and then the response read hangs. With a short handshake timeout the
+        // connect must return a TimedOut error instead of blocking forever.
+        let mut config = Config::new();
+        config.host("stalled.example");
+        config.handshake_timeout(Some(Duration::from_millis(100)));
+
+        let started = Instant::now();
+        let err = Connection::connect(config, SilentServer)
+            .await
+            .expect_err("a server that stalls after TCP connect must not hang connect");
+
+        assert!(
+            is_timed_out(&err),
+            "expected a TimedOut error, got: {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "connect should give up promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // The same stalled-peer
+    // scenario, pinned to `EncryptionLevel::NotSupported` so the prelogin read
+    // (not a TLS handshake) is what stalls, and a companion test proving that
+    // with the bound disabled the connect keeps waiting.
+    #[tokio::test]
+    async fn connect_honors_handshake_timeout_without_tls() {
+        let mut config = Config::new();
+        config.host("stalled.example");
+        config.encryption(EncryptionLevel::NotSupported);
+        config.handshake_timeout(Some(Duration::from_millis(50)));
+
+        let started = Instant::now();
+        let err = Connection::connect(config, SilentServer)
+            .await
+            .expect_err("a stalled handshake must fail rather than hang");
+
+        assert!(is_timed_out(&err), "expected TimedOut, got: {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "connect must fail promptly under the configured timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_without_handshake_timeout_does_not_time_out() {
+        // With the bound disabled the connect future keeps waiting on the
+        // stalled read; the outer guard elapsing proves no internal timeout
+        // fired.
+        let mut config = Config::new();
+        config.host("stalled.example");
+        config.encryption(EncryptionLevel::NotSupported);
+        config.handshake_timeout(None);
+        assert_eq!(config.get_handshake_timeout(), None);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            Connection::connect(config, SilentServer),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "connect without a handshake timeout should keep waiting on the stalled stream"
+        );
+    }
+
+    // Serves a canned prelogin response once, then parks every subsequent read
+    // forever — a server that completes the prelogin exchange and then stalls
+    // while the client waits for the login acknowledgement.
+    struct AnswerPreloginThenSilent {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl AsyncRead for AnswerPreloginThenSilent {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut task::Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pos >= self.data.len() {
+                return Poll::Pending;
+            }
+            let remaining = &self.data[self.pos..];
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.pos += n;
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    impl AsyncWrite for AnswerPreloginThenSilent {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Frame a payload as a single final (EndOfMessage) prelogin packet.
+    fn final_prelogin_packet() -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        PreloginMessage::new()
+            .encode(&mut payload)
+            .expect("prelogin encode");
+        let packet = Packet::new(PacketHeader::pre_login(1), payload);
+        let mut buf = BytesMut::new();
+        packet.encode(&mut buf).expect("packet encode");
+        buf.to_vec()
+    }
+
+    #[tokio::test]
+    async fn command_timeout_does_not_bound_the_connect_handshake() {
+        // `command_timeout` must NOT bound the
+        // login-ack drain that runs through the token stream during connect. The
+        // whole handshake is governed by `handshake_timeout` alone, so with
+        // `handshake_timeout(None)` a server that answers prelogin and then
+        // stalls at the login acknowledgement must be waited on indefinitely,
+        // even though a short `command_timeout` is configured. Before the fix
+        // the 50ms command timeout fired during `flush_done`, so connect would
+        // (wrongly) return within the 300ms guard.
+        let mut config = Config::new();
+        config.host("stalled.example");
+        config.encryption(EncryptionLevel::NotSupported);
+        config.handshake_timeout(None);
+        config.command_timeout(Some(Duration::from_millis(50)));
+
+        let server = AnswerPreloginThenSilent {
+            data: final_prelogin_packet(),
+            pos: 0,
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            Connection::connect(config, server),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "command_timeout must not cut off the connect handshake; connect returned {outcome:?}"
+        );
     }
 }
