@@ -14,6 +14,7 @@ pub use auth::*;
 pub use config::*;
 pub(crate) use connection::*;
 
+use crate::bulk_options::{ColumnOrderHint, SortOrder, SqlBulkCopyOption, SqlBulkCopyOptions};
 use crate::tds::codec::RpcValue;
 use crate::tds::stream::ReceivedToken;
 use crate::{
@@ -445,6 +446,86 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         table: &'a str,
         columns: &'a [&'a str],
     ) -> crate::Result<BulkLoadRequest<'a, S>> {
+        self.bulk_insert_with_options(table, columns, SqlBulkCopyOptions::empty(), &[])
+            .await
+    }
+
+    /// Execute a `BULK INSERT` statement like [`bulk_insert_columns`], with
+    /// additional control over the emitted `WITH (...)` clause.
+    ///
+    /// `options` is a set of [`SqlBulkCopyOption`] flags (combine them with `|`,
+    /// or pass [`SqlBulkCopyOptions::empty`] for none), and `order_hints`
+    /// declares the sort order the incoming rows are already in via an
+    /// `ORDER (...)` clause. Pass `&["*"]` as `columns` to target every column,
+    /// exactly like [`bulk_insert`] does internally.
+    ///
+    /// When `options` is empty and `order_hints` is empty this emits the exact
+    /// same statement as [`bulk_insert_columns`] (no `WITH` clause).
+    ///
+    /// # Security
+    ///
+    /// `table`, every entry of `columns`, and every order-hint column name are
+    /// interpolated **directly** into the SQL batches sent to the server (T-SQL
+    /// does not allow identifiers to be parameterized). The caller MUST pass
+    /// **trusted, hard-coded or otherwise validated** identifiers and MUST NOT
+    /// pass untrusted or user-supplied input. As cheap defense-in-depth this
+    /// method rejects obviously-malformed identifiers — NUL/ASCII control
+    /// characters, an unbalanced `]` bracket, a top-level space, statement-
+    /// breaking punctuation (`;`, quotes, `-`, etc.) and tokens spliced onto a
+    /// closing `]`/`)` — for the table, columns *and* order-hint columns, but
+    /// that guard is not a substitute for passing trusted input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `table`, a column, or an order-hint column is a
+    /// malformed identifier, if the column metadata query fails, or if the
+    /// server rejects the `INSERT BULK` statement. Row-level failures surface
+    /// later from [`send`] and [`finalize`] on the returned request.
+    ///
+    /// [`bulk_insert`]: #method.bulk_insert
+    /// [`bulk_insert_columns`]: #method.bulk_insert_columns
+    /// [`send`]: BulkLoadRequest::send
+    /// [`finalize`]: BulkLoadRequest::finalize
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use tiberius::{Config, IntoRow, SqlBulkCopyOption, SortOrder};
+    /// # use tokio_util::compat::TokioAsyncWriteCompatExt;
+    /// # use std::env;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let c_str = env::var("TIBERIUS_TEST_CONNECTION_STRING").unwrap_or(
+    /// #     "server=tcp:localhost,1433;integratedSecurity=true;TrustServerCertificate=true".to_owned(),
+    /// # );
+    /// # let config = Config::from_ado_string(&c_str)?;
+    /// # let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+    /// # tcp.set_nodelay(true)?;
+    /// # let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+    /// let mut req = client
+    ///     .bulk_insert_with_options(
+    ///         "##bulk_test",
+    ///         &["id", "val"],
+    ///         SqlBulkCopyOption::KeepIdentity | SqlBulkCopyOption::TableLock,
+    ///         &[("id", SortOrder::Ascending)],
+    ///     )
+    ///     .await?;
+    ///
+    /// for i in [0i32, 1i32, 2i32] {
+    ///     req.send((i, i).into_row()).await?;
+    /// }
+    ///
+    /// let res = req.finalize().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn bulk_insert_with_options<'a>(
+        &'a mut self,
+        table: &'a str,
+        columns: &'a [&'a str],
+        options: SqlBulkCopyOptions,
+        order_hints: &'a [ColumnOrderHint<'a>],
+    ) -> crate::Result<BulkLoadRequest<'a, S>> {
         // `table` is interpolated directly into the SQL batch (identifiers cannot
         // be parameterized in T-SQL). Reject obviously-malformed/dangerous input
         // as cheap defense-in-depth; see the `# Security` note above.
@@ -457,13 +538,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             validate_bulk_column_identifier(column)?;
         }
 
+        // Order-hint column names are interpolated into the `ORDER (...)` clause,
+        // so they get the exact same guard (and, below, the same bracket
+        // escaping) as the regular column list.
+        for &(column, _) in order_hints {
+            validate_bulk_column_identifier(column)?;
+        }
+
         // Retrieve column metadata from the server, keeping only the updateable
-        // columns as bulk targets (identity/computed columns are skipped).
+        // columns as bulk targets (read-only/computed columns are skipped).
+        //
+        // Identity columns are normally read-only (so filtered out, letting the
+        // server assign values), but `KEEP_IDENTITY` is implemented — exactly as
+        // ADO.NET's `SqlBulkCopy` does — by *including* the identity column in
+        // the bulk column list so the caller supplies explicit values; there is
+        // no `KEEP_IDENTITY` keyword in the `INSERT BULK` `WITH (...)` grammar.
+        // So when the flag is set, identity columns are additionally retained.
+        let keep_identity = options.contains(SqlBulkCopyOption::KeepIdentity);
         let mut columns: Vec<_> = self
             .column_metadata(table, columns)
             .await?
             .into_iter()
-            .filter(|column| column.base.is_updateable())
+            .filter(|column| bulk_column_is_target(&column.base, keep_identity))
             .collect();
 
         // `text`/`ntext`/`image` columns must carry the destination TableName in
@@ -477,7 +573,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         // now start bulk upload
         self.connection.flush_stream().await?;
         let col_data = columns.iter().map(|c| format!("{}", c)).join(", ");
-        let query = format!("INSERT BULK {} ({})", table, col_data);
+        let query = build_insert_bulk_sql(table, &col_data, options, order_hints);
 
         let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
         let id = self.connection.context_mut().next_packet_id();
@@ -832,6 +928,97 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     }
 }
 
+/// Build the `INSERT BULK <table> (<cols>) [WITH (...)]` statement text.
+///
+/// `col_data` is the already-formatted column list (each column bracket-quoted
+/// with its type, joined by `, `). Active [`SqlBulkCopyOptions`] flags and any
+/// `order_hints` are collected into a `WITH (...)` clause; when both are empty
+/// no `WITH` clause is emitted, so this reproduces the plain
+/// `INSERT BULK <table> (<cols>)` used by `bulk_insert_columns`.
+///
+/// Order-hint column names are interpolated verbatim as already-valid SQL
+/// identifiers — exactly like `table` and the `columns` entries elsewhere in
+/// this module — so a caller may pass a plain (`id`), bracket-quoted (`[id]`,
+/// `[my]]col]`) or multi-part name and get that same text back. Callers are
+/// expected to have run every identifier through [`validate_bulk_column_identifier`]
+/// first; do NOT re-bracket here, or an already-quoted name like `[id]` would be
+/// double-escaped into the wrong identifier `[[id]]]`.
+///
+/// Note there is deliberately no `KEEP_IDENTITY` keyword: the `INSERT BULK`
+/// `WITH (...)` grammar has no such option (unlike the textual `BULK INSERT`
+/// statement). [`SqlBulkCopyOption::KeepIdentity`] is honoured by the caller
+/// keeping the identity column in `col_data` instead.
+fn build_insert_bulk_sql(
+    table: &str,
+    col_data: &str,
+    options: SqlBulkCopyOptions,
+    order_hints: &[ColumnOrderHint<'_>],
+) -> String {
+    let mut clauses: Vec<String> = Vec::new();
+
+    // NB: `KeepIdentity` intentionally emits no keyword here — it is a
+    // column-inclusion concern handled in `bulk_insert_with_options`.
+    if options.contains(SqlBulkCopyOption::CheckConstraints) {
+        clauses.push("CHECK_CONSTRAINTS".to_owned());
+    }
+    if options.contains(SqlBulkCopyOption::TableLock) {
+        clauses.push("TABLOCK".to_owned());
+    }
+    if options.contains(SqlBulkCopyOption::KeepNulls) {
+        clauses.push("KEEP_NULLS".to_owned());
+    }
+    if options.contains(SqlBulkCopyOption::FireTriggers) {
+        clauses.push("FIRE_TRIGGERS".to_owned());
+    }
+
+    if !order_hints.is_empty() {
+        let hints = order_hints
+            .iter()
+            .map(|(col, order)| {
+                // Interpolate the (already-validated) identifier verbatim, like
+                // `table`/`columns`. Re-bracketing here would double-escape an
+                // already-quoted name (`[id]` -> `[[id]]]`).
+                format!(
+                    "{col} {}",
+                    match order {
+                        SortOrder::Ascending => "ASC",
+                        SortOrder::Descending => "DESC",
+                    }
+                )
+            })
+            .join(", ");
+
+        clauses.push(format!("ORDER({hints})"));
+    }
+
+    let mut query = format!("INSERT BULK {table} ({col_data})");
+
+    if !clauses.is_empty() {
+        query.push_str(" WITH (");
+        query.push_str(&clauses.join(", "));
+        query.push(')');
+    }
+
+    query
+}
+
+/// Decide whether a server-reported column is a bulk-insert target.
+///
+/// Read-only/computed columns are skipped so the server assigns their values.
+/// Identity columns are read-only by default (filtered out, letting the server
+/// assign them), but when [`SqlBulkCopyOption::KeepIdentity`] is set they are
+/// additionally retained so the caller can supply explicit values — matching
+/// ADO.NET's `SqlBulkCopy` (there is no `KEEP_IDENTITY` keyword in the
+/// `INSERT BULK` `WITH (...)` grammar). Factored out of
+/// [`Client::bulk_insert_with_options`] so this selection logic is unit-testable
+/// without a live server.
+fn bulk_column_is_target(
+    base: &crate::tds::codec::BaseMetaDataColumn,
+    keep_identity: bool,
+) -> bool {
+    base.is_updateable() || (keep_identity && base.is_identity())
+}
+
 /// Reject an obviously-malformed or dangerous bulk-insert table identifier.
 ///
 /// The `table` argument of [`Client::bulk_insert`] / [`Client::bulk_insert_columns`]
@@ -870,15 +1057,18 @@ fn validate_bulk_column_identifier(column: &str) -> crate::Result<()> {
 ///   identifiers/type names are allowed — `_`, `.` (multi-part names like
 ///   `dbo.MyType`), `@`/`#` (variable/temp-style names), `*` (a bulk column
 ///   list may be `*`), and `(`, `)`, `,` (parameterized types such as
-///   `decimal(10,2)` / `varchar(max)`). A space is allowed only *inside* those
-///   parens (e.g. `decimal(18, 4)`); a top-level space is rejected because it
-///   would let one identifier split into several SQL tokens. This rejects
-///   statement-breaking characters such as `;`, quotes and `-`, so a value like
-///   `1; DROP TABLE Users--` cannot slip through; and
+///   `decimal(10,2)` / `varchar(max)`). Parens must be balanced — an unbalanced
+///   `)` *or* an unclosed `(` is rejected — and both a space and a comma are allowed only *inside*
+///   those parens (e.g. `decimal(18, 4)`); a top-level space or comma is
+///   rejected because it would let one identifier split into several SQL tokens
+///   (a top-level comma would splice a verbatim order hint `a,b` into two
+///   columns). This rejects statement-breaking characters such as `;`, quotes
+///   and `-`, so a value like `1; DROP TABLE Users--` cannot slip through; and
 /// - **inside** a `[...]` bracket-quoted segment anything is allowed except an
 ///   unescaped `]` (per the T-SQL bracket-escaping rule a literal `]` must be
-///   doubled as `]]`). A `]` seen outside any bracket is unbalanced and
-///   rejected. A closing `]`, and a top-level closing `)`, are themselves SQL
+///   doubled as `]]`). The segment must be terminated — an unclosed `[` running
+///   to the end of the string is rejected. A `]` seen outside any bracket is
+///   unbalanced and rejected. A closing `]`, and a top-level closing `)`, are themselves SQL
 ///   token boundaries, so a segment may only be followed by `.` (the next part
 ///   of a multi-part name) or the end of the string — this stops delimiter-
 ///   adjacent splicing such as `[t]UNION(...)` or `foo(1)UNION(...)` that needs
@@ -939,7 +1129,17 @@ pub(crate) fn validate_sql_identifier(what: &str, ident: &str) -> crate::Result<
             }
             '(' => paren_depth += 1,
             ')' => {
-                paren_depth = paren_depth.saturating_sub(1);
+                // A `)` with no matching `(` is unbalanced. Left unchecked
+                // (`saturating_sub`) it would sail through and, interpolated
+                // verbatim, could close a caller-supplied enclosing paren early
+                // — e.g. an order hint `col)` desyncing `ORDER(col) ...)`. Reject
+                // it exactly like an unbalanced `]`.
+                if paren_depth == 0 {
+                    return Err(crate::Error::BulkInput(
+                        format!("{what} identifier contains an unbalanced `)`").into(),
+                    ));
+                }
+                paren_depth -= 1;
                 // A parameterized type ends at its closing paren; nothing is a
                 // legitimate continuation after a top-level `)`. Rejecting it
                 // stops `)`-delimited token splicing such as `foo(1)UNION(...)`
@@ -961,6 +1161,16 @@ pub(crate) fn validate_sql_identifier(what: &str, ident: &str) -> crate::Result<
                     format!("{what} identifier contains a disallowed character").into(),
                 ));
             }
+            // A comma is only legitimate inside a parameterized type's parens
+            // (`decimal(10,2)`). A *top-level* comma would splice a single
+            // identifier into two — e.g. a verbatim order hint `a,b` becoming
+            // two order columns `a` and `b` — so reject it like a top-level
+            // space.
+            ',' if paren_depth == 0 => {
+                return Err(crate::Error::BulkInput(
+                    format!("{what} identifier contains a disallowed character").into(),
+                ));
+            }
             // Outside a bracket-quoted segment only identifier-safe characters
             // are permitted (see the doc comment). Everything else — `;`,
             // quotes, `-`, etc. — is rejected.
@@ -974,12 +1184,206 @@ pub(crate) fn validate_sql_identifier(what: &str, ident: &str) -> crate::Result<
         }
     }
 
+    // Reject unbalanced *openers* left dangling at end of input, mirroring the
+    // rejection of unbalanced closers above. An unterminated `[` would quote and
+    // swallow whatever follows when interpolated (e.g. an order hint `[abc`
+    // becoming `ORDER([abc ASC))`); an unclosed `(` leaves an enclosing paren
+    // open. A legitimate identifier/type name never ends mid-bracket or with an
+    // open paren.
+    if in_bracket {
+        return Err(crate::Error::BulkInput(
+            format!("{what} identifier has an unterminated `[` bracket-quoted segment").into(),
+        ));
+    }
+    if paren_depth != 0 {
+        return Err(crate::Error::BulkInput(
+            format!("{what} identifier contains an unbalanced `(`").into(),
+        ));
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_bulk_column_identifier, validate_bulk_table_identifier};
+    use super::{
+        build_insert_bulk_sql, bulk_column_is_target, validate_bulk_column_identifier,
+        validate_bulk_table_identifier,
+    };
+    use crate::tds::codec::{BaseMetaDataColumn, ColumnFlag, TypeInfo, VarLenContext, VarLenType};
+    use crate::{SortOrder, SqlBulkCopyOption, SqlBulkCopyOptions};
+    use enumflags2::BitFlags;
+
+    // Build a `BaseMetaDataColumn` carrying exactly `flags`, so the bulk-target
+    // selection predicate can be exercised without a live server. The column
+    // type is irrelevant to the predicate; a small fixed-len type stands in.
+    fn base_with_flags(flags: BitFlags<ColumnFlag>) -> BaseMetaDataColumn {
+        BaseMetaDataColumn {
+            flags,
+            ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+            table_name: None,
+        }
+    }
+
+    #[test]
+    fn bulk_column_is_target_selects_writeable_and_keep_identity() {
+        let updateable: BitFlags<ColumnFlag> = ColumnFlag::Updateable.into();
+        let unknown: BitFlags<ColumnFlag> = ColumnFlag::UpdateableUnknown.into();
+        let read_only = BitFlags::<ColumnFlag>::empty();
+        let identity_ro: BitFlags<ColumnFlag> = ColumnFlag::Identity.into();
+        // An identity column SQL Server also reports as updateable-unknown.
+        let identity_unknown = ColumnFlag::Identity | ColumnFlag::UpdateableUnknown;
+
+        // Read/write and updateable-unknown columns are always targets,
+        // regardless of the KeepIdentity flag.
+        for keep in [false, true] {
+            assert!(bulk_column_is_target(&base_with_flags(updateable), keep));
+            assert!(bulk_column_is_target(&base_with_flags(unknown), keep));
+            // A plain read-only (non-identity) column is never a target.
+            assert!(!bulk_column_is_target(&base_with_flags(read_only), keep));
+        }
+
+        // A read-only identity column is skipped by default (server assigns the
+        // value) but retained when KeepIdentity is set.
+        assert!(!bulk_column_is_target(&base_with_flags(identity_ro), false));
+        assert!(bulk_column_is_target(&base_with_flags(identity_ro), true));
+
+        // KeepIdentity only *adds* identity columns; it never drops a column that
+        // was already a target on its own merits.
+        assert!(bulk_column_is_target(
+            &base_with_flags(identity_unknown),
+            false
+        ));
+        assert!(bulk_column_is_target(
+            &base_with_flags(identity_unknown),
+            true
+        ));
+
+        // A non-identity read-only column is not resurrected by KeepIdentity.
+        assert!(!bulk_column_is_target(&base_with_flags(read_only), true));
+    }
+
+    // A fixed, hand-written column list stands in for the server-provided
+    // `MetaDataColumn` Display output so the SQL-string builder can be unit
+    // tested without a live connection.
+    const COLS: &str = "[id] int, [val] int";
+
+    #[test]
+    fn build_sql_no_options_no_hints_emits_no_with_clause() {
+        // Empty options + empty hints must reproduce the plain statement that
+        // `bulk_insert_columns` has always emitted.
+        assert_eq!(
+            build_insert_bulk_sql("t", COLS, SqlBulkCopyOptions::empty(), &[]),
+            "INSERT BULK t ([id] int, [val] int)"
+        );
+    }
+
+    #[test]
+    fn build_sql_each_flag_emits_expected_keyword() {
+        // `KeepIdentity` is deliberately absent: the `INSERT BULK` `WITH (...)`
+        // grammar has no `KEEP_IDENTITY` keyword (it is a column-inclusion
+        // concern), so only these four flags map to keywords.
+        for (flag, keyword) in [
+            (SqlBulkCopyOption::CheckConstraints, "CHECK_CONSTRAINTS"),
+            (SqlBulkCopyOption::TableLock, "TABLOCK"),
+            (SqlBulkCopyOption::KeepNulls, "KEEP_NULLS"),
+            (SqlBulkCopyOption::FireTriggers, "FIRE_TRIGGERS"),
+        ] {
+            assert_eq!(
+                build_insert_bulk_sql("t", COLS, flag.into(), &[]),
+                format!("INSERT BULK t ([id] int, [val] int) WITH ({keyword})"),
+                "flag {flag:?} did not emit {keyword}",
+            );
+        }
+    }
+
+    #[test]
+    fn build_sql_keep_identity_emits_no_with_keyword() {
+        // Regression guard: emitting `KEEP_IDENTITY` into the `WITH (...)` clause
+        // is a syntax error against the TDS `INSERT BULK` statement (verified
+        // against ADO.NET's `SqlBulkCopy` and go-mssqldb, neither of which emits
+        // it). `KeepIdentity` alone must therefore produce no `WITH` clause at
+        // all; the flag's effect is entirely in column selection.
+        let sql = build_insert_bulk_sql("t", COLS, SqlBulkCopyOption::KeepIdentity.into(), &[]);
+        assert_eq!(sql, "INSERT BULK t ([id] int, [val] int)", "got: {sql}");
+        assert!(!sql.contains("KEEP_IDENTITY"), "got: {sql}");
+    }
+
+    #[test]
+    fn build_sql_combined_flags_join_in_fixed_order() {
+        // `KeepIdentity` contributes no keyword, so only TABLOCK/FIRE_TRIGGERS
+        // appear even though it is set.
+        let opts = SqlBulkCopyOption::KeepIdentity
+            | SqlBulkCopyOption::TableLock
+            | SqlBulkCopyOption::FireTriggers;
+
+        assert_eq!(
+            build_insert_bulk_sql("t", COLS, opts, &[]),
+            "INSERT BULK t ([id] int, [val] int) WITH (TABLOCK, FIRE_TRIGGERS)"
+        );
+    }
+
+    #[test]
+    fn build_sql_all_flags() {
+        // `all()` includes `KeepIdentity`, which emits nothing, so the keyword
+        // list is the four real `WITH` options.
+        let opts = SqlBulkCopyOptions::all();
+        assert_eq!(
+            build_insert_bulk_sql("t", COLS, opts, &[]),
+            "INSERT BULK t ([id] int, [val] int) WITH (CHECK_CONSTRAINTS, TABLOCK, KEEP_NULLS, FIRE_TRIGGERS)"
+        );
+    }
+
+    #[test]
+    fn build_sql_order_hints_asc_and_desc() {
+        // Plain column names are interpolated verbatim (like `columns`), not
+        // re-bracketed, and the reference `ORDER(` has no space.
+        let hints = [("id", SortOrder::Ascending), ("val", SortOrder::Descending)];
+        assert_eq!(
+            build_insert_bulk_sql("t", COLS, SqlBulkCopyOptions::empty(), &hints),
+            "INSERT BULK t ([id] int, [val] int) WITH (ORDER(id ASC, val DESC))"
+        );
+    }
+
+    #[test]
+    fn build_sql_options_and_order_hints_combine() {
+        let hints = [("id", SortOrder::Ascending)];
+        assert_eq!(
+            build_insert_bulk_sql("t", COLS, SqlBulkCopyOption::TableLock.into(), &hints),
+            "INSERT BULK t ([id] int, [val] int) WITH (TABLOCK, ORDER(id ASC))"
+        );
+    }
+
+    #[test]
+    fn build_sql_order_hint_bracketed_name_not_double_escaped() {
+        // Regression guard: order-hint column names are interpolated verbatim as
+        // already-valid identifiers, exactly like `table`/`columns`. An
+        // already-bracket-quoted name (which the validator accepts) must be
+        // emitted as-is — NOT re-bracketed into `[[id]]]` or `[[my]]]]col]]]`.
+        let hints = [
+            ("[id]", SortOrder::Ascending),
+            ("[my]]col]", SortOrder::Descending),
+        ];
+        assert_eq!(
+            build_insert_bulk_sql("t", COLS, SqlBulkCopyOptions::empty(), &hints),
+            "INSERT BULK t ([id] int, [val] int) WITH (ORDER([id] ASC, [my]]col] DESC))"
+        );
+    }
+
+    #[test]
+    fn build_sql_empty_hints_emits_no_order_clause() {
+        let sql = build_insert_bulk_sql("t", COLS, SqlBulkCopyOption::TableLock.into(), &[]);
+        assert!(!sql.contains("ORDER"), "got: {sql}");
+        assert_eq!(sql, "INSERT BULK t ([id] int, [val] int) WITH (TABLOCK)");
+    }
+
+    #[test]
+    fn build_sql_order_hint_column_names_are_validated_like_columns() {
+        // The public API runs order-hint column names through the same guard as
+        // the column list; confirm that guard rejects a stray `]`.
+        assert!(validate_bulk_column_identifier("my]col").is_err());
+        assert!(validate_bulk_column_identifier("[my]]col]").is_ok());
+    }
 
     #[test]
     fn accepts_normal_column_identifiers() {
@@ -1115,5 +1519,34 @@ mod tests {
         assert!(super::validate_sql_identifier("db_type", "decimal(18,4)").is_ok());
         assert!(super::validate_sql_identifier("db_type", "numeric(38, 38)").is_ok());
         assert!(super::validate_sql_identifier("db_type", "varchar(max)").is_ok());
+    }
+
+    #[test]
+    fn rejects_unbalanced_closing_paren_and_top_level_comma() {
+        // Order-hint columns are interpolated verbatim into `ORDER( ... )`, so a
+        // value the guard accepts must not be able to close that paren early or
+        // splice a second column. A lone trailing `)` (no matching `(`) used to
+        // slip through `saturating_sub`; a top-level comma used to be accepted
+        // for parameterized types. Both must now be rejected.
+        assert!(validate_bulk_column_identifier("col)").is_err());
+        assert!(validate_bulk_column_identifier(")").is_err());
+        assert!(validate_bulk_column_identifier("a,b").is_err());
+        assert!(validate_bulk_table_identifier("t)").is_err());
+        assert!(super::validate_sql_identifier("db_type", "decimal(10,2))").is_err());
+
+        // The symmetric openers must also be rejected: an unbalanced `(` never
+        // closed, and an unterminated `[` that would swallow trailing SQL when
+        // interpolated verbatim into `ORDER( ... )`.
+        assert!(validate_bulk_column_identifier("a(b").is_err());
+        assert!(validate_bulk_column_identifier("(").is_err());
+        assert!(validate_bulk_column_identifier("[abc").is_err());
+        assert!(validate_bulk_table_identifier("dbo.[my table").is_err());
+        assert!(super::validate_sql_identifier("db_type", "decimal(10,2").is_err());
+
+        // Balanced parens with an interior comma/space are still fine.
+        assert!(super::validate_sql_identifier("db_type", "decimal(10,2)").is_ok());
+        assert!(super::validate_sql_identifier("db_type", "numeric(18, 4)").is_ok());
+        // A bracket-quoted name may still contain `)`/`,` literally.
+        assert!(validate_bulk_column_identifier("[weird,name)]").is_ok());
     }
 }

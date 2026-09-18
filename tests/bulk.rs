@@ -593,3 +593,153 @@ where
 
     Ok(())
 }
+
+// Server-gated: `KeepIdentity` must let the caller supply explicit identity
+// values instead of the server auto-assigning them. It does so by keeping the
+// identity column in the bulk column list (there is no `KEEP_IDENTITY` keyword
+// in the `INSERT BULK` grammar); without the flag the identity column is
+// filtered out and the `id`s would be reassigned. Compiles locally; runs only
+// against a live server.
+#[test_on_runtimes]
+async fn bulk_insert_with_keep_identity_preserves_supplied_ids<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    use tiberius::{IntoRow, SqlBulkCopyOption};
+
+    let table = format!("##{}", random_table().await);
+
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (id INT IDENTITY PRIMARY KEY, val INT NOT NULL)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    let mut req = conn
+        .bulk_insert_with_options(
+            &table,
+            &["id", "val"],
+            SqlBulkCopyOption::KeepIdentity | SqlBulkCopyOption::TableLock,
+            &[],
+        )
+        .await?;
+
+    for (id, val) in [(100i32, 1i32), (200, 2), (300, 3)] {
+        req.send((id, val).into_row()).await?;
+    }
+    let res = req.finalize().await?;
+    assert_eq!(3, res.total());
+
+    // The explicit ids survived because the identity column was kept in the
+    // bulk column list.
+    let kept: i32 = conn
+        .query(
+            &format!("SELECT COUNT(*) FROM {} WHERE id IN (100, 200, 300)", table),
+            &[],
+        )
+        .await?
+        .into_row()
+        .await?
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(3, kept);
+
+    Ok(())
+}
+
+// Server-gated: an `ORDER (...)` hint plus `TABLOCK` must produce a statement
+// the server accepts, and all rows must land. Compiles locally; runs only
+// against a live server.
+#[test_on_runtimes]
+async fn bulk_insert_with_order_hints_inserts_all_rows<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    use tiberius::{SortOrder, SqlBulkCopyOption};
+
+    let table = format!("##{}", random_table().await);
+
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (id INT IDENTITY PRIMARY KEY, val INT NOT NULL)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    let mut req = conn
+        .bulk_insert_with_options(
+            &table,
+            &["val"],
+            SqlBulkCopyOption::TableLock.into(),
+            &[("val", SortOrder::Ascending)],
+        )
+        .await?;
+
+    for v in 0..10i32 {
+        let mut row = TokenRow::new();
+        row.push(v.into_sql());
+        req.send(row).await?;
+    }
+    let res = req.finalize().await?;
+    assert_eq!(10, res.total());
+
+    let count: i32 = conn
+        .query(&format!("SELECT COUNT(*) FROM {}", table), &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(10, count);
+
+    Ok(())
+}
+
+// Server-gated: empty options + empty order hints via the new API must behave
+// exactly like `bulk_insert_columns` (no `WITH` clause). Compiles locally; runs
+// only against a live server.
+#[test_on_runtimes]
+async fn bulk_insert_with_options_empty_matches_plain_path<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    use tiberius::SqlBulkCopyOptions;
+
+    let table = format!("##{}", random_table().await);
+
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (id INT IDENTITY PRIMARY KEY, val INT NOT NULL)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    let mut req = conn
+        .bulk_insert_with_options(&table, &["val"], SqlBulkCopyOptions::empty(), &[])
+        .await?;
+
+    for v in 0..5i32 {
+        let mut row = TokenRow::new();
+        row.push(v.into_sql());
+        req.send(row).await?;
+    }
+    let res = req.finalize().await?;
+    assert_eq!(5, res.total());
+
+    Ok(())
+}

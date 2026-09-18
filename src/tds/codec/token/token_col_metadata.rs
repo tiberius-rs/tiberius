@@ -661,6 +661,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn display_text_ntext_image_render_expected_type_names() {
+        // The LOB var-len types feed the bulk `INSERT` column list and must
+        // render their exact SQL type names (not a sized form), complementing
+        // the encode-path `TableName` tests above. Assert on a leading-space
+        // suffix so the column-name prefix quoting is irrelevant.
+        let cases = [
+            (VarLenType::Text, " text"),
+            (VarLenType::NText, " ntext"),
+            (VarLenType::Image, " image"),
+        ];
+
+        for (ty, expected_suffix) in cases {
+            let rendered = format!(
+                "{}",
+                meta(
+                    TypeInfo::VarLenSized(VarLenContext::new(ty, 2147483647, None)),
+                    "c",
+                )
+            );
+            assert!(
+                rendered.ends_with(expected_suffix),
+                "expected {rendered:?} to end with {expected_suffix:?}",
+            );
+        }
+    }
+
     fn column(name: &'static str) -> MetaDataColumn<'static> {
         MetaDataColumn {
             base: BaseMetaDataColumn {
