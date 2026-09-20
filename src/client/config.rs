@@ -1,4 +1,5 @@
 mod ado_net;
+mod ado_parser;
 mod jdbc;
 
 use std::collections::HashMap;
@@ -839,13 +840,18 @@ impl Config {
     /// |`WorkstationID`, `Workstation ID`|`<string>`|The client / workstation name reported to the server.|
     /// |`MultiSubnetFailover`|`true`,`false`,`yes`,`no`|When enabled, connections are attempted in parallel to all IP addresses the server resolves to, and the first to succeed is used.|
     ///
-    /// # Special characters in values
+    /// # Parsing model and special characters
     ///
-    /// Characters with a structural meaning in a connection string — `;`, `=`,
-    /// `{`, `'`, `"` and leading spaces — must be quoted when they appear in a
-    /// value such as a password. Wrap the value in single quotes, double
-    /// quotes, or braces (`{...}`), choosing a style the value does not itself
-    /// contain (braces carry both quote characters):
+    /// Pairs are separated by `;`, and each pair is split on its **first** `=`,
+    /// so a value may itself contain `=`: a base64 or otherwise generated
+    /// password with `=` padding (for example `password=Zm9vYmFy==`) parses
+    /// without any quoting.
+    ///
+    /// Characters that are still structural inside a *value* — `;`, a leading
+    /// `'`, `"` or `{`, and any leading or trailing spaces you want to keep —
+    /// must be quoted. Wrap the value in single quotes, double quotes, or braces
+    /// (`{...}`), choosing a style the value does not itself contain, and embed
+    /// the enclosing quote by doubling it (`"a""b"` → `a"b`):
     ///
     /// - `password='p@ss;word=42'`
     /// - `password="p@ss;word=42"`
@@ -853,10 +859,17 @@ impl Config {
     ///
     /// Do **not** URL-encode the value: `%24` is sent to the server literally,
     /// not decoded back to `$`, which is a common cause of login failures.
-    /// A bare `}` needs no quoting, but note that brace quoting cannot hold a
-    /// literal `}` (there is no `}}` doubling), so a value that must be quoted
-    /// *and* contains a `}` has to use single or double quotes. Only ASCII
-    /// values are accepted by the parser.
+    /// A bare `}` needs no quoting, but brace quoting cannot hold a literal `}`
+    /// (there is no `}}` doubling), so a value that must be quoted *and*
+    /// contains a `}` has to use single or double quotes. Only ASCII values are
+    /// accepted by the parser.
+    ///
+    /// tiberius parses a **superset** of ADO.NET's documented rules: the ADO.NET
+    /// semantics above, plus `{...}` brace quoting as an extension (braces are
+    /// not part of ADO.NET itself). One consequence of that extension: because a
+    /// value that *begins* with `{` is read as brace-quoted, a value whose
+    /// literal first character is `{` must instead be single- or double-quoted
+    /// (e.g. `password='{literal-braces}'`).
     ///
     /// For non-ASCII passwords, or to avoid escaping entirely, build the
     /// [`Config`] programmatically — the values are passed verbatim:
@@ -1253,6 +1266,13 @@ fn connection_string_error(
     // duplicate the prefix.
     let err = err.to_string();
     let detail = err.strip_prefix("Conversion error: ").unwrap_or(&err);
+    hinted_conversion_error(detail, quoting, docs)
+}
+
+/// Builds a `Conversion` error from a terse parser reason plus the shared
+/// quoting hint, so every connection-string failure points the caller at the
+/// escaping options and the programmatic `Config` API.
+fn hinted_conversion_error(detail: &str, quoting: &str, docs: &str) -> crate::Error {
     crate::Error::Conversion(
         format!(
             "{detail}. hint: if a value such as a password contains a special \

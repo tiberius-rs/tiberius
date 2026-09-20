@@ -2,16 +2,16 @@ use super::{ConfigString, ServerDefinition};
 use std::str::FromStr;
 
 pub(crate) struct AdoNetConfig {
-    dict: connection_string::AdoNetString,
+    dict: super::ado_parser::AdoNetString,
 }
 
 impl FromStr for AdoNetConfig {
     type Err = crate::error::Error;
 
     fn from_str(s: &str) -> crate::Result<Self> {
-        let dict = s.parse().map_err(|e| {
-            super::connection_string_error(
-                e,
+        let dict = super::ado_parser::parse(s).map_err(|reason| {
+            super::hinted_conversion_error(
+                reason,
                 "wrap the value in single quotes (e.g. `password='p@ss;word'`), \
                  double quotes, or braces (e.g. `password={p@ss;word}`), and \
                  quote leading spaces too",
@@ -24,7 +24,7 @@ impl FromStr for AdoNetConfig {
 
 impl ConfigString for AdoNetConfig {
     fn dict(&self) -> &std::collections::HashMap<String, String> {
-        &self.dict
+        self.dict.pairs()
     }
 
     fn server(&self) -> crate::Result<ServerDefinition> {
@@ -63,8 +63,9 @@ impl ConfigString for AdoNetConfig {
 
         match self
             .dict
+            .pairs()
             .get("server")
-            .or_else(|| self.dict.get("data source"))
+            .or_else(|| self.dict.pairs().get("data source"))
         {
             Some(value) if value.starts_with("tcp:") => {
                 parse_server(value[4..].split(',').collect())
@@ -511,13 +512,17 @@ mod tests {
 
     #[test]
     fn parsing_password_whitespace_quirks() -> crate::Result<()> {
-        // Trailing whitespace is always trimmed, even inside quotes.
+        // Quoting preserves surrounding whitespace (matching ADO.NET): both a
+        // leading and a trailing space inside quotes survive.
         let ado: AdoNetConfig = "User Id=sa;Password='a '".parse()?;
-        assert_eq!(AuthMethod::sql_server("sa", "a"), ado.authentication()?);
+        assert_eq!(AuthMethod::sql_server("sa", "a "), ado.authentication()?);
 
-        // Leading whitespace is preserved when the value is quoted.
         let ado: AdoNetConfig = "User Id=sa;Password=' a'".parse()?;
         assert_eq!(AuthMethod::sql_server("sa", " a"), ado.authentication()?);
+
+        // An unquoted value is trimmed on both sides.
+        let ado: AdoNetConfig = "User Id=sa;Password=  a  ".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", "a"), ado.authentication()?);
 
         // Internal tabs survive.
         let ado: AdoNetConfig = "User Id=sa;Password='a\tb'".parse()?;
@@ -528,11 +533,10 @@ mod tests {
 
     #[test]
     fn parsing_password_brace_cannot_hold_close_brace() -> crate::Result<()> {
-        // ADO.NET brace quoting has no `}}` doubling: the brace closes at the
-        // first `}`, so the `}` between `a` and `b` is consumed as the
-        // terminator and lost. This documents the limitation.
-        let ado: AdoNetConfig = "User Id=sa;Password={a}b}".parse()?;
-        assert_eq!(AuthMethod::sql_server("sa", "ab}"), ado.authentication()?);
+        // A `{…}` value closes at the first `}` and cannot contain one: any
+        // characters after that `}` are a syntax error rather than being
+        // silently folded into the value.
+        assert!("User Id=sa;Password={a}b}".parse::<AdoNetConfig>().is_err());
 
         // Use single or double quotes for passwords that contain `}`.
         let ado: AdoNetConfig = "User Id=sa;Password='a}b}'".parse()?;
@@ -549,6 +553,115 @@ mod tests {
         assert!("User Id=sa;Password='café'"
             .parse::<AdoNetConfig>()
             .is_err());
+    }
+
+    // Every printable-ASCII special character must be usable in a password
+    // through single quotes and through double quotes, round-tripping exactly.
+    // The enclosing quote is embedded by doubling it.
+    #[test]
+    fn parsing_password_every_special_char_via_quotes() -> crate::Result<()> {
+        const SPECIALS: &str = "!@#$%^&*()-_+=[]{}|\\:;\"'<>,.?/~` ";
+        for c in SPECIALS.chars() {
+            let expected = format!("Pa{c}ss1");
+
+            // Single quotes: a literal `'` is written as `''`.
+            let inner = if c == '\'' {
+                "Pa''ss1".to_string()
+            } else {
+                format!("Pa{c}ss1")
+            };
+            let s = format!("User Id=sa;Password='{inner}'");
+            let ado: AdoNetConfig = s
+                .parse()
+                .unwrap_or_else(|e| panic!("char {c:?} single-quoted failed: {e}"));
+            assert_eq!(
+                AuthMethod::sql_server("sa", expected.as_str()),
+                ado.authentication()?,
+                "char {c:?} single-quoted"
+            );
+
+            // Double quotes: a literal `"` is written as `""`.
+            let inner = if c == '"' {
+                "Pa\"\"ss1".to_string()
+            } else {
+                format!("Pa{c}ss1")
+            };
+            let s = format!("User Id=sa;Password=\"{inner}\"");
+            let ado: AdoNetConfig = s
+                .parse()
+                .unwrap_or_else(|e| panic!("char {c:?} double-quoted failed: {e}"));
+            assert_eq!(
+                AuthMethod::sql_server("sa", expected.as_str()),
+                ado.authentication()?,
+                "char {c:?} double-quoted"
+            );
+        }
+
+        Ok(())
+    }
+
+    // A doubled enclosing quote embeds that quote character.
+    #[test]
+    fn parsing_password_doubled_quotes_embed_the_quote() -> crate::Result<()> {
+        let ado: AdoNetConfig = "User Id=sa;Password='a''b'".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", "a'b"), ado.authentication()?);
+
+        let ado: AdoNetConfig = "User Id=sa;Password=\"a\"\"b\"".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", "a\"b"), ado.authentication()?);
+
+        Ok(())
+    }
+
+    // An unquoted value may contain `=` — each pair splits on the first `=` —
+    // so a base64/generated password with `=` padding parses (issue #313).
+    #[test]
+    fn issue_313_unquoted_equals_in_password_parses() -> crate::Result<()> {
+        let cases: &[(&str, &str)] = &[
+            ("Zm9vYmFy==", "Zm9vYmFy=="), // base64 with `==` padding (the report)
+            ("aGVsbG8=", "aGVsbG8="),     // base64 with a single `=` pad
+            ("Pa=ss1", "Pa=ss1"),
+            ("a=b=c", "a=b=c"),
+        ];
+        for (raw, expected) in cases {
+            let s =
+                format!("Server=tcp:host.example.com,1433;Database=DB;User Id=sa;Password={raw}");
+            let ado: AdoNetConfig = s
+                .parse()
+                .unwrap_or_else(|e| panic!("unquoted `{raw}` should parse: {e}"));
+            assert_eq!(
+                AuthMethod::sql_server("sa", *expected),
+                ado.authentication()?,
+                "unquoted `{raw}`"
+            );
+        }
+
+        Ok(())
+    }
+
+    // `==` in the key position is a literal `=`; the pair still splits on the
+    // first *single* `=`.
+    #[test]
+    fn parsing_key_double_equals_is_literal() -> crate::Result<()> {
+        let ado: AdoNetConfig = "User Id=sa;Password=p".parse()?;
+        assert_eq!(AuthMethod::sql_server("sa", "p"), ado.authentication()?);
+        // A hypothetical key containing `=` round-trips via `==`.
+        let cfg: AdoNetConfig = "a==b=c".parse()?;
+        assert_eq!(cfg.dict.pairs().get("a=b").map(String::as_str), Some("c"));
+
+        Ok(())
+    }
+
+    // Characters that remain genuinely ambiguous unquoted must still error and
+    // point the caller at quoting — never silently mis-parse.
+    #[test]
+    fn parsing_password_ambiguous_unquoted_chars_error() {
+        // `;` is the separator; `Password=a;b` is read as a pair `a` then a
+        // second pair `b` with no `=`.
+        assert!("User Id=sa;Password=a;b".parse::<AdoNetConfig>().is_err());
+        // A value that *starts* with a quote/brace but is not closed is an error.
+        assert!("User Id=sa;Password='ab".parse::<AdoNetConfig>().is_err());
+        assert!("User Id=sa;Password=\"ab".parse::<AdoNetConfig>().is_err());
+        assert!("User Id=sa;Password={ab".parse::<AdoNetConfig>().is_err());
     }
 
     #[test]
