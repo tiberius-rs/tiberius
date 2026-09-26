@@ -1,5 +1,6 @@
 # Run locally with:  cargo deny check advisories bans sources
-# CI runs the same via .github/workflows/security.yml.
+# CI runs the same via the cargo-deny job in .github/workflows/ci.yml (on every
+# PR, in the merge queue, and weekly).
 #
 # Policy: a vulnerability or yanked crate in the default-built graph fails the build; ignored advisories are only reachable via dev-deps or opt-in features.
 

@@ -1,0 +1,273 @@
+name: CI
+
+# Fast tier (~10 min): runs on every PR push and again in the merge queue.
+# Rulesets require only the `ci-ok` aggregator, so jobs can be added or
+# renamed here without touching branch protection.
+on:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+  schedule:
+    # Weekly cargo-deny so newly-published advisories are caught without a push.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to a PR supersedes the previous run for that PR.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
+      - name: Clippy (--features=all, strict)
+        run: cargo clippy --all-targets --features=all -- -D warnings
+      # The rustls backends are mutually exclusive with native-tls, so
+      # `--features=all` never builds them; lint them separately.
+      # TODO: add `-- -D warnings` once the 0.13.1 stack lands. Upstream main
+      # still trips clippy::large_enum_variant on MaybeTlsStream under rustls,
+      # which that stack fixes. Until then this lane gates on compile errors
+      # and reports lints without failing.
+      - name: Clippy (rustls-webpki-roots, advisory)
+        run: >-
+          cargo clippy --all-targets --no-default-features
+          --features=rustls-webpki-roots,chrono,time,tds73
+
+  test:
+    name: lib tests (${{ matrix.name }})
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: all
+            features: "--features=all"
+          - name: no-default-features
+            features: "--no-default-features"
+          - name: rustls
+            features: "--no-default-features --features=rustls,chrono,time,tds73"
+          - name: rustls-webpki-roots
+            features: "--no-default-features --features=rustls-webpki-roots,chrono,time,tds73"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.name }}
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
+      # `--lib` needs no live server.
+      - run: cargo test --lib ${{ matrix.features }}
+
+  msrv:
+    name: MSRV (1.88)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # Keep this in sync with `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
+      - run: cargo check --features all
+
+  docs:
+    name: docs
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
+      # TODO: set RUSTDOCFLAGS="-D warnings" once the 0.13.1 stack lands; upstream
+      # main still has two broken intra-doc links that stack fixes.
+      - run: cargo doc --no-deps --features all
+
+  deny:
+    name: cargo-deny (advisories, bans, sources, licenses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      # Run cargo-deny on the runner directly (the musl container action
+      # conflicts with the repo's rust-toolchain file).
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: cargo-deny
+      - run: cargo deny check advisories bans sources licenses
+
+  gitleaks:
+    name: secret detection (gitleaks)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Full history so gitleaks can scan every commit.
+          fetch-depth: 0
+          persist-credentials: false
+      # We run the gitleaks CLI directly rather than gitleaks-action: the
+      # action wrapper requires a paid license for repos under a GitHub
+      # organization, while the gitleaks binary itself is MIT-licensed and
+      # free. Pinned by version and verified by SHA-256 before use.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "$url" -o gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Scan git history for secrets
+        run: gitleaks git --no-banner --redact --exit-code 1 --config .gitleaks.toml .
+
+  semver:
+    name: semver-checks (advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # Advisory: reports API-breaking changes vs the PR's base branch without
+    # blocking. The strict check against the last crates.io release runs in
+    # the merge queue (qa.yml).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: cargo-semver-checks
+      - name: Fetch baseline branch
+        # `actions/checkout` leaves the PR base branch without a local ref, so
+        # fetch it explicitly and compare against FETCH_HEAD.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --no-tags --depth=100 origin "$BASE_REF"
+      - name: Check for semver-breaking changes
+        # One coherent, non-conflicting feature set: enabling all features
+        # turns on the mutually-exclusive TLS backends together, whose
+        # duplicate `TlsStream` definitions break rustdoc (E0428).
+        run: >-
+          cargo semver-checks --package tiberius --baseline-rev FETCH_HEAD
+          --only-explicit-features
+          --features rustls,chrono,time,tds73,rust_decimal,bigdecimal
+
+  smoke:
+    name: integration smoke (SQL 2022, --features=all)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      TIBERIUS_TEST_CONNECTION_STRING: "server=tcp:localhost,1433;user=SA;password=<YourStrong@Passw0rd>;TrustServerCertificate=true"
+      RUSTFLAGS: "-Dwarnings"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: "--features=all"
+      - name: Start SQL Server 2022
+        run: DOCKER_BUILDKIT=1 docker compose -f docker-compose.yml up -d mssql-2022
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
+      - name: Wait for SQL Server
+        run: .github/scripts/wait-for-sql.sh mssql-2022
+      - run: cargo test --features=all
+
+  release-scripts:
+    name: release gate tests
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - run: python3 .github/scripts/test_release_gate.py -v
+
+  ci-ok:
+    name: ci-ok
+    # The single required status check. Skipped jobs (e.g. PR-only semver, or
+    # everything but cargo-deny on the weekly schedule) count as passing;
+    # any failure or cancellation fails this job.
+    if: always()
+    needs: [fmt, clippy, test, msrv, docs, deny, gitleaks, semver, smoke, release-scripts]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check needed jobs
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(echo "$RESULTS" | jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")')
+          if [ -n "$bad" ]; then
+            echo "::error::CI failed: $bad"
+            exit 1
+          fi

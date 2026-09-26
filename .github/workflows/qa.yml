@@ -1,0 +1,204 @@
+name: QA
+
+# Heavy tier. Runs in the merge queue on the exact commit that will land on
+# dev; a red run bounces the PR out of the queue. release.yml only lets a
+# commit reach main if its tree equals a dev commit with a green run here.
+on:
+  merge_group:
+  workflow_dispatch:
+  workflow_call:
+  # Required-check shim: a ruleset's required checks must also report on the
+  # PR itself before it can enter the merge queue, so this workflow runs on
+  # pull_request with every job skipped and `qa-ok` passing trivially. The
+  # release gate ignores pull_request runs when looking for QA provenance.
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: linux (${{ matrix.database }}, ${{ matrix.features }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        database:
+          - 2017
+          - 2019
+          - 2022
+          - azure-sql-edge
+        features:
+          - "--features=all"
+          - "--no-default-features"
+          - "--no-default-features --features=chrono"
+          - "--no-default-features --features=time"
+          - "--no-default-features --features=rustls"
+          - "--no-default-features --features=vendored-openssl"
+          - "--no-default-features --features=rustls,chrono,time,tds73,rust_decimal,bigdecimal"
+    env:
+      TIBERIUS_TEST_CONNECTION_STRING: "server=tcp:localhost,1433;user=SA;password=<YourStrong@Passw0rd>;TrustServerCertificate=true"
+      RUSTFLAGS: "-Dwarnings"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - name: Compute cache key
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: echo "RUST_CACHE_KEY=${FEATURES//,/+}" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: ${{ env.RUST_CACHE_KEY }}
+      - name: Start SQL Server ${{ matrix.database }}
+        run: DOCKER_BUILDKIT=1 docker compose -f docker-compose.yml up -d mssql-${{ matrix.database }}
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
+      - name: Wait for SQL Server
+        run: .github/scripts/wait-for-sql.sh mssql-${{ matrix.database }}
+      - run: cargo test --no-fail-fast ${{ matrix.features }}
+
+  macos:
+    name: macos (SQL 2022 via colima, ${{ matrix.name }})
+    if: github.event_name != 'pull_request'
+    # Hosted macOS has no Linux Docker daemon, so the linux/amd64 SQL Server
+    # container runs inside a colima (Lima) VM. The Intel runner runs that
+    # image natively (no qemu user-mode emulation of x86 on arm64).
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rustls
+            features: "--no-default-features --features=rustls,chrono,time,tds73,rust_decimal,bigdecimal"
+          - name: vendored-openssl
+            features: "--no-default-features --features=vendored-openssl,chrono,time,tds73,rust_decimal,bigdecimal"
+          # No `--features=all` lane: on macOS `native-tls` is Apple Secure
+          # Transport, which cannot complete the SQL Server TLS handshake. It is
+          # covered on Linux (OpenSSL) and Windows (SChannel).
+    env:
+      TIBERIUS_TEST_CONNECTION_STRING: "server=tcp:localhost,1433;user=SA;password=<YourStrong@Passw0rd>;TrustServerCertificate=true"
+      RUSTFLAGS: "-Dwarnings"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: macos-${{ matrix.name }}
+      - name: Start Docker (colima)
+        run: |
+          brew install colima docker docker-compose
+          # Homebrew's docker-compose is a CLI plugin; tell the docker CLI where it is.
+          mkdir -p ~/.docker
+          echo "{\"cliPluginsExtraDirs\": [\"$(brew --prefix)/lib/docker/cli-plugins\"]}" > ~/.docker/config.json
+          # SQL Server wants ~2 GB RAM; give the VM headroom for it.
+          colima start --cpu 3 --memory 6 --disk 20
+          docker version
+          docker compose version
+      - name: Start SQL Server 2022
+        run: docker compose -f docker-compose.yml up -d mssql-2022
+      - name: Wait for SQL Server
+        run: .github/scripts/wait-for-sql.sh mssql-2022 exec
+      - run: cargo test --no-fail-fast ${{ matrix.features }}
+
+  windows:
+    name: windows (SQL 2019, integrated auth, ${{ matrix.name }})
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: all
+            features: "--features=all"
+          - name: rustls
+            features: "--no-default-features --features=rustls,winauth"
+          - name: vendored-openssl
+            features: "--no-default-features --features=vendored-openssl,winauth"
+    env:
+      TIBERIUS_TEST_INSTANCE: "MSSQLSERVER"
+      TIBERIUS_TEST_CONNECTION_STRING: "server=tcp:127.0.0.1,1433;IntegratedSecurity=true;TrustServerCertificate=true"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: windows-${{ matrix.name }}
+      - name: Install SQL Server 2019
+        # Windows PowerShell 5.1: its .NET Framework ships System.Data.SqlClient,
+        # used by the script's readiness probe.
+        shell: powershell
+        run: ./.github/scripts/install-sqlserver-windows.ps1
+      # The special-character password tests (tests/special_char_password.rs)
+      # derive a SQL-login connection string by appending user/password to
+      # TIBERIUS_TEST_CONNECTION_STRING. Here that string has
+      # IntegratedSecurity=true, so they would authenticate as Windows users
+      # and fail with 18452. They are SQL-auth tests and run on Linux and
+      # macOS. TODO: drop the skip once the test also appends
+      # `IntegratedSecurity=false`.
+      - run: cargo test --no-fail-fast ${{ matrix.features }} -- --skip password_authenticates
+
+  semver:
+    name: semver-checks (strict, vs crates.io)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: cargo-semver-checks
+      # Baseline is the latest crates.io release; the allowed change class is
+      # derived from the Cargo.toml version bump (0.x: a minor bump permits
+      # breaking changes, a patch bump or no bump does not). A breaking PR must
+      # therefore bump the version on dev in the same change.
+      - name: Check against the last published release
+        run: >-
+          cargo semver-checks --package tiberius
+          --only-explicit-features
+          --features rustls,chrono,time,tds73,rust_decimal,bigdecimal
+
+  qa-ok:
+    name: qa-ok
+    if: always()
+    needs: [linux, macos, windows, semver]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check needed jobs
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(echo "$RESULTS" | jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")')
+          if [ -n "$bad" ]; then
+            echo "::error::QA failed: $bad"
+            exit 1
+          fi

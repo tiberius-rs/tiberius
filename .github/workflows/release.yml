@@ -1,0 +1,199 @@
+name: Release
+
+# main always equals the latest crates.io release. Every PR into main is a
+# release: a PR from dev (QA'd, with a version + CHANGELOG bump) merged with
+# "Create a merge commit" (see CONTRIBUTING.md).
+#
+#   pull_request into main  -> strict `release gate` (required check on main)
+#   push to main            -> if a version is above crates.io: publish via
+#                              crates.io Trusted Publishing, verify the index,
+#                              tag + GitHub Release; otherwise a no-op
+#   workflow_dispatch       -> retry a failed release on main (resumes: crates
+#                              already published from this commit are skipped),
+#                              or `dry_run` on any ref to exercise the publish
+#                              job with `cargo publish --dry-run` and no auth.
+#
+# Trusted Publishing matches this file name (release.yml) from the OIDC
+# `workflow_ref` claim and rejects pull_request_target / workflow_run, so
+# publishing must stay in this top-level push-triggered workflow.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: `cargo publish --dry-run`, no authentication, no tag"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # Releases never cancel each other; PR gate runs get their own group so they
+  # cannot displace a pending publish.
+  group: ${{ github.event_name == 'pull_request' && format('release-pr-{0}', github.event.pull_request.number) || 'release' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fork proofs only: RELEASE_REGISTRY=staging targets staging.crates.io;
+  # RELEASE_DRY_RUN=true lets a push run the publish job as a dry run (no
+  # authentication, no upload, no tag) in any repo.
+  REGISTRY: ${{ vars.RELEASE_REGISTRY == 'staging' && 'staging' || 'crates-io' }}
+
+jobs:
+  gate:
+    name: release gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # list qa.yml runs for the tree-identity check
+    outputs:
+      release: ${{ steps.gate.outputs.release }}
+      publish: ${{ steps.gate.outputs.publish }}
+      plan: ${{ steps.gate.outputs.plan }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Default ref: on PRs this is GitHub's test merge commit, i.e.
+          # exactly the tree "Create a merge commit" will land on main.
+          # All branches and tags: the gate needs dev's and main's history and the tags.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - name: Fetch dev
+        # Tolerate a missing dev branch here; the gate then reports it.
+        run: git fetch --no-tags origin +refs/heads/dev:refs/remotes/origin/dev || true
+      - name: Release gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          mode=()
+          # PR: the strict release gate. SHA is the test merge commit; the
+          # head must be on dev. Push / dispatch: publish if a version is
+          # above crates.io.
+          if [ "$EVENT" = pull_request ]; then
+            mode=(--target "origin/$BASE_REF" --head "$HEAD_SHA")
+          fi
+          python3 .github/scripts/release_gate.py gate --sha "$SHA" --registry "$REGISTRY" \
+            --qa-ref origin/dev "${mode[@]}"
+
+  publish:
+    name: publish
+    needs: gate
+    # Real publishes: push to main (or a dispatch retry on main) in the
+    # upstream repo, or in a fork that opted into staging.crates.io. Dry runs:
+    # any dispatch with dry_run, in any repo.
+    # Only when the gate decided this commit is a release.
+    if: >-
+      needs.gate.outputs.release == 'true' && (
+      (github.event_name == 'workflow_dispatch' && inputs.dry_run) ||
+      ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+       github.ref == 'refs/heads/main' &&
+       (github.repository == 'tiberius-rs/tiberius' || vars.RELEASE_REGISTRY == 'staging' ||
+        vars.RELEASE_DRY_RUN == 'true')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create (creates the tag)
+      id-token: write # crates.io Trusted Publishing
+    env:
+      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || vars.RELEASE_DRY_RUN == 'true' }}
+      PUBLISH: ${{ needs.gate.outputs.publish }}
+      PLAN: ${{ needs.gate.outputs.plan }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - name: Release plan
+        run: |
+          echo "$PLAN" | jq .
+          echo "registry=$REGISTRY dry_run=$DRY_RUN sha=$SHA"
+      - name: Authenticate to crates.io (Trusted Publishing)
+        id: auth
+        if: env.DRY_RUN != 'true' && env.PUBLISH != ''
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          url: ${{ vars.RELEASE_REGISTRY == 'staging' && 'https://staging.crates.io' || 'https://crates.io' }}
+      - name: Publish
+        if: env.PUBLISH != ''
+        env:
+          TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          args=()
+          for crate in $PUBLISH; do args+=(-p "$crate"); done
+          if [ "$DRY_RUN" = true ]; then
+            args+=(--dry-run)
+          elif [ "$REGISTRY" = staging ]; then
+            export CARGO_REGISTRIES_STAGING_INDEX=sparse+https://index.staging.crates.io/
+            export CARGO_REGISTRIES_STAGING_TOKEN="$TOKEN"
+            args+=(--registry staging)
+          else
+            export CARGO_REGISTRY_TOKEN="$TOKEN"
+          fi
+          # One invocation publishes the crates in dependency order (macros
+          # first) and waits for each to be available before the next. A
+          # version that already exists is an error, which fails the job.
+          cargo publish "${args[@]}"
+          # Record the exact .crate files cargo uploaded. `cargo publish`
+          # writes them to target/package/tmp-crate/ (current cargo) or
+          # target/package/ (older cargo); a missing file is an error.
+          : > "$RUNNER_TEMP/published.txt"
+          for crate in $PUBLISH; do
+            version=$(echo "$PLAN" | jq -r --arg c "$crate" '.releases[] | select(.crate == $c) | .version')
+            file=""
+            for f in "target/package/tmp-crate/${crate}-${version}.crate" "target/package/${crate}-${version}.crate"; do
+              if [ -f "$f" ]; then file=$f; break; fi
+            done
+            if [ -z "$file" ]; then
+              echo "::error::no ${crate}-${version}.crate under target/package after cargo publish"
+              exit 1
+            fi
+            sum=$(sha256sum "$file" | cut -d' ' -f1)
+            echo "${crate} ${version} sha256 ${sum} ${file}"
+            echo "${crate} ${version} ${file}" >> "$RUNNER_TEMP/published.txt"
+          done
+      - name: Verify the registry index
+        if: env.DRY_RUN != 'true' && env.PUBLISH != ''
+        run: |
+          set -euo pipefail
+          while read -r crate version file; do
+            python3 .github/scripts/release_gate.py verify --registry "$REGISTRY" \
+              --crate "$crate" --version "$version" --crate-file "$file" --timeout 900
+          done < "$RUNNER_TEMP/published.txt"
+      - name: Tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "$PLAN" | jq -c '.releases[]' | while read -r rel; do
+            crate=$(echo "$rel" | jq -r .crate)
+            version=$(echo "$rel" | jq -r .version)
+            tag=$(echo "$rel" | jq -r .tag)
+            flags=(--target "$SHA" --generate-notes --title "$crate $version")
+            if [ "$crate" != tiberius ]; then flags+=(--latest=false); fi
+            case "$version" in *-*) flags+=(--prerelease) ;; esac
+            if [ "$DRY_RUN" = true ]; then
+              echo "dry run: gh release create $tag ${flags[*]}"
+            elif gh release view "$tag" >/dev/null 2>&1; then
+              echo "release $tag already exists"
+            else
+              gh release create "$tag" "${flags[@]}"
+            fi
+          done

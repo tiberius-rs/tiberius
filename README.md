@@ -1,7 +1,7 @@
 # Tiberius
 [![crates.io](https://meritbadge.herokuapp.com/tiberius)](https://crates.io/crates/tiberius)
 [![docs.rs](https://docs.rs/tiberius/badge.svg)](https://docs.rs/tiberius)
-[![Cargo tests](https://github.com/prisma/tiberius/actions/workflows/test.yml/badge.svg)](https://github.com/prisma/tiberius/actions/workflows/test.yml)
+[![CI](https://github.com/tiberius-rs/tiberius/actions/workflows/ci.yml/badge.svg)](https://github.com/tiberius-rs/tiberius/actions/workflows/ci.yml)
 [![Chat](https://img.shields.io/discord/664092374359605268)](https://discord.gg/xX4xp9x)
 
 A native Microsoft SQL Server (TDS) client for Rust.
