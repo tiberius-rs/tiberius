@@ -40,6 +40,8 @@ jobs:
           components: rustfmt
       - name: Rustfmt
         run: cargo fmt --check
+      - name: Rustfmt (provider consumer)
+        run: cargo fmt --manifest-path tests/rustls-provider/Cargo.toml --check
 
   msrv:
     name: MSRV (1.88)
@@ -57,13 +59,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
       - name: Check on MSRV
         run: cargo check --features all
+      - name: Check provider-neutral rustls on MSRV
+        run: cargo check --no-default-features --features rustls-no-provider,tds80 --lib
 
-  # The `rustls-webpki-roots` feature (and the rustls trust-store code paths in
-  # general) are excluded from `--features=all` because the three TLS backends
-  # are mutually exclusive, so neither the clippy nor the MSRV job above builds
-  # them. This server-less lane keeps them clippy-clean, buildable, and unit-
-  # tested so a regression (e.g. a `webpki-roots` major bump changing
-  # `TLS_SERVER_ROOTS`) is caught in CI.
+  # The custom `all` feature selects native TLS; the mutually exclusive TLS
+  # backends need separate coverage. The MSRV job checks provider-neutral rustls,
+  # while this server-less stable lane builds and unit-tests the rustls backend
+  # and trust-store paths, including `rustls-webpki-roots`.
   rustls-features:
     name: rustls trust-store (unit)
     runs-on: ubuntu-latest
@@ -84,6 +86,24 @@ jobs:
         run: cargo test --no-default-features --features rustls,chrono,time,tds73 --lib
       - name: Unit tests (rustls-webpki-roots)
         run: cargo test --no-default-features --features rustls-webpki-roots,chrono,time,tds73 --lib
+      - name: Unit tests (rustls-no-provider)
+        run: cargo test --no-default-features --features rustls-no-provider,chrono,time,tds80 --lib
+      - name: Provider-neutral consumer graph
+        shell: bash
+        run: |
+          cargo check --manifest-path tests/rustls-provider/Cargo.toml --tests
+          cargo tree --manifest-path tests/rustls-provider/Cargo.toml --edges normal --prefix none > provider-tree.txt
+          if grep -E '^(aws-lc-rs|aws-lc-sys|ring|openssl|openssl-sys|symcrypt|symcrypt-sys) v' provider-tree.txt; then
+            echo "provider-neutral consumer unexpectedly includes a crypto backend"
+            exit 1
+          fi
+      # Separate integration binaries isolate rustls' process-global provider.
+      - name: Consumer provider contracts
+        run: |
+          cargo test --manifest-path tests/rustls-provider/Cargo.toml
+          cargo test --manifest-path tests/rustls-provider/Cargo.toml --features ring
+          cargo test --manifest-path tests/rustls-provider/Cargo.toml --features aws-lc
+          cargo test --manifest-path tests/rustls-provider/Cargo.toml --features openssl
 
   semver:
     name: semver-checks (advisory)

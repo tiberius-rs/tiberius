@@ -153,7 +153,7 @@ impl PacketHeader {
     }
 
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -174,7 +174,7 @@ impl PacketHeader {
     // field directly). Gate the allow so TLS builds still flag genuine disuse.
     #[cfg_attr(
         not(any(
-            feature = "rustls",
+            feature = "rustls-no-provider",
             feature = "native-tls",
             feature = "vendored-openssl"
         )),
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]

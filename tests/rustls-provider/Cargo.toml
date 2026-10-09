@@ -1,0 +1,23 @@
+[package]
+name = "tiberius-rustls-provider-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT/Apache-2.0"
+
+# Keep root dev-dependencies (notably reqwest) from enabling a crypto backend.
+[workspace]
+
+[dependencies]
+tiberius = { path = "../..", default-features = false, features = ["rustls-no-provider", "tds80"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"] }
+tokio = { version = "1", features = ["macros", "rt", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+rustls-openssl = { version = "0.4", optional = true, default-features = false, features = ["tls12"] }
+rustls-symcrypt = { version = "0.2", optional = true }
+
+[features]
+ring = ["tokio-rustls/ring"]
+aws-lc = ["tiberius/rustls"]
+openssl = ["dep:rustls-openssl"]
+symcrypt = ["dep:rustls-symcrypt"]

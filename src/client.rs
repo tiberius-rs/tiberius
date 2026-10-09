@@ -4,7 +4,7 @@ mod connection;
 
 mod tls;
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -90,6 +90,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// (such as multi-subnet failover, which selects between resolved
     /// addresses) must be handled while establishing that stream, outside of
     /// this constructor.
+    ///
+    /// With the `rustls-no-provider` feature, install the application's rustls
+    /// 0.23 `CryptoProvider` process-wide before calling this method. If TLS is
+    /// needed and no provider is installed, this returns [`crate::error::Error::Tls`].
+    /// The `rustls` feature retains an AWS-LC fallback when none is installed.
     ///
     /// [`Config`]: struct.Config.html
     pub async fn connect(config: Config, tcp_stream: S) -> crate::Result<Client<S>> {

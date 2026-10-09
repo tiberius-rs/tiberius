@@ -65,7 +65,7 @@ pub struct Config {
     pub(crate) lossy_utf16_decoding: bool,
     pub(crate) lossy_codepage_decoding: bool,
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -152,7 +152,7 @@ pub(crate) enum RootSource {
 #[derive(Clone)]
 #[cfg_attr(
     not(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     )),
@@ -187,7 +187,7 @@ impl std::fmt::Debug for ExtraCa {
 /// certificate + private-key files) or [`Config::client_certificate_pkcs12`]
 /// (a PKCS#12 / PFX bundle, `native-tls` and `vendored-openssl` only).
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -197,7 +197,7 @@ pub(crate) struct ClientCertificate {
 }
 
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -216,7 +216,10 @@ pub(crate) enum ClientCertSource {
     /// are therefore never read, so silence dead-code exactly there rather than
     /// unconditionally — this keeps the derived `Debug` (which no longer counts
     /// as a read) while still compiling clean under `-Dwarnings`.
-    #[cfg_attr(not(any(feature = "rustls", feature = "native-tls")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "rustls-no-provider", feature = "native-tls")),
+        allow(dead_code)
+    )]
     CertAndKey { cert: PathBuf, key: PathBuf },
     /// A PKCS#12 / PFX bundle path together with its decryption password. Only
     /// supported by the `native-tls` and `vendored-openssl` backends.
@@ -236,13 +239,13 @@ impl Default for Config {
             instance_name: None,
             application_name: None,
             #[cfg(any(
-                feature = "rustls",
+                feature = "rustls-no-provider",
                 feature = "native-tls",
                 feature = "vendored-openssl"
             ))]
             encryption: EncryptionLevel::Required,
             #[cfg(not(any(
-                feature = "rustls",
+                feature = "rustls-no-provider",
                 feature = "native-tls",
                 feature = "vendored-openssl"
             )))]
@@ -259,7 +262,7 @@ impl Default for Config {
             lossy_utf16_decoding: false,
             lossy_codepage_decoding: false,
             #[cfg(any(
-                feature = "rustls",
+                feature = "rustls-no-provider",
                 feature = "native-tls",
                 feature = "vendored-openssl"
             ))]
@@ -766,14 +769,14 @@ impl Config {
     ///
     /// [`client_certificate_pkcs12`]: Config::client_certificate_pkcs12
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
     #[cfg_attr(
         docsrs,
         doc(cfg(any(
-            feature = "rustls",
+            feature = "rustls-no-provider",
             feature = "native-tls",
             feature = "vendored-openssl"
         )))
@@ -818,7 +821,7 @@ impl Config {
     }
 
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -834,7 +837,7 @@ impl Config {
     }
 
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -1228,14 +1231,14 @@ impl ConfigBuilder {
     ///
     /// See [`Config::client_certificate`] for details and backend support.
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
     #[cfg_attr(
         docsrs,
         doc(cfg(any(
-            feature = "rustls",
+            feature = "rustls-no-provider",
             feature = "native-tls",
             feature = "vendored-openssl"
         )))
@@ -1435,7 +1438,7 @@ pub(crate) trait ConfigString {
     }
 
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -1463,7 +1466,7 @@ pub(crate) trait ConfigString {
     }
 
     #[cfg(not(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]
@@ -1490,7 +1493,7 @@ pub(crate) trait ConfigString {
     }
 
     #[cfg(not(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]
@@ -1767,7 +1770,7 @@ mod tests {
     }
 
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -1783,7 +1786,7 @@ mod tests {
     }
 
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -1808,7 +1811,7 @@ mod tests {
     }
 
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -2140,7 +2143,7 @@ mod tests {
     }
 
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]

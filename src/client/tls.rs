@@ -1,11 +1,11 @@
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
 use super::tls_stream::TlsStream;
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -14,20 +14,20 @@ use crate::tds::{
     HEADER_BYTES,
 };
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
 use bytes::BytesMut;
 use futures_util::io::{AsyncRead, AsyncWrite};
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
 use futures_util::ready;
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -38,7 +38,7 @@ use std::{
     task::{self, Poll},
 };
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -48,7 +48,7 @@ use tracing::{event, Level};
 pub(crate) enum MaybeTlsStream<S: AsyncRead + AsyncWrite + Unpin + Send> {
     Raw(S),
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -56,7 +56,7 @@ pub(crate) enum MaybeTlsStream<S: AsyncRead + AsyncWrite + Unpin + Send> {
 }
 
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -65,7 +65,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MaybeTlsStream<S> {
         match self {
             Self::Raw(s) => s,
             #[cfg(any(
-                feature = "rustls",
+                feature = "rustls-no-provider",
                 feature = "native-tls",
                 feature = "vendored-openssl"
             ))]
@@ -83,7 +83,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for MaybeTlsStream<S> {
         match self.get_mut() {
             MaybeTlsStream::Raw(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(any(
-                feature = "rustls",
+                feature = "rustls-no-provider",
                 feature = "native-tls",
                 feature = "vendored-openssl"
             ))]
@@ -101,7 +101,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for MaybeTlsStream<S> 
         match self.get_mut() {
             MaybeTlsStream::Raw(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(any(
-                feature = "rustls",
+                feature = "rustls-no-provider",
                 feature = "native-tls",
                 feature = "vendored-openssl"
             ))]
@@ -113,7 +113,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for MaybeTlsStream<S> 
         match self.get_mut() {
             MaybeTlsStream::Raw(s) => Pin::new(s).poll_flush(cx),
             #[cfg(any(
-                feature = "rustls",
+                feature = "rustls-no-provider",
                 feature = "native-tls",
                 feature = "vendored-openssl"
             ))]
@@ -125,7 +125,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for MaybeTlsStream<S> 
         match self.get_mut() {
             MaybeTlsStream::Raw(s) => Pin::new(s).poll_close(cx),
             #[cfg(any(
-                feature = "rustls",
+                feature = "rustls-no-provider",
                 feature = "native-tls",
                 feature = "vendored-openssl"
             ))]
@@ -141,7 +141,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for MaybeTlsStream<S> 
 /// What it does is it interferes on handshake for TDS packet handling,
 /// and when complete, just passes the calls to the underlying connection.
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -158,7 +158,7 @@ pub(crate) struct TlsPreloginWrapper<S> {
 }
 
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -182,7 +182,7 @@ impl<S> TlsPreloginWrapper<S> {
 }
 
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -263,7 +263,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsPreloginWrapper<
 }
 
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -334,7 +334,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsPreloginWrapper
 #[cfg(all(
     test,
     any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     )

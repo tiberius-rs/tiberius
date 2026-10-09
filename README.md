@@ -38,7 +38,8 @@ A native Microsoft SQL Server (TDS) client for Rust.
 |--------------------------|----------------------------------------------------------------------------------------------------------------------------------|------------|
 | `tds73`                  | Support for new date and time types in TDS version 7.3. Disable if using version 7.2.                                            | `enabled`  |
 | `native-tls`             | Use operating system's TLS libraries for traffic encryption.                                                                     | `enabled`  |
-| `rustls`                 | Use the builtin TLS implementation from rustls instead of linking to the operating system implementation for traffic encryption. | `disabled` |
+| `rustls`                 | Use rustls with an installed crypto provider, falling back to AWS-LC (compiled in).                                               | `disabled` |
+| `rustls-no-provider`     | Use rustls without selecting a crypto backend; the application must install a provider before connecting.                        | `disabled` |
 | `vendored-openssl`       | Statically link against OpenSSL instead of dynamically linking to the operating system implementation for traffic encryption.    | `disabled` |
 | `chrono`                 | Read and write date and time values using `chrono`'s types. (for greenfield, using time instead of chrono is recommended)        | `disabled` |
 | `time`                   | Read and write date and time values using `time` crate types.                                                                    | `disabled` |
@@ -72,6 +73,45 @@ Tiberius can be set to use two different implementations of TLS connection encry
 Alternatively one can use the `rustls` feature flag to use the Rust native TLS implementation. This way there are no dynamic dependencies to the system. This might be useful in certain installations, but requires a rebuild to update to a new TLS version. For some reasons the Security Framework on macOS does not work with SQL Server TLS settings, and on Apple platforms if needing TLS it is recommended to use `rustls` instead of `native-tls`. The other option is to use the `vendored-openssl` feature flag, that statically links against the latest OpenSSL implementation.
 
 The crate can also be compiled without TLS support, but not with both features enabled at the same time.
+
+#### Application-selected rustls crypto provider
+
+Use `rustls-no-provider` **instead of** `rustls`, and disable default features to
+avoid selecting native TLS. For example, an application selecting Ring uses:
+
+```toml
+[dependencies]
+tiberius = { git = "https://github.com/tiberius-rs/tiberius", default-features = false, features = ["tds73", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+```
+
+This feature is unreleased. Until it ships, use a Git revision containing this
+change (pin it with `rev`); switch back to a crates.io release once available.
+
+Install the chosen provider once during application startup, **before any
+`Client::connect` calls** (and before other rustls users initialize a default):
+
+```rust,ignore
+rustls::crypto::ring::default_provider()
+    .install_default()
+    .expect("install the application's crypto provider exactly once");
+```
+
+AWS-LC or a third-party rustls 0.23 provider (such as `rustls-openssl` or
+`rustls-symcrypt`) can be installed instead. Select that provider in the
+application's dependencies; Tiberius does not add Ring or AWS-LC in
+`rustls-no-provider` mode. If TLS is needed without a process-installed provider,
+`Client::connect` returns `Error::Tls` with guidance to call
+`CryptoProvider::install_default()`; it does not panic or infer a provider from
+other crates' enabled features.
+
+Cargo features are additive: enabling `rustls` anywhere restores the compiled-in
+AWS-LC fallback. `rustls-webpki-roots` still implies `rustls` for compatibility,
+so do not enable it when avoiding AWS-LC. Native roots, additional CA files and
+in-memory CA bundles remain available in provider-neutral mode. Provider
+selection does not change certificate or hostname verification, TLS 1.2/1.3
+support, or client certificates. Use `tds80` in place of `tds73` for TDS 8.0
+strict encryption.
 
 Tiberius has three runtime encryption settings:
 

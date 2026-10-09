@@ -1,5 +1,12 @@
 # Changes
 
+## Unreleased
+
+- feat: `rustls-no-provider` enables rustls without selecting a crypto backend.
+  Applications must install a rustls 0.23 `CryptoProvider` before connecting;
+  missing providers return `Error::Tls`. The existing `rustls` feature retains
+  its AWS-LC fallback and native-TLS defaults are unchanged.
+
 ## Version 0.13.0
 
 - feat: TLS trust configuration is revamped around two orthogonal axes plus a

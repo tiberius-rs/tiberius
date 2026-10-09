@@ -139,6 +139,8 @@ optional = true
 [dependencies.tokio-rustls]
 version = "0.26.4"
 optional = true
+default-features = false
+features = ["logging", "tls12"]
 
 [dependencies.rustls-native-certs]
 version = "0.8"
@@ -248,7 +250,10 @@ sql-browser-tokio = ["tokio", "tokio-util"]
 sql-browser-smol = ["async-io", "async-net", "futures-lite"]
 integrated-auth-gssapi = ["libgssapi"]
 bigdecimal = ["bigdecimal_"]
-rustls = ["tokio-rustls", "tokio-util", "rustls-native-certs", "rustls-webpki", "rustls-pki-types"]
+# Preserve the existing AWS-LC fallback for users selecting `rustls`.
+rustls = ["rustls-no-provider", "tokio-rustls/aws_lc_rs"]
+# The application must install a rustls CryptoProvider before connecting.
+rustls-no-provider = ["tokio-rustls", "tokio-util", "rustls-native-certs", "rustls-webpki", "rustls-pki-types"]
 # Bundle a compiled-in snapshot of Mozilla's root CA store, selectable via
 # `Config::trust_webpki_roots()` (rustls only). Implies `rustls`; the bundled
 # roots are a pinned snapshot that goes stale without dependency updates.

@@ -80,6 +80,13 @@ let config = Config::builder()
 TLS is on by default. Pick a backend via a feature flag (mutually exclusive):
 `native-tls` (default), `rustls`, or `vendored-openssl`.
 
+For an application-selected rustls 0.23 `CryptoProvider`, use
+`default-features = false, features = ["tds73", "rustls-no-provider"]` instead.
+Install the provider process-wide before `Client::connect`; a TLS connection
+without one returns `Error::Tls`, not a panic or an implicit backend fallback.
+The `rustls` and `rustls-webpki-roots` features still compile in AWS-LC.
+See the [provider setup example](../README.md#application-selected-rustls-crypto-provider).
+
 Encryption levels (`Config::encryption`): `NotSupported`, `Off`, `Required`
 (default), and **`Strict`** — TDS 8.0, TLS *before* the pre-login, with the
 `tds/8.0` ALPN (requires the `tds80` feature; native-tls or rustls).

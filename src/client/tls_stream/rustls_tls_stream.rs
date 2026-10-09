@@ -21,7 +21,7 @@ use tokio_rustls::{
             danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
             WantsClientCert,
         },
-        crypto::{aws_lc_rs, CryptoProvider},
+        crypto::CryptoProvider,
         pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime},
         ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore,
         SignatureScheme,
@@ -30,6 +30,9 @@ use tokio_rustls::{
 };
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::{event, Level};
+
+#[cfg(feature = "rustls")]
+use tokio_rustls::rustls::crypto::aws_lc_rs;
 
 impl From<tokio_rustls::rustls::Error> for Error {
     fn from(e: tokio_rustls::rustls::Error) -> Self {
@@ -168,7 +171,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
     pub(super) async fn new(config: &Config, stream: S) -> crate::Result<Self> {
         event!(Level::DEBUG, "Performing a TLS handshake");
 
-        let provider = resolve_crypto_provider(CryptoProvider::get_default().cloned());
+        let provider = resolve_crypto_provider(CryptoProvider::get_default().cloned())?;
 
         // Negotiate the best available protocol version (TLS 1.2 or 1.3), the
         // same policy as upstream's previous `with_safe_defaults()`.
@@ -266,24 +269,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
 }
 
 /// Resolve the rustls `CryptoProvider`: honour a process-installed default
-/// (`CryptoProvider::install_default`) if present, otherwise fall back to
-/// aws-lc-rs.
-fn resolve_crypto_provider(installed: Option<Arc<CryptoProvider>>) -> Arc<CryptoProvider> {
+/// (`CryptoProvider::install_default`) if present. Only the legacy `rustls`
+/// feature enables the aws-lc-rs fallback.
+fn resolve_crypto_provider(
+    installed: Option<Arc<CryptoProvider>>,
+) -> crate::Result<Arc<CryptoProvider>> {
     match installed {
         Some(provider) => {
             event!(
                 Level::DEBUG,
                 "Using process-installed rustls CryptoProvider"
             );
-            provider
+            Ok(provider)
         }
+        #[cfg(feature = "rustls")]
         None => {
             event!(
                 Level::DEBUG,
                 "No process-installed CryptoProvider; using the aws-lc-rs default"
             );
-            Arc::new(aws_lc_rs::default_provider())
+            Ok(Arc::new(aws_lc_rs::default_provider()))
         }
+        #[cfg(not(feature = "rustls"))]
+        None => Err(Error::Tls(
+            "no process-installed rustls CryptoProvider; call \
+             CryptoProvider::install_default() before connecting with \
+             the `rustls-no-provider` feature, or enable `rustls` for the AWS-LC fallback"
+                .to_string(),
+        )),
     }
 }
 
@@ -500,9 +513,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rustls")]
     fn resolve_crypto_provider_honours_installed() {
         let installed = Arc::new(aws_lc_rs::default_provider());
-        let got = resolve_crypto_provider(Some(installed.clone()));
+        let got = resolve_crypto_provider(Some(installed.clone())).unwrap();
         assert!(
             Arc::ptr_eq(&got, &installed),
             "an installed CryptoProvider must be used as-is"
@@ -510,11 +524,22 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rustls")]
     fn resolve_crypto_provider_falls_back_to_aws_lc_rs() {
-        let got = resolve_crypto_provider(None);
+        let got = resolve_crypto_provider(None).unwrap();
         assert!(
             !got.cipher_suites.is_empty(),
             "the aws-lc-rs fallback must provide cipher suites"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "rustls"))]
+    fn resolve_crypto_provider_requires_installation() {
+        let err = resolve_crypto_provider(None).unwrap_err();
+        assert!(
+            matches!(err, Error::Tls(ref message) if message.contains("CryptoProvider::install_default()")),
+            "missing provider must return an actionable TLS error, got: {err:?}"
         );
     }
 
@@ -917,6 +942,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rustls")]
     fn default_verifier_rejects_untrusted_certificate() {
         // Security-preserving invariant: with no explicit opt-in, a *well-formed*
         // certificate that does not chain to a trusted root MUST be rejected with

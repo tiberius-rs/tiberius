@@ -47,7 +47,7 @@ static APP_NAME_CONN_STR: Lazy<String> =
 // (see #305), so this connection string and the test using it are only built
 // when a TLS backend is compiled in.
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -57,7 +57,7 @@ static PLAIN_TEXT_CONN_STR: Lazy<String> =
     Lazy::new(|| format!("{};encrypt=DANGER_PLAINTEXT", *CONN_STR));
 
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]

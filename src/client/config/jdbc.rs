@@ -45,7 +45,7 @@ mod tests {
     use crate::client::AuthMethod;
 
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     #[cfg(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     ))]
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     #[cfg(not(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     #[cfg(not(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]
@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     #[cfg(not(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     #[cfg(not(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     #[cfg(not(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     #[cfg(not(any(
-        feature = "rustls",
+        feature = "rustls-no-provider",
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]

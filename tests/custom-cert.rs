@@ -9,7 +9,7 @@ static LOGGER_SETUP: Once = Once::new();
 
 #[test]
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
@@ -45,7 +45,7 @@ fn connect_to_custom_cert_instance_ado() -> Result<()> {
 
 #[test]
 #[cfg(any(
-    feature = "rustls",
+    feature = "rustls-no-provider",
     feature = "native-tls",
     feature = "vendored-openssl"
 ))]
