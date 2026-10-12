@@ -152,10 +152,10 @@ impl Context {
         self.spn = Some(format!("MSSQLSvc/{}:{}", host.as_ref(), port));
     }
 
-    #[cfg(any(
-        windows,
-        all(unix, any(feature = "integrated-auth-gssapi", feature = "sspi-rs"))
-    ))]
+    pub fn override_spn(&mut self, spn: String) {
+        self.spn = Some(spn);
+    }
+
     pub fn spn(&self) -> &str {
         self.spn.as_deref().unwrap_or("")
     }
@@ -267,18 +267,9 @@ mod tests {
         let mut ctx = Context::new();
         ctx.set_spn("dbhost", 1433);
 
-        #[cfg(any(
-            windows,
-            all(unix, any(feature = "integrated-auth-gssapi", feature = "sspi-rs"))
-        ))]
         assert_eq!(ctx.spn(), "MSSQLSvc/dbhost:1433");
 
-        // On platforms without an spn() accessor, at least make sure setting
-        // it doesn't panic.
-        #[cfg(not(any(
-            windows,
-            all(unix, any(feature = "integrated-auth-gssapi", feature = "sspi-rs"))
-        )))]
-        let _ = ctx;
+        ctx.override_spn("svc/db.example.test".into());
+        assert_eq!(ctx.spn(), "svc/db.example.test");
     }
 }

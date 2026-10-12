@@ -233,7 +233,9 @@ mod sql_browser;
 mod bulk_options;
 
 pub use bulk_options::{ColumnOrderHint, SortOrder, SqlBulkCopyOption, SqlBulkCopyOptions};
-pub use client::{AuthMethod, Client, Config, ConfigBuilder};
+pub use client::{
+    AuthFuture, AuthMethod, Client, Config, ConfigBuilder, ExternalAuth, ExternalAuthProvider,
+};
 pub use command::{Command, SqlTableData, SqlTableDataRow, TableValue, TableValueRow};
 pub(crate) use error::Error;
 pub use from_sql::{FromSql, FromSqlOwned};

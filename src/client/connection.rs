@@ -5,7 +5,7 @@
 ))]
 use crate::client::{tls::TlsPreloginWrapper, tls_stream::create_tls_stream};
 use crate::{
-    client::{tls::MaybeTlsStream, AuthMethod, Config},
+    client::{tls::MaybeTlsStream, AuthMethod, Config, ExternalAuthProvider},
     tds::{
         codec::{
             self, Encode, LoginMessage, Packet, PacketCodec, PacketHeader, PacketStatus,
@@ -18,7 +18,6 @@ use crate::{
 };
 use asynchronous_codec::Framed;
 use bytes::BytesMut;
-#[cfg(any(windows, feature = "integrated-auth-gssapi", feature = "sspi-rs"))]
 use codec::TokenSspi;
 use futures_util::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use futures_util::ready;
@@ -48,6 +47,9 @@ use tracing::{event, Level};
 #[cfg(all(windows, feature = "winauth"))]
 use winauth::{windows::NtlmSspiBuilder, NextBytes};
 use zeroize::{Zeroize, Zeroizing};
+
+/// The most token exchanges an external authentication may take after LOGIN7.
+const MAX_EXTERNAL_AUTH_ROUNDS: u32 = 16;
 
 /// A `Connection` is an abstraction between the [`Client`] and the server. It
 /// can be used as a `Stream` to fetch [`Packet`]s from and to `send` packets
@@ -132,6 +134,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let context = {
             let mut context = Context::new();
             context.set_spn(config.get_host(), config.get_port());
+            if let Some(spn) = config.spn.clone() {
+                context.override_spn(spn);
+            }
             // Row-decode preference; unrelated to handshake timing, so set it up
             // front alongside the SPN.
             context.set_lossy_utf16(config.lossy_utf16_decoding);
@@ -202,6 +207,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let mut connection = connection
             .login(
                 config.auth,
+                config.external_auth,
                 encryption,
                 config.database,
                 config.host,
@@ -230,7 +236,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         TokenStream::new(self).flush_done().await
     }
 
-    #[cfg(any(windows, feature = "integrated-auth-gssapi", feature = "sspi-rs"))]
     /// Flush the incoming token stream until receiving `SSPI` token.
     async fn flush_sspi(&mut self) -> crate::Result<TokenSspi> {
         TokenStream::new(self).flush_sspi().await
@@ -547,12 +552,60 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         Ok(response)
     }
 
+    /// Logs in with a token exchange supplied by the caller. The exchange
+    /// lives only as long as this future, so dropping it releases the context.
+    async fn login_external(
+        mut self,
+        provider: Arc<dyn ExternalAuthProvider>,
+        mut login_message: LoginMessage<'static>,
+        encryption: EncryptionLevel,
+    ) -> crate::Result<Self> {
+        let mut auth = provider.create(self.context.spn()).await?;
+
+        let initial = auth
+            .next_token(None)
+            .await?
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                crate::Error::Protocol("authentication produced no initial token".into())
+            })?;
+        login_message.integrated_security(Some(initial));
+
+        let id = self.context.next_packet_id();
+        self.send(PacketHeader::login(id), login_message).await?;
+        self = self.post_login_encryption(encryption);
+
+        let mut rounds = 0;
+        while !auth.is_complete() {
+            rounds += 1;
+            if rounds > MAX_EXTERNAL_AUTH_ROUNDS {
+                return Err(crate::Error::Protocol(
+                    "authentication did not finish within 16 token exchanges".into(),
+                ));
+            }
+
+            let challenge = self.flush_sspi().await?;
+            if let Some(token) = auth
+                .next_token(Some(challenge.as_ref()))
+                .await?
+                .filter(|token| !token.is_empty())
+            {
+                let id = self.context.next_packet_id();
+                self.send(PacketHeader::login(id), TokenSspi::new(token))
+                    .await?;
+            }
+        }
+
+        Ok(self)
+    }
+
     /// Defines the login record rules with SQL Server. Authentication with
     /// connection options.
     #[allow(clippy::too_many_arguments)]
     async fn login(
         mut self,
         auth: AuthMethod,
+        external_auth: Option<Arc<dyn ExternalAuthProvider>>,
         encryption: EncryptionLevel,
         db: Option<String>,
         server_name: Option<String>,
@@ -584,6 +637,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
 
         if let Some(size) = packet_size {
             login_message.packet_size(size);
+        }
+
+        if let Some(provider) = external_auth {
+            return self
+                .login_external(provider, login_message, encryption)
+                .await;
         }
 
         match auth {

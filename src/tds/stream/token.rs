@@ -152,12 +152,6 @@ pub enum ReceivedToken {
     // remaining fields are retained for debugging but not otherwise read.
     #[allow(dead_code)]
     LoginAck(TokenLoginAck),
-    // Consumed by `flush_sspi`, which is only compiled with an integrated-auth
-    // backend; without one the payload is decoded but never read.
-    #[cfg_attr(
-        not(any(windows, feature = "integrated-auth-gssapi", feature = "sspi-rs")),
-        allow(dead_code)
-    )]
     Sspi(TokenSspi),
     // TODO(surface): act on negotiated feature acknowledgements.
     #[allow(dead_code)]
@@ -240,7 +234,6 @@ where
         }
     }
 
-    #[cfg(any(windows, feature = "integrated-auth-gssapi", feature = "sspi-rs"))]
     pub(crate) async fn flush_sspi(self) -> crate::Result<TokenSspi> {
         let mut stream = self.try_unfold();
         let mut last_error = None;

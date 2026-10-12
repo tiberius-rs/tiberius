@@ -18,6 +18,34 @@ pub(crate) fn secret_from_string(mut s: String) -> SecretString {
 // `PartialEq`/`Eq` (comparing secrets is deliberately opt-in), so the equality
 // impls below are hand-written; they compare the exposed plaintext to preserve
 // the previous derived behaviour (and the public `AuthMethod: Eq` bound).
+/// The boxed future returned by [`ExternalAuthProvider`] and [`ExternalAuth`].
+pub type AuthFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<T>> + Send + 'a>>;
+
+/// Supplies the token exchange for integrated authentication, so the caller
+/// chooses the credentials for each connection. Tiberius keeps the LOGIN7 and
+/// SSPI framing. Set it with [`Config::external_authentication`].
+///
+/// [`Config::external_authentication`]: crate::Config::external_authentication
+pub trait ExternalAuthProvider: std::fmt::Debug + Send + Sync {
+    /// Start a new exchange for one login. `spn` is the service principal name
+    /// the server expects.
+    fn create<'a>(&'a self, spn: &'a str) -> AuthFuture<'a, Box<dyn ExternalAuth>>;
+}
+
+/// The token exchange for a single login. It is dropped when the login ends,
+/// whether it succeeds, fails or is cancelled.
+pub trait ExternalAuth: Send {
+    /// Produce the next token. `input` is `None` for the first call and the
+    /// server's SSPI token afterwards. Return `None` when there is nothing to
+    /// send back.
+    fn next_token<'a>(&'a mut self, input: Option<&'a [u8]>) -> AuthFuture<'a, Option<Vec<u8>>>;
+
+    /// True once the exchange is finished and no more server tokens are
+    /// expected.
+    fn is_complete(&self) -> bool;
+}
+
 #[derive(Clone, Debug)]
 pub struct SqlServerAuth {
     user: String,

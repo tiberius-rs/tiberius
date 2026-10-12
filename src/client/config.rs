@@ -4,6 +4,7 @@ mod jdbc;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Default upper bound on how long the connection handshake (TDS prelogin, TLS
@@ -19,7 +20,7 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// `CommandTimeout` default used by ADO.NET / the Microsoft SQL Server drivers.
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-use super::AuthMethod;
+use super::{AuthMethod, ExternalAuthProvider};
 use crate::EncryptionLevel;
 use ado_net::*;
 use jdbc::*;
@@ -55,6 +56,8 @@ pub struct Config {
     pub(crate) encryption: EncryptionLevel,
     pub(crate) trust: TrustConfig,
     pub(crate) auth: AuthMethod,
+    pub(crate) external_auth: Option<Arc<dyn ExternalAuthProvider>>,
+    pub(crate) spn: Option<String>,
     pub(crate) readonly: bool,
     pub(crate) packet_size: Option<u32>,
     pub(crate) hostname_in_certificate: Option<String>,
@@ -249,6 +252,8 @@ impl Default for Config {
             encryption: EncryptionLevel::NotSupported,
             trust: TrustConfig::default(),
             auth: AuthMethod::None,
+            external_auth: None,
+            spn: None,
             readonly: false,
             packet_size: None,
             hostname_in_certificate: None,
@@ -523,6 +528,25 @@ impl Config {
     /// - Defaults to `None`.
     pub fn authentication(&mut self, auth: AuthMethod) {
         self.auth = auth;
+        self.external_auth = None;
+    }
+
+    /// Lets the caller run the integrated authentication token exchange, with
+    /// a fresh context for each login. Replaces the authentication method set
+    /// with [`authentication`](Self::authentication), and the other way round.
+    ///
+    /// - Defaults to none.
+    pub fn external_authentication(&mut self, provider: Arc<dyn ExternalAuthProvider>) {
+        self.auth = AuthMethod::None;
+        self.external_auth = Some(provider);
+    }
+
+    /// Overrides the service principal name used for integrated authentication.
+    /// It changes neither the address nor the TLS server name.
+    ///
+    /// - Defaults to `MSSQLSvc/host:port`.
+    pub fn service_principal_name(&mut self, spn: impl ToString) {
+        self.spn = Some(spn.to_string());
     }
 
     /// Sets ApplicationIntent readonly.
@@ -1170,7 +1194,19 @@ impl ConfigBuilder {
     ///
     /// - Defaults to `None`.
     pub fn authentication(mut self, auth: AuthMethod) -> Self {
-        self.inner.auth = auth;
+        self.inner.authentication(auth);
+        self
+    }
+
+    /// See [`Config::external_authentication`].
+    pub fn external_authentication(mut self, provider: Arc<dyn ExternalAuthProvider>) -> Self {
+        self.inner.external_authentication(provider);
+        self
+    }
+
+    /// See [`Config::service_principal_name`].
+    pub fn service_principal_name(mut self, spn: impl ToString) -> Self {
+        self.inner.service_principal_name(spn);
         self
     }
 
