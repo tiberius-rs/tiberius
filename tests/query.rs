@@ -1,3 +1,4 @@
+use futures_util::future::{self, Either};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::TryStreamExt;
 use names::{Generator, Name};
@@ -5,6 +6,7 @@ use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::env;
 use std::sync::Once;
+use std::time::{Duration, Instant};
 
 use tiberius::FromSql;
 use tiberius::{numeric::Numeric, xml::XmlData, ColumnType, Query, QueryItem, Result};
@@ -3179,6 +3181,37 @@ where
 
     let res = query.execute(&mut conn).await?;
     assert_eq!(1, res.total());
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn cancel_query_after_dropping_a_running_query<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let running = Box::pin(conn.simple_query("WAITFOR DELAY '00:00:30'"));
+    let delay = futures_timer::Delay::new(Duration::from_millis(300));
+
+    if let Either::Left(_) = future::select(running, delay).await {
+        panic!("WAITFOR DELAY '00:00:30' must still be running after 300 ms");
+    }
+
+    let started = Instant::now();
+    conn.cancel_query().await?;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "cancel_query must not wait for the WAITFOR to finish, took {:?}",
+        started.elapsed()
+    );
+
+    let row = conn
+        .simple_query("SELECT 1")
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    assert_eq!(Some(1i32), row.get(0));
 
     Ok(())
 }

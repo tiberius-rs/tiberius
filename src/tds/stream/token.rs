@@ -219,7 +219,8 @@ where
     /// received, per MS-TDS section 2.2.1.6. Returns that DONE token so the
     /// connection is left clean and ready for reuse.
     pub(crate) async fn flush_done_attention(self) -> crate::Result<TokenDone> {
-        let mut stream = self.try_unfold();
+        // The acknowledgement can arrive in a later message than the cancelled response.
+        let mut stream = self.unfold(false);
 
         loop {
             match stream.try_next().await? {
@@ -456,6 +457,10 @@ where
     }
 
     pub fn try_unfold(self) -> BoxStream<'a, crate::Result<ReceivedToken>> {
+        self.unfold(true)
+    }
+
+    fn unfold(self, stop_at_end_of_message: bool) -> BoxStream<'a, crate::Result<ReceivedToken>> {
         // Read the per-response command timeout before `self` is moved into the
         // unfold closure. Every command result-read path funnels through here
         // (query/execute/simple_query result streams, the bulk-insert server
@@ -467,8 +472,8 @@ where
         // otherwise unreachable from `RoundTripTimeout`).
         let poison = self.conn.command_desync_flag();
 
-        let stream = futures_util::stream::try_unfold(self, |mut this| async move {
-            if this.conn.is_eof() {
+        let stream = futures_util::stream::try_unfold(self, move |mut this| async move {
+            if stop_at_end_of_message && this.conn.is_eof() {
                 match this.last_error {
                     None => return Ok(None),
                     Some(error) => return Err(error),
@@ -959,6 +964,72 @@ mod tests {
         assert!(
             outcome.is_err(),
             "with no command timeout the read should stay pending on the stalled server"
+        );
+    }
+
+    // --- (e) attention acknowledgement --------------------------------------
+
+    const DONE_ERROR: u16 = 0x02;
+    const DONE_COUNT: u16 = 0x10;
+    const DONE_ATTN: u16 = 0x20;
+
+    // What SQL Server 2022 sends for a batch cancelled before it returned
+    // anything: a DONE_ERROR message, then the DONE_ATTN message.
+    fn cancelled_response_then_ack() -> Vec<u8> {
+        let mut script = packet_bytes(&done_token(DONE_ERROR, 0, 0));
+        script.extend(packet_bytes(&done_token(DONE_ATTN, 0, 0)));
+        script
+    }
+
+    #[tokio::test]
+    async fn cancel_reads_the_ack_from_the_next_message() {
+        let mut conn = Connection::test_over(MockStream::new(cancelled_response_then_ack()), false);
+
+        let done = conn
+            .cancel_request()
+            .await
+            .expect("the acknowledgement in the second message must be read");
+
+        assert!(done.is_attention());
+        assert!(conn.is_eof());
+    }
+
+    #[tokio::test]
+    async fn request_after_cancel_reads_its_own_response() {
+        use crate::tds::codec::BatchRequest;
+
+        let mut script = cancelled_response_then_ack();
+        script.extend(packet_bytes(&done_token(DONE_COUNT, 0, 1)));
+        let mut conn = Connection::test_over(MockStream::new(script), false);
+
+        conn.cancel_request().await.expect("cancel must succeed");
+
+        conn.flush_stream().await.unwrap();
+        let id = conn.context_mut().next_packet_id();
+        let req = BatchRequest::new("SELECT 1", [0; 8]);
+        conn.send(PacketHeader::batch(id), req).await.unwrap();
+
+        let done = TokenStream::new(&mut conn)
+            .flush_done()
+            .await
+            .expect("the next request must read its own DONE");
+
+        assert!(!done.is_attention());
+        assert_eq!(done.rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_fails_when_the_transport_closes_before_the_ack() {
+        let mut conn = conn_over(&done_token(DONE_ERROR, 0, 0));
+
+        let err = conn
+            .cancel_request()
+            .await
+            .expect_err("a closed transport must not count as an acknowledgement");
+
+        assert!(
+            matches!(err, Error::Io { kind, .. } if kind == io::ErrorKind::UnexpectedEof),
+            "expected UnexpectedEof, got: {err:?}"
         );
     }
 }
