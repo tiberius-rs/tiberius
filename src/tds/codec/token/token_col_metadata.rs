@@ -1,7 +1,9 @@
 use std::{borrow::Cow, fmt::Display};
 
 use crate::{
-    tds::codec::{encode_b_varchar, Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
+    tds::codec::{
+        column_data::money, encode_b_varchar, Encode, FixedLenType, TokenType, TypeInfo, VarLenType,
+    },
     Column, ColumnData, ColumnType, Error, SqlReadBytes,
 };
 use asynchronous_codec::BytesMut;
@@ -207,10 +209,10 @@ impl BaseMetaDataColumn {
                 FixedLenType::Int4 => ColumnData::I32(None),
                 FixedLenType::Datetime4 => ColumnData::SmallDateTime(None),
                 FixedLenType::Float4 => ColumnData::F32(None),
-                FixedLenType::Money => ColumnData::F64(None),
+                FixedLenType::Money => money::null_value(),
                 FixedLenType::Datetime => ColumnData::DateTime(None),
                 FixedLenType::Float8 => ColumnData::F64(None),
-                FixedLenType::Money4 => ColumnData::F32(None),
+                FixedLenType::Money4 => money::fixed_smallmoney_null_value(),
                 FixedLenType::Int8 => ColumnData::I64(None),
             },
             TypeInfo::VarLenSized(cx) => match cx.r#type() {
@@ -228,7 +230,7 @@ impl BaseMetaDataColumn {
                     4 => ColumnData::F32(None),
                     _ => ColumnData::F64(None),
                 },
-                VarLenType::Money => ColumnData::F64(None),
+                VarLenType::Money => money::null_value(),
                 VarLenType::Datetimen => ColumnData::DateTime(None),
                 #[cfg(feature = "tds73")]
                 VarLenType::Daten => ColumnData::Date(None),
@@ -263,7 +265,7 @@ impl BaseMetaDataColumn {
                 VarLenType::Decimaln => ColumnData::Numeric(None),
                 VarLenType::Numericn => ColumnData::Numeric(None),
                 VarLenType::Floatn => ColumnData::F32(None),
-                VarLenType::Money => ColumnData::F64(None),
+                VarLenType::Money => money::null_value(),
                 VarLenType::Datetimen => ColumnData::DateTime(None),
                 #[cfg(feature = "tds73")]
                 VarLenType::Daten => ColumnData::Date(None),
@@ -1355,6 +1357,18 @@ mod tests {
         }
     }
 
+    // Every money null placeholder follows the `exact-money` feature together.
+    // Without it they are unchanged from 0.13.0, including `F32(None)` for
+    // fixed-length smallmoney.
+    #[cfg(feature = "exact-money")]
+    const MONEY_NULL: ColumnData<'static> = ColumnData::Numeric(None);
+    #[cfg(feature = "exact-money")]
+    const FIXED_SMALLMONEY_NULL: ColumnData<'static> = ColumnData::Numeric(None);
+    #[cfg(not(feature = "exact-money"))]
+    const MONEY_NULL: ColumnData<'static> = ColumnData::F64(None);
+    #[cfg(not(feature = "exact-money"))]
+    const FIXED_SMALLMONEY_NULL: ColumnData<'static> = ColumnData::F32(None);
+
     #[test]
     fn null_value_all_fixed_len() {
         use FixedLenType::*;
@@ -1366,10 +1380,10 @@ mod tests {
             (Int4, ColumnData::I32(None)),
             (Datetime4, ColumnData::SmallDateTime(None)),
             (Float4, ColumnData::F32(None)),
-            (Money, ColumnData::F64(None)),
+            (Money, MONEY_NULL),
             (Datetime, ColumnData::DateTime(None)),
             (Float8, ColumnData::F64(None)),
-            (Money4, ColumnData::F32(None)),
+            (Money4, FIXED_SMALLMONEY_NULL),
             (Int8, ColumnData::I64(None)),
         ];
 
@@ -1399,7 +1413,8 @@ mod tests {
         assert_eq!(vsize_null(Bitn, 1), ColumnData::Bit(None));
         assert_eq!(vsize_null(Decimaln, 17), ColumnData::Numeric(None));
         assert_eq!(vsize_null(Numericn, 17), ColumnData::Numeric(None));
-        assert_eq!(vsize_null(Money, 8), ColumnData::F64(None));
+        assert_eq!(vsize_null(Money, 8), MONEY_NULL);
+        assert_eq!(vsize_null(Money, 4), MONEY_NULL);
         assert_eq!(vsize_null(Datetimen, 8), ColumnData::DateTime(None));
         assert_eq!(vsize_null(BigVarBin, 100), ColumnData::Binary(None));
         assert_eq!(vsize_null(BigVarChar, 100), ColumnData::String(None));
@@ -1451,7 +1466,7 @@ mod tests {
         assert_eq!(vprec_null(Decimaln), ColumnData::Numeric(None));
         assert_eq!(vprec_null(Numericn), ColumnData::Numeric(None));
         assert_eq!(vprec_null(Floatn), ColumnData::F32(None));
-        assert_eq!(vprec_null(Money), ColumnData::F64(None));
+        assert_eq!(vprec_null(Money), MONEY_NULL);
         assert_eq!(vprec_null(Datetimen), ColumnData::DateTime(None));
         assert_eq!(vprec_null(BigVarBin), ColumnData::Binary(None));
         assert_eq!(vprec_null(BigVarChar), ColumnData::String(None));

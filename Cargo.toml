@@ -248,6 +248,11 @@ sql-browser-tokio = ["tokio", "tokio-util"]
 sql-browser-smol = ["async-io", "async-net", "futures-lite"]
 integrated-auth-gssapi = ["libgssapi"]
 bigdecimal = ["bigdecimal_"]
+# Decode `money` and `smallmoney` exactly, as a scale-4 `Numeric`, instead of
+# an `f64` that loses digits past 2^53. Their nulls become `Numeric(None)`.
+# Read these columns as `Numeric`, or as `Decimal` / `BigDecimal` with the
+# `rust_decimal` / `bigdecimal` features; `f64` no longer accepts them.
+exact-money = []
 rustls = ["tokio-rustls", "tokio-util", "rustls-native-certs", "rustls-webpki", "rustls-pki-types"]
 # Bundle a compiled-in snapshot of Mozilla's root CA store, selectable via
 # `Config::trust_webpki_roots()` (rustls only). Implies `rustls`; the bundled

@@ -1,5 +1,32 @@
 # Changes
 
+## Unreleased
+
+- feat: new default-off `exact-money` feature decodes `money` and `smallmoney`
+  exactly. Default builds decode both as before: values are
+  `ColumnData::F64`, a nullable (`MONEYN`) null is `F64(None)`, and the
+  fixed-length `smallmoney` null placeholder is `F32(None)`.
+
+  The wire carries a scaled integer (value × 10^4). Dividing it in `f64` loses
+  digits past 2^53: `900719925474099.0001` reads back as `900719925474099.0`,
+  and both `money` extremes round. With `exact-money`, values decode as a
+  scale-4 `ColumnData::Numeric`, and every money null decodes as
+  `Numeric(None)`.
+
+  Enabling `exact-money` changes how these columns read:
+  - `row.get::<f64, _>()` panics on a `money` or `smallmoney` column, populated
+    or NULL.
+  - `row.try_get::<f64, _>()` returns `Error::Conversion`.
+  - Read them as `Numeric`, as `rust_decimal::Decimal` with the
+    `rust_decimal` feature, or as `BigDecimal` with the `bigdecimal` feature.
+  - Writing money from `f64` or `Numeric` is unchanged.
+  - A nullable `smallmoney` column reports `ColumnType::Money4`, matching its
+    NOT NULL form. It arrives as nullable money with length 4, which default
+    builds still report as `ColumnType::Money`.
+
+  `VarLenSizedPrecision(Money)` is still rejected as a protocol error. `money`
+  type info carries no precision or scale, so that form is never valid.
+
 ## Version 0.13.0
 
 - feat: TLS trust configuration is revamped around two orthogonal axes plus a

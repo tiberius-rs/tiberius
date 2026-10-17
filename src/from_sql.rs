@@ -14,13 +14,14 @@ use uuid::Uuid;
 /// |`i32`|`int`|
 /// |`i64`|`bigint`|
 /// |`f32`|`float(24)`|
-/// |`f64`|`float(53)`|
+/// |`f64`|`float(53)`, and `money`/`smallmoney` without feature flag `exact-money`|
 /// |`bool`|`bit`|
 /// |`String`/`&str`|`nvarchar`/`varchar`/`nchar`/`char`/`ntext`/`text`|
 /// |`Vec<u8>`/`&[u8]`|`binary`/`varbinary`/`image`|
 /// |[`Uuid`]|`uniqueidentifier`|
-/// |[`Numeric`]|`numeric`/`decimal`|
-/// |[`Decimal`] (with feature flag `rust_decimal`)|`numeric`/`decimal`|
+/// |[`Numeric`]|`numeric`/`decimal`, and `money`/`smallmoney` with feature flag `exact-money`|
+/// |[`Decimal`] (with feature flag `rust_decimal`)|`numeric`/`decimal`, and `money`/`smallmoney` with feature flag `exact-money`|
+/// |[`BigDecimal`] (with feature flag `bigdecimal`)|`numeric`/`decimal`, and `money`/`smallmoney` with feature flag `exact-money`|
 /// |[`XmlData`]|`xml`|
 /// |[`NaiveDateTime`] (with feature flag `chrono`)|`datetime`/`datetime2`/`smalldatetime`|
 /// |[`NaiveDate`] (with feature flag `chrono`)|`date`|
@@ -36,6 +37,7 @@ use uuid::Uuid;
 /// [`Uuid`]: struct.Uuid.html
 /// [`Numeric`]: numeric/struct.Numeric.html
 /// [`Decimal`]: numeric/struct.Decimal.html
+/// [`BigDecimal`]: numeric/struct.BigDecimal.html
 /// [`XmlData`]: xml/struct.XmlData.html
 /// [`NaiveDateTime`]: time/chrono/struct.NaiveDateTime.html
 /// [`NaiveDate`]: time/chrono/struct.NaiveDate.html

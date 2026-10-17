@@ -204,16 +204,27 @@ where
     let res = req.finalize().await?;
     assert_eq!(1, res.total());
 
-    let value: f64 = conn
+    let row = conn
         .query(&format!("SELECT content FROM {}", table), &[])
         .await?
         .into_row()
         .await?
-        .unwrap()
-        .get(0)
         .unwrap();
 
-    assert!((value - 1234.5678).abs() < 1e-6, "got {value}");
+    #[cfg(not(feature = "exact-money"))]
+    {
+        let value: f64 = row.get(0).unwrap();
+        assert!((value - 1234.5678).abs() < 1e-6, "got {value}");
+    }
+
+    #[cfg(feature = "exact-money")]
+    {
+        let value: tiberius::numeric::Numeric = row.get(0).unwrap();
+        assert_eq!(
+            tiberius::numeric::Numeric::new_with_scale(12_345_678, 4),
+            value
+        );
+    }
 
     Ok(())
 }
