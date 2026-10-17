@@ -2654,10 +2654,323 @@ where
         .await?
         .unwrap();
 
-    assert_eq!(Some(1.23), row.get(0));
-    assert_eq!(Some(2.33), row.get(1));
-    assert_eq!(Some(4.56), row.get(2));
-    assert_eq!(Some(5.67), row.get(3));
+    #[cfg(not(feature = "exact-money"))]
+    {
+        assert_eq!(Some(1.23), row.get(0));
+        assert_eq!(Some(2.33), row.get(1));
+        assert_eq!(Some(4.56), row.get(2));
+        assert_eq!(Some(5.67), row.get(3));
+    }
+
+    #[cfg(feature = "exact-money")]
+    {
+        assert_eq!(Some(Numeric::new_with_scale(12300, 4)), row.get(0));
+        assert_eq!(Some(Numeric::new_with_scale(23300, 4)), row.get(1));
+        assert_eq!(Some(Numeric::new_with_scale(45600, 4)), row.get(2));
+        assert_eq!(Some(Numeric::new_with_scale(56700, 4)), row.get(3));
+    }
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn money_smallmoney_column_types<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = random_table().await;
+
+    conn.execute(
+        format!(
+            "CREATE TABLE ##{} (m1 Money NOT NULL, m2 SmallMoney NOT NULL, m3 Money, m4 SmallMoney)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    conn.execute(
+        format!(
+            "INSERT INTO ##{} (m1, m2, m3, m4) VALUES (1.5, 2.5, NULL, NULL)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    // A nullable smallmoney arrives as `Money` with length 4. Without
+    // `exact-money` it reports `Money`, as in 0.13.0.
+    #[cfg(not(feature = "exact-money"))]
+    let expected = [
+        ColumnType::Money,
+        ColumnType::Money4,
+        ColumnType::Money,
+        ColumnType::Money,
+    ];
+
+    #[cfg(feature = "exact-money")]
+    let expected = [
+        ColumnType::Money,
+        ColumnType::Money4,
+        ColumnType::Money,
+        ColumnType::Money4,
+    ];
+
+    // The populated result and the zero-row result report the same types.
+    for filter in ["", " WHERE 1 = 0"] {
+        let mut stream = conn
+            .query(
+                format!("SELECT m1, m2, m3, m4 FROM ##{}{}", table, filter),
+                &[],
+            )
+            .await?;
+
+        let actual: Vec<ColumnType> = stream
+            .columns()
+            .await?
+            .unwrap()
+            .iter()
+            .map(|c| c.column_type())
+            .collect();
+
+        assert_eq!(expected.to_vec(), actual, "filter {:?}", filter);
+
+        stream.into_results().await?;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "exact-money")]
+#[test_on_runtimes]
+async fn money_smallmoney_decode_exactly<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = random_table().await;
+
+    conn.execute(
+        format!(
+            "CREATE TABLE ##{} (id INT NOT NULL, m1 Money NOT NULL, m2 SmallMoney NOT NULL, m3 Money, m4 SmallMoney)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    // Values past f64's 2^53 exact range, their neighbours, both extremes of
+    // each type and negatives. Literals keep the inserted values exact.
+    conn.execute(
+        format!(
+            "INSERT INTO ##{} (id, m1, m2, m3, m4) VALUES
+                (1, 900719925474099.0000, 0.0000, 900719925474099.0000, 0.0000),
+                (2, 900719925474099.0001, 0.0001, 900719925474099.0001, 0.0001),
+                (3, 900719925474099.0002, -0.0001, 900719925474099.0002, -0.0001),
+                (4, 922337203685477.5807, 214748.3647, 922337203685477.5807, 214748.3647),
+                (5, -922337203685477.5808, -214748.3648, -922337203685477.5808, -214748.3648),
+                (6, -900719925474099.0001, -214748.3647, NULL, NULL)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    let rows = conn
+        .query(
+            format!("SELECT m1, m2, m3, m4 FROM ##{} ORDER BY id", table),
+            &[],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let text = |n: Option<Numeric>| n.map(|n| n.to_string());
+    let actual: Vec<[Option<String>; 4]> = rows
+        .iter()
+        .map(|row| {
+            [
+                text(row.get(0)),
+                text(row.get(1)),
+                text(row.get(2)),
+                text(row.get(3)),
+            ]
+        })
+        .collect();
+
+    let some = |s: &str| Some(s.to_owned());
+    let expected = vec![
+        [
+            some("900719925474099.0000"),
+            some("0.0000"),
+            some("900719925474099.0000"),
+            some("0.0000"),
+        ],
+        [
+            some("900719925474099.0001"),
+            some("0.0001"),
+            some("900719925474099.0001"),
+            some("0.0001"),
+        ],
+        [
+            some("900719925474099.0002"),
+            some("-0.0001"),
+            some("900719925474099.0002"),
+            some("-0.0001"),
+        ],
+        [
+            some("922337203685477.5807"),
+            some("214748.3647"),
+            some("922337203685477.5807"),
+            some("214748.3647"),
+        ],
+        [
+            some("-922337203685477.5808"),
+            some("-214748.3648"),
+            some("-922337203685477.5808"),
+            some("-214748.3648"),
+        ],
+        [
+            some("-900719925474099.0001"),
+            some("-214748.3647"),
+            None,
+            None,
+        ],
+    ];
+
+    assert_eq!(expected, actual);
+
+    Ok(())
+}
+
+// The accessor contract for money and smallmoney, in NOT NULL (fixed-length)
+// and nullable (MONEYN) columns, populated and NULL, in both feature states.
+#[test_on_runtimes]
+async fn money_accessor_contract<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = random_table().await;
+
+    conn.execute(
+        format!(
+            "CREATE TABLE ##{} (id INT NOT NULL, m1 Money NOT NULL, m2 SmallMoney NOT NULL, m3 Money, m4 SmallMoney)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    conn.execute(
+        format!(
+            "INSERT INTO ##{} (id, m1, m2, m3, m4) VALUES (1, 1.5, -1.5, 1.5, -1.5), (2, 1.5, -1.5, NULL, NULL)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    let rows = conn
+        .query(
+            format!("SELECT m1, m2, m3, m4 FROM ##{} ORDER BY id", table),
+            &[],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let (populated, nulls) = (&rows[0], &rows[1]);
+
+    #[cfg(not(feature = "exact-money"))]
+    {
+        // Unchanged from 0.13.0: money reads as `f64`, never as a decimal.
+        for (idx, value) in [(0, 1.5), (1, -1.5), (2, 1.5), (3, -1.5)] {
+            assert_eq!(Some(value), populated.get::<f64, _>(idx));
+            assert_eq!(Some(value), populated.try_get::<f64, _>(idx)?);
+            assert!(matches!(
+                populated.try_get::<Numeric, _>(idx),
+                Err(tiberius::error::Error::Conversion(_))
+            ));
+        }
+
+        for idx in [2, 3] {
+            assert_eq!(None, nulls.get::<f64, _>(idx));
+            assert_eq!(None, nulls.try_get::<f64, _>(idx)?);
+        }
+    }
+
+    #[cfg(feature = "exact-money")]
+    {
+        let one_and_a_half = Numeric::new_with_scale(15_000, 4);
+        let minus_one_and_a_half = Numeric::new_with_scale(-15_000, 4);
+
+        for (idx, value) in [
+            (0, one_and_a_half),
+            (1, minus_one_and_a_half),
+            (2, one_and_a_half),
+            (3, minus_one_and_a_half),
+        ] {
+            assert_eq!(Some(value), populated.get::<Numeric, _>(idx));
+            assert_eq!(Some(value), populated.try_get::<Numeric, _>(idx)?);
+        }
+
+        for idx in [2, 3] {
+            assert_eq!(None, nulls.get::<Numeric, _>(idx));
+            assert_eq!(None, nulls.try_get::<Numeric, _>(idx)?);
+        }
+
+        // `f64` no longer accepts money, populated or NULL: `try_get` returns
+        // a conversion error and `get` panics.
+        for (row, idx) in [
+            (populated, 0),
+            (populated, 1),
+            (populated, 2),
+            (populated, 3),
+            (nulls, 2),
+            (nulls, 3),
+        ] {
+            assert!(matches!(
+                row.try_get::<f64, _>(idx),
+                Err(tiberius::error::Error::Conversion(_))
+            ));
+
+            let panicked =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| row.get::<f64, _>(idx)));
+            assert!(panicked.is_err(), "get::<f64>({idx}) must panic");
+        }
+
+        #[cfg(feature = "rust_decimal")]
+        {
+            use tiberius::numeric::Decimal;
+
+            assert_eq!(
+                Some(Decimal::new(15_000, 4)),
+                populated.get::<Decimal, _>(0)
+            );
+            assert_eq!(
+                Some(Decimal::new(-15_000, 4)),
+                populated.get::<Decimal, _>(1)
+            );
+            assert_eq!(None, nulls.try_get::<Decimal, _>(2)?);
+            assert_eq!(None, nulls.try_get::<Decimal, _>(3)?);
+        }
+
+        #[cfg(feature = "bigdecimal")]
+        {
+            use std::str::FromStr;
+            use tiberius::numeric::BigDecimal;
+
+            assert_eq!(
+                Some(BigDecimal::from_str("1.5000").unwrap()),
+                populated.get::<BigDecimal, _>(0)
+            );
+            assert_eq!(
+                Some(BigDecimal::from_str("-1.5000").unwrap()),
+                populated.get::<BigDecimal, _>(1)
+            );
+            assert_eq!(None, nulls.try_get::<BigDecimal, _>(2)?);
+            assert_eq!(None, nulls.try_get::<BigDecimal, _>(3)?);
+        }
+    }
 
     Ok(())
 }

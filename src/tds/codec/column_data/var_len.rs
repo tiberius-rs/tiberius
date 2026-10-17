@@ -110,6 +110,9 @@ mod tests {
 
         let ctx = VarLenContext::new(VarLenType::Money, 8, None);
         let data = decode(&mut buf.into_sql_read_bytes(), &ctx).await.unwrap();
+        #[cfg(feature = "exact-money")]
+        assert_eq!(data, ColumnData::Numeric(None));
+        #[cfg(not(feature = "exact-money"))]
         assert_eq!(data, ColumnData::F64(None));
     }
 

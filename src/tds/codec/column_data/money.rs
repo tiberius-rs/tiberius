@@ -213,6 +213,42 @@ where
     put_scaled(dst, max_len, scaled, &num, length_prefixed)
 }
 
+/// The null a nullable money column (`MONEYN`) decodes to.
+///
+/// With the `exact-money` feature this is `Numeric(None)`, matching the decoded
+/// values. Without it, it stays `F64(None)`.
+pub(crate) fn null_value() -> ColumnData<'static> {
+    #[cfg(feature = "exact-money")]
+    {
+        ColumnData::Numeric(None)
+    }
+    #[cfg(not(feature = "exact-money"))]
+    {
+        ColumnData::F64(None)
+    }
+}
+
+/// The null placeholder for fixed-length `smallmoney` metadata.
+///
+/// With the `exact-money` feature this is `Numeric(None)`. Without it, it stays
+/// `F32(None)`, as it was before the feature existed.
+pub(crate) fn fixed_smallmoney_null_value() -> ColumnData<'static> {
+    #[cfg(feature = "exact-money")]
+    {
+        ColumnData::Numeric(None)
+    }
+    #[cfg(not(feature = "exact-money"))]
+    {
+        ColumnData::F32(None)
+    }
+}
+
+/// Decode a money/smallmoney value.
+///
+/// With the `exact-money` feature the value decodes exactly, as a scale-4
+/// [`Numeric`](crate::tds::Numeric). Without it, the scaled integer is divided
+/// in `f64`, which loses digits past 2^53.
+#[cfg(not(feature = "exact-money"))]
 pub(crate) async fn decode<R>(src: &mut R, len: u8) -> crate::Result<ColumnData<'static>>
 where
     R: SqlReadBytes + Unpin,
@@ -236,37 +272,327 @@ where
     Ok(res)
 }
 
+/// Decode a money/smallmoney value.
+///
+/// With the `exact-money` feature the value decodes exactly, as a scale-4
+/// [`Numeric`](crate::tds::Numeric). Without it, the scaled integer is divided
+/// in `f64`, which loses digits past 2^53.
+#[cfg(feature = "exact-money")]
+pub(crate) async fn decode<R>(src: &mut R, len: u8) -> crate::Result<ColumnData<'static>>
+where
+    R: SqlReadBytes + Unpin,
+{
+    let scaled = match len {
+        0 => return Ok(ColumnData::Numeric(None)),
+        4 => src.read_i32_le().await? as i64,
+        8 => {
+            let high = src.read_i32_le().await? as i64;
+            let low = src.read_u32_le().await? as i64;
+            (high << 32) | low
+        }
+        _ => {
+            return Err(Error::Protocol(
+                format!("money: length of {} is invalid", len).into(),
+            ))
+        }
+    };
+
+    Ok(ColumnData::Numeric(Some(
+        crate::tds::Numeric::new_with_scale(scaled as i128, MONEY_SCALE as u8),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
     use bytes::{BufMut, BytesMut};
 
-    // `smallmoney` (len 4) is a single scaled `i32` divided by 1e4: 12345 -> 1.2345.
-    #[tokio::test]
-    async fn decode_smallmoney_arm() {
-        let mut buf = BytesMut::new();
-        buf.put_i32_le(12345);
+    // Without `exact-money`, decoding is unchanged from 0.13.0: the scaled
+    // integer is divided in `f64`, and a null is `F64(None)`.
+    #[cfg(not(feature = "exact-money"))]
+    mod float {
+        use super::*;
 
-        let data = decode(&mut buf.into_sql_read_bytes(), 4).await.unwrap();
-        match data {
-            ColumnData::F64(Some(v)) => assert!((v - 1.2345).abs() < 1e-9, "v={}", v),
-            other => panic!("expected F64, got {:?}", other),
+        // `smallmoney` (len 4) is a single scaled `i32` divided by 1e4: 12345 -> 1.2345.
+        #[tokio::test]
+        async fn decode_smallmoney_arm() {
+            let mut buf = BytesMut::new();
+            buf.put_i32_le(12345);
+
+            let data = decode(&mut buf.into_sql_read_bytes(), 4).await.unwrap();
+            match data {
+                ColumnData::F64(Some(v)) => assert!((v - 1.2345).abs() < 1e-9, "v={}", v),
+                other => panic!("expected F64, got {:?}", other),
+            }
+        }
+
+        // `money` (len 8) is two 32-bit words: `((high << 32) + low) / 1e4`.
+        // high = 1, low = 30000 gives ((1 << 32) + 30000) / 1e4 = 429499.7296.
+        #[tokio::test]
+        async fn decode_money_arm() {
+            let mut buf = BytesMut::new();
+            buf.put_i32_le(1); // high word
+            buf.put_u32_le(30000); // low word
+
+            let data = decode(&mut buf.into_sql_read_bytes(), 8).await.unwrap();
+            match data {
+                ColumnData::F64(Some(v)) => assert!((v - 429499.7296).abs() < 1e-6, "v={}", v),
+                other => panic!("expected F64, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn decode_null_is_f64_none() {
+            let buf = BytesMut::new();
+            let data = decode(&mut buf.into_sql_read_bytes(), 0).await.unwrap();
+            assert_eq!(data, ColumnData::F64(None));
+        }
+
+        #[test]
+        fn null_placeholders_are_unchanged() {
+            assert_eq!(null_value(), ColumnData::F64(None));
+            assert_eq!(fixed_smallmoney_null_value(), ColumnData::F32(None));
         }
     }
 
-    // `money` (len 8) is two 32-bit words: `((high << 32) + low) / 1e4`.
-    // high = 1, low = 30000 gives ((1 << 32) + 30000) / 1e4 = 429499.7296.
-    #[tokio::test]
-    async fn decode_money_arm() {
-        let mut buf = BytesMut::new();
-        buf.put_i32_le(1); // high word
-        buf.put_u32_le(30000); // low word
+    // With `exact-money`, money decodes exactly as a scale-4 `Numeric`.
+    #[cfg(feature = "exact-money")]
+    mod exact {
+        use super::*;
+        use crate::tds::codec::{FixedLenType, TypeInfo, VarLenContext, VarLenType};
+        use crate::tds::Numeric;
 
-        let data = decode(&mut buf.into_sql_read_bytes(), 8).await.unwrap();
-        match data {
-            ColumnData::F64(Some(v)) => assert!((v - 429499.7296).abs() < 1e-6, "v={}", v),
-            other => panic!("expected F64, got {:?}", other),
+        // Decode the raw (unprefixed) money bytes of a `len`-byte value, asserting
+        // the result is an exact scale-4 `Numeric` holding `scaled`.
+        async fn assert_decodes_exactly(len: u8, scaled: i64) {
+            let mut buf = BytesMut::new();
+            match len {
+                4 => buf.put_i32_le(scaled as i32),
+                8 => {
+                    buf.put_i32_le((scaled >> 32) as i32); // high word
+                    buf.put_u32_le(scaled as u32); // low word
+                }
+                _ => unreachable!(),
+            }
+
+            let data = decode(&mut buf.into_sql_read_bytes(), len).await.unwrap();
+            match data {
+                ColumnData::Numeric(Some(n)) => {
+                    assert_eq!(n.value(), scaled as i128, "len={len}");
+                    assert_eq!(n.scale(), 4, "len={len}");
+                }
+                other => panic!("expected Numeric, got {:?}", other),
+            }
+        }
+
+        // `smallmoney` (len 4) is a single scaled `i32`: 12345 -> 1.2345.
+        #[tokio::test]
+        async fn decode_smallmoney_arm() {
+            let mut buf = BytesMut::new();
+            buf.put_i32_le(12345);
+
+            let data = decode(&mut buf.into_sql_read_bytes(), 4).await.unwrap();
+            assert_eq!(
+                data,
+                ColumnData::Numeric(Some(Numeric::new_with_scale(12345, 4)))
+            );
+        }
+
+        // `money` (len 8) is two 32-bit words, high word first.
+        // high = 1, low = 30000 gives (1 << 32) + 30000 = 4294997296 -> 429499.7296.
+        #[tokio::test]
+        async fn decode_money_arm() {
+            let mut buf = BytesMut::new();
+            buf.put_i32_le(1); // high word
+            buf.put_u32_le(30000); // low word
+
+            let data = decode(&mut buf.into_sql_read_bytes(), 8).await.unwrap();
+            assert_eq!(
+                data,
+                ColumnData::Numeric(Some(Numeric::new_with_scale(4_294_997_296, 4)))
+            );
+        }
+
+        // The full `smallmoney` range, its neighbours and negatives decode exactly.
+        #[tokio::test]
+        async fn decode_smallmoney_extremes_and_neighbours_are_exact() {
+            for scaled in [
+                i32::MIN,
+                i32::MIN + 1,
+                -10_000,
+                -1,
+                0,
+                1,
+                10_000,
+                i32::MAX - 1,
+                i32::MAX,
+            ] {
+                assert_decodes_exactly(4, scaled as i64).await;
+            }
+        }
+
+        // The full `money` range, its neighbours and negatives decode exactly,
+        // including values whose scaled form is far past f64's 2^53 exact range.
+        #[tokio::test]
+        async fn decode_money_extremes_and_neighbours_are_exact() {
+            for scaled in [
+                i64::MIN,
+                i64::MIN + 1,
+                -9_007_199_254_740_990_001,
+                -(1 << 32),
+                -1,
+                0,
+                1,
+                (1 << 32) - 1,
+                1 << 32,
+                9_007_199_254_740_990_000,
+                9_007_199_254_740_990_001,
+                9_007_199_254_740_990_002,
+                i64::MAX - 1,
+                i64::MAX,
+            ] {
+                assert_decodes_exactly(8, scaled).await;
+            }
+        }
+
+        // 900719925474099.0001 and its neighbours collapse to one value through
+        // f64; the exact decode keeps them distinct and prints them verbatim.
+        #[tokio::test]
+        async fn decode_money_keeps_adjacent_values_distinct() {
+            let mut seen = Vec::new();
+            for scaled in [
+                9_007_199_254_740_990_000_i64,
+                9_007_199_254_740_990_001,
+                9_007_199_254_740_990_002,
+            ] {
+                let mut buf = BytesMut::new();
+                buf.put_i32_le((scaled >> 32) as i32);
+                buf.put_u32_le(scaled as u32);
+
+                match decode(&mut buf.into_sql_read_bytes(), 8).await.unwrap() {
+                    ColumnData::Numeric(Some(n)) => seen.push(n.to_string()),
+                    other => panic!("expected Numeric, got {:?}", other),
+                }
+            }
+
+            assert_eq!(
+                seen,
+                [
+                    "900719925474099.0000",
+                    "900719925474099.0001",
+                    "900719925474099.0002"
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn decode_money_extremes_display_exactly() {
+            for (scaled, expected) in [
+                (i64::MAX, "922337203685477.5807"),
+                (i64::MIN, "-922337203685477.5808"),
+                (-1, "-0.0001"),
+            ] {
+                let mut buf = BytesMut::new();
+                buf.put_i32_le((scaled >> 32) as i32);
+                buf.put_u32_le(scaled as u32);
+
+                let data = decode(&mut buf.into_sql_read_bytes(), 8).await.unwrap();
+                match data {
+                    ColumnData::Numeric(Some(n)) => assert_eq!(n.to_string(), expected),
+                    other => panic!("expected Numeric, got {:?}", other),
+                }
+            }
+
+            for (scaled, expected) in [
+                (i32::MAX, "214748.3647"),
+                (i32::MIN, "-214748.3648"),
+                (-1, "-0.0001"),
+            ] {
+                let mut buf = BytesMut::new();
+                buf.put_i32_le(scaled);
+
+                let data = decode(&mut buf.into_sql_read_bytes(), 4).await.unwrap();
+                match data {
+                    ColumnData::Numeric(Some(n)) => assert_eq!(n.to_string(), expected),
+                    other => panic!("expected Numeric, got {:?}", other),
+                }
+            }
+        }
+
+        // A zero length is a `MONEYN` null, for both money and smallmoney columns.
+        #[tokio::test]
+        async fn decode_null_is_numeric_none() {
+            let buf = BytesMut::new();
+            let data = decode(&mut buf.into_sql_read_bytes(), 0).await.unwrap();
+            assert_eq!(data, ColumnData::Numeric(None));
+        }
+
+        // Both wire forms, end to end through `ColumnData::decode`: a NOT-NULL
+        // column is `FixedLen(Money/Money4)` with raw bytes, a nullable one is
+        // `VarLenSized(Money)` with a length byte (0 for NULL).
+        #[tokio::test]
+        async fn decode_fixed_and_nullable_wire_forms() {
+            let money: i64 = 9_007_199_254_740_990_001; // 900719925474099.0001
+            let smallmoney: i32 = -2_147_483_648; // -214748.3648
+
+            let mut money_bytes = BytesMut::new();
+            money_bytes.put_i32_le((money >> 32) as i32);
+            money_bytes.put_u32_le(money as u32);
+            let mut smallmoney_bytes = BytesMut::new();
+            smallmoney_bytes.put_i32_le(smallmoney);
+
+            let money_num = Numeric::new_with_scale(money as i128, 4);
+            let smallmoney_num = Numeric::new_with_scale(smallmoney as i128, 4);
+
+            let cases = [
+                (
+                    TypeInfo::FixedLen(FixedLenType::Money),
+                    money_bytes.to_vec(),
+                    ColumnData::Numeric(Some(money_num)),
+                ),
+                (
+                    TypeInfo::FixedLen(FixedLenType::Money4),
+                    smallmoney_bytes.to_vec(),
+                    ColumnData::Numeric(Some(smallmoney_num)),
+                ),
+                (
+                    TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 8, None)),
+                    [&[8u8][..], &money_bytes[..]].concat(),
+                    ColumnData::Numeric(Some(money_num)),
+                ),
+                (
+                    TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 4, None)),
+                    [&[4u8][..], &smallmoney_bytes[..]].concat(),
+                    ColumnData::Numeric(Some(smallmoney_num)),
+                ),
+                (
+                    TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 8, None)),
+                    vec![0u8],
+                    ColumnData::Numeric(None),
+                ),
+                (
+                    TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 4, None)),
+                    vec![0u8],
+                    ColumnData::Numeric(None),
+                ),
+            ];
+
+            for (ti, bytes, expected) in cases {
+                let buf = BytesMut::from(&bytes[..]);
+                let reader = &mut buf.into_sql_read_bytes();
+                let data = ColumnData::decode(reader, &ti).await.unwrap();
+                assert_eq!(data, expected, "ti={ti:?}");
+                if let ColumnData::Numeric(Some(n)) = data {
+                    assert_eq!(n.scale(), 4, "ti={ti:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn null_placeholders_are_numeric_none() {
+            assert_eq!(null_value(), ColumnData::Numeric(None));
+            assert_eq!(fixed_smallmoney_null_value(), ColumnData::Numeric(None));
         }
     }
 

@@ -17,7 +17,7 @@ mod int;
 mod legacy_codepages;
 #[cfg(test)]
 mod lossy_codepage;
-mod money;
+pub(crate) mod money;
 mod plp;
 mod sql_variant;
 mod string;
@@ -2049,20 +2049,68 @@ mod tests {
         }
     }
 
+    // Money decodes as an `F64` by default, and exactly as a scale-4 `Numeric`
+    // with the `exact-money` feature.
+    fn decoded_money(value: f64, scaled: i128) -> ColumnData<'static> {
+        #[cfg(feature = "exact-money")]
+        {
+            let _ = value;
+            ColumnData::Numeric(Some(Numeric::new_with_scale(scaled, 4)))
+        }
+        #[cfg(not(feature = "exact-money"))]
+        {
+            let _ = scaled;
+            ColumnData::F64(Some(value))
+        }
+    }
+
+    fn decoded_money_null() -> ColumnData<'static> {
+        #[cfg(feature = "exact-money")]
+        {
+            ColumnData::Numeric(None)
+        }
+        #[cfg(not(feature = "exact-money"))]
+        {
+            ColumnData::F64(None)
+        }
+    }
+
+    // Money is written from an `F64`; see `decoded_money` for what it reads as.
+    async fn test_money_round_trip(ti: TypeInfo, d: ColumnData<'_>, expected: ColumnData<'_>) {
+        let mut buf = BytesMut::new();
+        let mut buf_with_ti = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+
+        d.encode(&mut buf_with_ti).expect("encode must succeed");
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let nd = ColumnData::decode(reader, &ti)
+            .await
+            .expect("decode must succeed");
+
+        assert_eq!(nd, expected);
+
+        reader
+            .read_u8()
+            .await
+            .expect_err("decode must consume entire buffer");
+    }
+
     #[tokio::test]
     async fn f64_with_fixedlen_money() {
-        test_round_trip(
+        test_money_round_trip(
             TypeInfo::FixedLen(FixedLenType::Money),
             ColumnData::F64(Some(3.5)),
+            decoded_money(3.5, 35000),
         )
         .await;
     }
 
     #[tokio::test]
     async fn f64_with_fixedlen_smallmoney() {
-        test_round_trip(
+        test_money_round_trip(
             TypeInfo::FixedLen(FixedLenType::Money4),
             ColumnData::F64(Some(3.5)),
+            decoded_money(3.5, 35000),
         )
         .await;
     }
@@ -2203,18 +2251,20 @@ mod tests {
 
     #[tokio::test]
     async fn f64_with_varlen_money() {
-        test_round_trip(
+        test_money_round_trip(
             TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 8, None)),
             ColumnData::F64(Some(3.5)),
+            decoded_money(3.5, 35000),
         )
         .await;
     }
 
     #[tokio::test]
     async fn none_f64_with_varlen_money() {
-        test_round_trip(
+        test_money_round_trip(
             TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 8, None)),
             ColumnData::F64(None),
+            decoded_money_null(),
         )
         .await;
     }
@@ -2394,7 +2444,7 @@ mod tests {
 
         let reader = &mut buf.into_sql_read_bytes();
         let nd = ColumnData::decode(reader, &ti).await.unwrap();
-        assert_eq!(nd, ColumnData::F64(Some(3.5)));
+        assert_eq!(nd, decoded_money(3.5, 35000));
     }
 
     #[tokio::test]
@@ -2404,7 +2454,7 @@ mod tests {
 
         let reader = &mut buf.into_sql_read_bytes();
         let nd = ColumnData::decode(reader, &ti).await.unwrap();
-        assert_eq!(nd, ColumnData::F64(None));
+        assert_eq!(nd, decoded_money_null());
     }
 
     // ----- Numeric rescale on encode (lines 859-879) -----

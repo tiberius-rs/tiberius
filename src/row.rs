@@ -140,6 +140,10 @@ impl From<&TypeInfo> for ColumnType {
                     8 => Self::Float8,
                     _ => Self::Floatn,
                 },
+                // A nullable smallmoney is `Money` with length 4. With
+                // `exact-money` it reports `Money4`, matching its NOT NULL form.
+                #[cfg(feature = "exact-money")]
+                VarLenType::Money if cx.len() == 4 => Self::Money4,
                 VarLenType::Money => Self::Money,
                 VarLenType::Datetimen => Self::Datetimen,
                 #[cfg(feature = "tds73")]
@@ -1291,6 +1295,10 @@ mod tests {
             (VarLenType::Floatn, 8, ColumnType::Float8),
             (VarLenType::Floatn, 2, ColumnType::Floatn),
             (VarLenType::Money, 8, ColumnType::Money),
+            #[cfg(not(feature = "exact-money"))]
+            (VarLenType::Money, 4, ColumnType::Money),
+            #[cfg(feature = "exact-money")]
+            (VarLenType::Money, 4, ColumnType::Money4),
             (VarLenType::Datetimen, 8, ColumnType::Datetimen),
             (VarLenType::BigVarBin, 8000, ColumnType::BigVarBin),
             (VarLenType::BigVarChar, 8000, ColumnType::BigVarChar),
@@ -1411,6 +1419,149 @@ mod tests {
                 scale: 7,
             };
             assert_eq!(ColumnType::from(&ti), expected, "{:?}", ty);
+        }
+    }
+
+    // The money accessor contract at the row level, through the real decoder
+    // and the metadata null placeholders that an NBCROW substitutes for
+    // omitted values. Index 0 is a decoded money value, 1 a decoded
+    // smallmoney value, 2 a decoded MONEYN null, 3 the nullable money
+    // placeholder and 4 the fixed-length smallmoney placeholder.
+    async fn money_contract_row() -> Row {
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+        use crate::tds::codec::{
+            BaseMetaDataColumn, FixedLenType, TypeInfo, VarLenContext, VarLenType,
+        };
+        use bytes::{BufMut, BytesMut};
+
+        fn placeholder(ty: TypeInfo) -> ColumnData<'static> {
+            BaseMetaDataColumn {
+                flags: Default::default(),
+                ty,
+                table_name: None,
+            }
+            .null_value()
+        }
+
+        async fn decode(bytes: BytesMut, ti: TypeInfo) -> ColumnData<'static> {
+            ColumnData::decode(&mut bytes.into_sql_read_bytes(), &ti)
+                .await
+                .unwrap()
+        }
+
+        let mut m = BytesMut::new();
+        m.put_i32_le(0);
+        m.put_u32_le(15_000); // 1.5
+        let mut sm = BytesMut::new();
+        sm.put_i32_le(-15_000); // -1.5
+        let mut null = BytesMut::new();
+        null.put_u8(0);
+
+        RowBuilder::default()
+            .column(
+                "m",
+                ColumnType::Money,
+                decode(m, TypeInfo::FixedLen(FixedLenType::Money)).await,
+            )
+            .column(
+                "sm",
+                ColumnType::Money4,
+                decode(sm, TypeInfo::FixedLen(FixedLenType::Money4)).await,
+            )
+            .column(
+                "mn",
+                ColumnType::Money,
+                decode(
+                    null,
+                    TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Money, 8, None)),
+                )
+                .await,
+            )
+            .column(
+                "nbc_mn",
+                ColumnType::Money,
+                placeholder(TypeInfo::VarLenSized(VarLenContext::new(
+                    VarLenType::Money,
+                    8,
+                    None,
+                ))),
+            )
+            .column(
+                "nbc_sm",
+                ColumnType::Money4,
+                placeholder(TypeInfo::FixedLen(FixedLenType::Money4)),
+            )
+            .build()
+    }
+
+    // Without `exact-money` the 0.13.0 contract holds: values and MONEYN nulls
+    // read as `f64`, and the fixed-length smallmoney placeholder is `F32(None)`.
+    #[cfg(not(feature = "exact-money"))]
+    #[tokio::test]
+    async fn money_contract_without_exact_money() {
+        let row = money_contract_row().await;
+
+        assert_eq!(Some(1.5), row.get::<f64, _>(0));
+        assert_eq!(Some(-1.5), row.get::<f64, _>(1));
+        assert_eq!(None, row.get::<f64, _>(2));
+        assert_eq!(None, row.try_get::<f64, _>(3).unwrap());
+
+        assert!(matches!(
+            row.try_get::<f64, _>(4),
+            Err(crate::Error::Conversion(_))
+        ));
+        assert_eq!(None, row.try_get::<f32, _>(4).unwrap());
+
+        for idx in 0..5 {
+            assert!(matches!(
+                row.try_get::<crate::tds::Numeric, _>(idx),
+                Err(crate::Error::Conversion(_))
+            ));
+        }
+    }
+
+    // With `exact-money` every value and null is a scale-4 `Numeric`, and `f64`
+    // rejects them all: `try_get` errors and `get` panics.
+    #[cfg(feature = "exact-money")]
+    #[tokio::test]
+    async fn money_contract_with_exact_money() {
+        use crate::tds::Numeric;
+
+        let row = money_contract_row().await;
+
+        assert_eq!(Some(Numeric::new_with_scale(15_000, 4)), row.get(0));
+        assert_eq!(
+            Some(Numeric::new_with_scale(-15_000, 4)),
+            row.try_get(1).unwrap()
+        );
+        for idx in 2..5 {
+            assert_eq!(None, row.get::<Numeric, _>(idx));
+            assert_eq!(None, row.try_get::<Numeric, _>(idx).unwrap());
+        }
+
+        for idx in 0..5 {
+            assert!(matches!(
+                row.try_get::<f64, _>(idx),
+                Err(crate::Error::Conversion(_))
+            ));
+            let panicked =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| row.get::<f64, _>(idx)));
+            assert!(panicked.is_err(), "get::<f64>({idx}) must panic");
+        }
+
+        #[cfg(feature = "rust_decimal")]
+        {
+            use crate::tds::numeric::Decimal;
+            assert_eq!(Some(Decimal::new(15_000, 4)), row.get(0));
+            assert_eq!(None, row.try_get::<Decimal, _>(4).unwrap());
+        }
+
+        #[cfg(feature = "bigdecimal")]
+        {
+            use crate::tds::numeric::BigDecimal;
+            use std::str::FromStr;
+            assert_eq!(Some(BigDecimal::from_str("-1.5000").unwrap()), row.get(1));
+            assert_eq!(None, row.try_get::<BigDecimal, _>(4).unwrap());
         }
     }
 }
