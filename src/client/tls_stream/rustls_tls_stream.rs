@@ -168,62 +168,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
     pub(super) async fn new(config: &Config, stream: S) -> crate::Result<Self> {
         event!(Level::DEBUG, "Performing a TLS handshake");
 
-        let provider = resolve_crypto_provider(CryptoProvider::get_default().cloned());
+        let connector = TlsConnector::from(client_config(config)?);
+        let server_name = get_server_name(config)?;
 
-        // Negotiate the best available protocol version (TLS 1.2 or 1.3), the
-        // same policy as upstream's previous `with_safe_defaults()`.
-        let builder = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| crate::Error::Tls(e.to_string()))?;
-
-        // First select the server-certificate verification strategy, yielding a
-        // builder that still awaits the client-authentication decision.
-        let cc_builder: ConfigBuilder<ClientConfig, WantsClientCert> = if config.trust.bypass {
-            event!(
-                Level::WARN,
-                "Trusting the server certificate without validation."
-            );
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
-        } else {
-            // Build the root store from the configured base source plus any
-            // accumulated extra CAs, then validate against it.
-            let store = build_trust_store(&config.trust)?;
-            builder.with_root_certificates(store)
+        let tls_stream = match config.get_rustls_client_config() {
+            // The remedies `map_handshake_error` suggests are trust settings,
+            // which a caller-supplied configuration replaces, so its failures
+            // pass through unchanged.
+            Some(_) => connector.connect(server_name, stream.compat()).await?,
+            None => connector
+                .connect(server_name, stream.compat())
+                .await
+                .map_err(|e| map_handshake_error(e, &config.trust))?,
         };
-
-        // Present a client certificate (mutual TLS / TDS 8.0
-        // `ENCRYPT_CLIENT_CERT`) if one was configured, otherwise finalize
-        // without client authentication.
-        let mut client_config = match config.get_client_certificate() {
-            Some(cert) => {
-                event!(
-                    Level::DEBUG,
-                    "Presenting a client certificate for mutual TLS."
-                );
-                let (chain, key) = load_client_auth(cert)?;
-                cc_builder
-                    .with_client_auth_cert(chain, key)
-                    .map_err(|e| crate::Error::Tls(e.to_string()))?
-            }
-            None => cc_builder.with_no_client_auth(),
-        };
-
-        // TDS 8.0 "strict" mode advertises the `tds/8.0` ALPN protocol so the
-        // server knows to speak TDS directly over the TLS stream.
-        if matches!(config.encryption, crate::EncryptionLevel::Strict) {
-            client_config
-                .alpn_protocols
-                .push(super::TDS_ALPN_PROTOCOL_NAME.as_bytes().to_vec());
-        }
-
-        let connector = TlsConnector::from(Arc::new(client_config));
-
-        let tls_stream = connector
-            .connect(get_server_name(config)?, stream.compat())
-            .await
-            .map_err(|e| map_handshake_error(e, &config.trust))?;
 
         Ok(TlsStream(tls_stream.compat()))
     }
@@ -263,6 +220,76 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
         let inner = Pin::get_mut(self);
         Pin::new(&mut inner.0).poll_close(cx)
     }
+}
+
+/// The rustls client configuration for `config`: the caller's own (see
+/// [`Config::rustls_client_config`]), or one built from the trust settings and
+/// client certificate. TDS 8.0 "strict" mode advertises the `tds/8.0` ALPN
+/// protocol so the server knows to speak TDS directly over the TLS stream.
+fn client_config(config: &Config) -> crate::Result<Arc<ClientConfig>> {
+    let strict = matches!(config.encryption, crate::EncryptionLevel::Strict);
+    let alpn = super::TDS_ALPN_PROTOCOL_NAME.as_bytes();
+
+    if let Some(given) = config.get_rustls_client_config() {
+        event!(
+            Level::DEBUG,
+            "Using the caller-supplied rustls ClientConfig; trust settings are not consulted."
+        );
+        if !strict || given.alpn_protocols.iter().any(|p| p == alpn) {
+            return Ok(given.clone());
+        }
+        let mut client_config = ClientConfig::clone(given);
+        client_config.alpn_protocols.push(alpn.to_vec());
+        return Ok(Arc::new(client_config));
+    }
+
+    let provider = resolve_crypto_provider(CryptoProvider::get_default().cloned());
+
+    // Negotiate the best available protocol version (TLS 1.2 or 1.3), the
+    // same policy as upstream's previous `with_safe_defaults()`.
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| crate::Error::Tls(e.to_string()))?;
+
+    // First select the server-certificate verification strategy, yielding a
+    // builder that still awaits the client-authentication decision.
+    let cc_builder: ConfigBuilder<ClientConfig, WantsClientCert> = if config.trust.bypass {
+        event!(
+            Level::WARN,
+            "Trusting the server certificate without validation."
+        );
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+    } else {
+        // Build the root store from the configured base source plus any
+        // accumulated extra CAs, then validate against it.
+        let store = build_trust_store(&config.trust)?;
+        builder.with_root_certificates(store)
+    };
+
+    // Present a client certificate (mutual TLS / TDS 8.0
+    // `ENCRYPT_CLIENT_CERT`) if one was configured, otherwise finalize
+    // without client authentication.
+    let mut client_config = match config.get_client_certificate() {
+        Some(cert) => {
+            event!(
+                Level::DEBUG,
+                "Presenting a client certificate for mutual TLS."
+            );
+            let (chain, key) = load_client_auth(cert)?;
+            cc_builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| crate::Error::Tls(e.to_string()))?
+        }
+        None => cc_builder.with_no_client_auth(),
+    };
+
+    if strict {
+        client_config.alpn_protocols.push(alpn.to_vec());
+    }
+
+    Ok(Arc::new(client_config))
 }
 
 /// Resolve the rustls `CryptoProvider`: honour a process-installed default
@@ -996,6 +1023,155 @@ mod tests {
             }
             other => panic!("expected Error::Io, got: {other:?}"),
         }
+    }
+
+    /// Verification time pinned inside the `docker/certs` fixtures' validity
+    /// window (2027-01-15), so the handshake tests below do not start failing
+    /// once `server.crt` expires.
+    #[derive(Debug)]
+    struct FixedTime;
+
+    impl tokio_rustls::rustls::time_provider::TimeProvider for FixedTime {
+        fn current_time(&self) -> Option<UnixTime> {
+            Some(UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+                1_800_000_000,
+            )))
+        }
+    }
+
+    /// A caller-built client configuration trusting only `ca` (`customCA` is
+    /// the issuer of `docker/certs/server.crt`).
+    fn caller_client_config(ca: &str) -> Arc<ClientConfig> {
+        let mut roots = RootCertStore::empty();
+        for cert in certs::certs_from_file(Path::new(ca)).unwrap() {
+            roots.add(cert).unwrap();
+        }
+        let config = ClientConfig::builder_with_details(
+            Arc::new(aws_lc_rs::default_provider()),
+            Arc::new(FixedTime),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Arc::new(config)
+    }
+
+    fn caller_config(encryption: crate::EncryptionLevel, tls: Arc<ClientConfig>) -> Config {
+        let mut config = make_config(Some("localhost"), None, default_trust());
+        config.encryption = encryption;
+        config.rustls_client_config(tls);
+        config
+    }
+
+    #[test]
+    fn client_config_uses_caller_config_as_is() {
+        let tls = caller_client_config("docker/certs/customCA.crt");
+        let config = caller_config(crate::EncryptionLevel::Required, tls.clone());
+        let got = client_config(&config).unwrap();
+        assert!(
+            Arc::ptr_eq(&got, &tls),
+            "without strict encryption the caller's configuration is used unchanged"
+        );
+        assert!(got.alpn_protocols.is_empty());
+    }
+
+    #[test]
+    fn client_config_adds_tds_alpn_for_strict_without_mutating_caller() {
+        let tls = caller_client_config("docker/certs/customCA.crt");
+        let config = caller_config(crate::EncryptionLevel::Strict, tls.clone());
+        let got = client_config(&config).unwrap();
+        assert_eq!(got.alpn_protocols, vec![b"tds/8.0".to_vec()]);
+        assert!(
+            tls.alpn_protocols.is_empty(),
+            "the caller's configuration must not be modified"
+        );
+        assert!(
+            Arc::ptr_eq(got.crypto_provider(), tls.crypto_provider()),
+            "the caller's crypto provider must be kept"
+        );
+    }
+
+    #[test]
+    fn client_config_does_not_duplicate_tds_alpn() {
+        let mut tls = ClientConfig::clone(&caller_client_config("docker/certs/customCA.crt"));
+        tls.alpn_protocols = vec![b"tds/8.0".to_vec()];
+        let tls = Arc::new(tls);
+        let config = caller_config(crate::EncryptionLevel::Strict, tls.clone());
+        let got = client_config(&config).unwrap();
+        assert!(Arc::ptr_eq(&got, &tls));
+        assert_eq!(got.alpn_protocols, vec![b"tds/8.0".to_vec()]);
+    }
+
+    #[test]
+    fn client_config_does_not_consult_trust_settings_for_caller_config() {
+        // An unreadable CA file fails the built-in configuration ...
+        let mut config = make_config(Some("localhost"), None, ca_file_trust("does/not/exist.pem"));
+        assert!(client_config(&config).is_err());
+        // ... but is never read when the caller supplies the configuration.
+        config.rustls_client_config(caller_client_config("docker/certs/customCA.crt"));
+        assert!(client_config(&config).is_ok());
+    }
+
+    /// Runs a TLS handshake over an in-memory pipe against a server presenting
+    /// `docker/certs/server.crt` (issued by `customCA`, valid for `localhost`)
+    /// and offering the `tds/8.0` ALPN protocol. Returns the client's result
+    /// and the ALPN protocol the server negotiated.
+    async fn handshake_with_test_server(
+        config: &Config,
+    ) -> (
+        crate::Result<TlsStream<Compat<tokio::io::DuplexStream>>>,
+        Option<Vec<u8>>,
+    ) {
+        use tokio_rustls::rustls::ServerConfig;
+
+        let chain = certs::certs_from_file(Path::new("docker/certs/server.crt")).unwrap();
+        let key = PrivateKeyDer::from_pem_file("docker/certs/server.key").unwrap();
+        let mut server =
+            ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap();
+        server.alpn_protocols = vec![b"tds/8.0".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client, server) = tokio::join!(
+            TlsStream::new(config, client_io.compat()),
+            acceptor.accept(server_io)
+        );
+        let alpn = server
+            .ok()
+            .and_then(|s| s.get_ref().1.alpn_protocol().map(<[u8]>::to_vec));
+        (client, alpn)
+    }
+
+    #[tokio::test]
+    async fn caller_config_completes_strict_handshake() {
+        let tls = caller_client_config("docker/certs/customCA.crt");
+        let config = caller_config(crate::EncryptionLevel::Strict, tls);
+        let (client, alpn) = handshake_with_test_server(&config).await;
+        assert!(client.is_ok(), "handshake failed: {:?}", client.err());
+        assert_eq!(alpn.as_deref(), Some(&b"tds/8.0"[..]));
+    }
+
+    #[tokio::test]
+    async fn caller_config_verifier_is_not_bypassed_by_trust_cert() {
+        // `trust_cert` would accept any certificate, but the caller's
+        // configuration (which does not trust `customCA`) decides.
+        let tls = caller_client_config("docker/certs/server.crt");
+        let mut config = caller_config(crate::EncryptionLevel::Required, tls);
+        config.trust_cert();
+        let (client, _) = handshake_with_test_server(&config).await;
+        let err = client
+            .err()
+            .expect("the caller's verifier must reject the server");
+        assert!(
+            format!("{err}").contains("UnknownIssuer"),
+            "expected the caller's verifier to reject the issuer, got: {err}"
+        );
     }
 
     #[test]

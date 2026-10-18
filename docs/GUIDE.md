@@ -92,6 +92,12 @@ config.client_certificate("client.pem", "client.key"); // mutual TLS
 // or: config.client_certificate_pkcs12("client.pfx", "password");
 ```
 
+With `rustls`, an application that manages its own rustls setup (verifier, root
+store, crypto provider, client authentication) can hand it over with
+`Config::rustls_client_config(Arc<rustls::ClientConfig>)`. It replaces the
+trust settings and `client_certificate`; the `tds/8.0` ALPN is still added for
+`Strict`.
+
 ## Authentication
 
 ```rust,ignore

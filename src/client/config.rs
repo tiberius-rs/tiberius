@@ -70,6 +70,8 @@ pub struct Config {
         feature = "vendored-openssl"
     ))]
     pub(crate) client_cert: Option<ClientCertificate>,
+    #[cfg(feature = "rustls")]
+    pub(crate) rustls_client_config: Option<std::sync::Arc<tokio_rustls::rustls::ClientConfig>>,
 }
 
 /// How the server certificate is trusted.
@@ -264,6 +266,8 @@ impl Default for Config {
                 feature = "vendored-openssl"
             ))]
             client_cert: None,
+            #[cfg(feature = "rustls")]
+            rustls_client_config: None,
         }
     }
 }
@@ -826,6 +830,76 @@ impl Config {
         self.client_cert.as_ref()
     }
 
+    /// Performs the TLS handshake with the given rustls client configuration
+    /// instead of one built from this `Config`'s trust settings.
+    ///
+    /// Use this when the application already manages its own rustls setup:
+    /// a custom [`ServerCertVerifier`], a root store shared with other
+    /// clients, a specific [`CryptoProvider`] (for example `ring` instead of
+    /// the process default), client authentication through a
+    /// [`ResolvesClientCert`], session resumption or key logging.
+    ///
+    /// The supplied configuration is used as-is, so it **replaces**:
+    ///
+    /// - the trust settings ([`trust_cert`], [`trust_cert_ca`],
+    ///   [`trust_cert_ca_bundle`], `trust_webpki_roots` and their
+    ///   connection-string equivalents): the configuration's own verifier
+    ///   decides whether the server certificate is trusted;
+    /// - the client certificate ([`client_certificate`]): configure client
+    ///   authentication on the `ClientConfig` instead;
+    /// - the crypto provider: the configuration's own provider is used, not
+    ///   the process-installed default.
+    ///
+    /// The server name sent in SNI and verified against the certificate is
+    /// still [`hostname_in_certificate`] (or [`host`]). For
+    /// [`EncryptionLevel::Strict`] the `tds/8.0` ALPN protocol is added to a
+    /// copy of the configuration if it is not already present; the caller's
+    /// configuration is never modified.
+    ///
+    /// The configuration must come from the same `rustls` major version
+    /// tiberius uses (0.23).
+    ///
+    /// - Defaults to building the configuration from the trust settings.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # fn roots() -> tokio_rustls::rustls::RootCertStore { unimplemented!() }
+    /// use tokio_rustls::rustls::ClientConfig;
+    ///
+    /// // `ClientConfig::builder_with_provider` selects a provider explicitly.
+    /// let tls = ClientConfig::builder()
+    ///     .with_root_certificates(roots())
+    ///     .with_no_client_auth();
+    ///
+    /// let mut config = tiberius::Config::new();
+    /// config.rustls_client_config(Arc::new(tls));
+    /// ```
+    ///
+    /// [`ServerCertVerifier`]: tokio_rustls::rustls::client::danger::ServerCertVerifier
+    /// [`CryptoProvider`]: tokio_rustls::rustls::crypto::CryptoProvider
+    /// [`ResolvesClientCert`]: tokio_rustls::rustls::client::ResolvesClientCert
+    /// [`trust_cert`]: Self::trust_cert
+    /// [`trust_cert_ca`]: Self::trust_cert_ca
+    /// [`trust_cert_ca_bundle`]: Self::trust_cert_ca_bundle
+    /// [`client_certificate`]: Self::client_certificate
+    /// [`hostname_in_certificate`]: Self::hostname_in_certificate
+    /// [`host`]: Self::host
+    #[cfg(feature = "rustls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rustls")))]
+    pub fn rustls_client_config(
+        &mut self,
+        config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+    ) {
+        self.rustls_client_config = Some(config);
+    }
+
+    #[cfg(feature = "rustls")]
+    pub(crate) fn get_rustls_client_config(
+        &self,
+    ) -> Option<&std::sync::Arc<tokio_rustls::rustls::ClientConfig>> {
+        self.rustls_client_config.as_ref()
+    }
+
     pub(crate) fn get_host(&self) -> &str {
         self.host
             .as_deref()
@@ -1242,6 +1316,19 @@ impl ConfigBuilder {
     )]
     pub fn client_certificate(mut self, cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
         self.inner.client_certificate(cert, key);
+        self
+    }
+
+    /// Performs the TLS handshake with the given rustls client configuration.
+    ///
+    /// See [`Config::rustls_client_config`] for what it replaces.
+    #[cfg(feature = "rustls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rustls")))]
+    pub fn rustls_client_config(
+        mut self,
+        config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+    ) -> Self {
+        self.inner.rustls_client_config(config);
         self
     }
 
@@ -1709,6 +1796,48 @@ mod tests {
         config.lossy_codepage_decoding(false);
         assert!(!config.get_lossy_codepage_decoding());
         assert!(config.get_lossy_utf16_decoding());
+    }
+
+    #[cfg(feature = "rustls")]
+    fn empty_rustls_client_config() -> std::sync::Arc<tokio_rustls::rustls::ClientConfig> {
+        use tokio_rustls::rustls::{crypto::aws_lc_rs, ClientConfig, RootCertStore};
+        let config =
+            ClientConfig::builder_with_provider(std::sync::Arc::new(aws_lc_rs::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth();
+        std::sync::Arc::new(config)
+    }
+
+    #[test]
+    #[cfg(feature = "rustls")]
+    fn rustls_client_config_defaults_and_setter() {
+        let mut config = Config::new();
+        assert!(config.get_rustls_client_config().is_none());
+        let tls = empty_rustls_client_config();
+        config.rustls_client_config(tls.clone());
+        assert!(std::sync::Arc::ptr_eq(
+            config.get_rustls_client_config().unwrap(),
+            &tls
+        ));
+        // The trust settings are left as they were; they are only bypassed.
+        assert!(config.trust.is_default());
+    }
+
+    #[test]
+    #[cfg(feature = "rustls")]
+    fn config_builder_sets_rustls_client_config() {
+        assert!(Config::builder()
+            .build()
+            .get_rustls_client_config()
+            .is_none());
+        let tls = empty_rustls_client_config();
+        let config = Config::builder().rustls_client_config(tls.clone()).build();
+        assert!(std::sync::Arc::ptr_eq(
+            config.get_rustls_client_config().unwrap(),
+            &tls
+        ));
     }
 
     #[test]
