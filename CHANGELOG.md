@@ -1,5 +1,15 @@
 # Changes
 
+## Unreleased
+
+- feat: `Config::rustls_client_config(Arc<rustls::ClientConfig>)` (and the
+  `ConfigBuilder` mirror) performs the TLS handshake with a caller-supplied
+  rustls client configuration instead of one built from the trust settings
+  (`rustls` only). Its verifier, roots, client authentication and crypto
+  provider are used as-is; the trust settings and `client_certificate` are not
+  consulted. The `tds/8.0` ALPN protocol is still added (to a copy) for
+  `EncryptionLevel::Strict`.
+
 ## Version 0.13.0
 
 - feat: TLS trust configuration is revamped around two orthogonal axes plus a

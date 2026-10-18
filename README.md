@@ -71,6 +71,8 @@ Tiberius can be set to use two different implementations of TLS connection encry
 
 Alternatively one can use the `rustls` feature flag to use the Rust native TLS implementation. This way there are no dynamic dependencies to the system. This might be useful in certain installations, but requires a rebuild to update to a new TLS version. For some reasons the Security Framework on macOS does not work with SQL Server TLS settings, and on Apple platforms if needing TLS it is recommended to use `rustls` instead of `native-tls`. The other option is to use the `vendored-openssl` feature flag, that statically links against the latest OpenSSL implementation.
 
+With `rustls`, `Config::rustls_client_config` takes a caller-built `rustls::ClientConfig` (its own verifier, roots, crypto provider and client authentication) in place of the trust settings.
+
 The crate can also be compiled without TLS support, but not with both features enabled at the same time.
 
 Tiberius has three runtime encryption settings:
