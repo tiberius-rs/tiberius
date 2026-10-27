@@ -1,5 +1,11 @@
 # Changes
 
+## Unreleased
+
+- chore: `sspi` 0.18 → 0.23 for `sspi-rs`: 0.18 pins `crypto-bigint
+  =0.7.0-rc.18`, which can't resolve next to crates needing `^0.7.3` (russh
+  0.64, for example). No code change was needed.
+
 ## Version 0.13.0
 
 - feat: TLS trust configuration is revamped around two orthogonal axes plus a
