@@ -1,6 +1,8 @@
 pub(crate) mod auth;
 mod config;
 mod connection;
+#[cfg(all(windows, feature = "winauth"))]
+mod negotiate;
 
 mod tls;
 #[cfg(any(

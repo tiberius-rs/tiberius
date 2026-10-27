@@ -63,8 +63,15 @@ uuid = "1.0"
 zeroize = "1.8.2"
 secrecy = "0.10"
 
-[target.'cfg(windows)'.dependencies]
-winauth = { version = "0.0.5", optional = true }
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+optional = true
+features = [
+    "Win32_Foundation",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_System_Rpc",
+]
 
 [target.'cfg(unix)'.dependencies]
 libgssapi = { version = "0.11", optional = true, default-features = false }
@@ -240,6 +247,9 @@ all = [
     "sspi-rs",
 ]
 default = ["tds80", "winauth", "native-tls"]
+# Windows authentication on Windows (`AuthMethod::Integrated` and `AuthMethod::Windows`) through
+# SSPI's `Negotiate` package: Kerberos when the server's SPN is registered, NTLM otherwise.
+winauth = ["dep:windows-sys"]
 tds73 = []
 # Enables TDS 8.0 support, including the `Strict` encryption level (TLS before
 # the TDS prelogin, TDS 8.0 "strict" mode). Requires a TLS backend.

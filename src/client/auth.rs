@@ -67,17 +67,19 @@ impl Eq for WindowsAuth {}
 pub enum AuthMethod {
     /// Authenticate directly with SQL Server.
     SqlServer(SqlServerAuth),
-    /// Authenticate with Windows credentials. On Windows this uses SSPI via the
-    /// `winauth` feature; on Unix it uses NTLM (no Kerberos) via the `sspi-rs`
-    /// feature.
+    /// Authenticate with Windows credentials. On Windows this uses SSPI's
+    /// `Negotiate` package (Kerberos when the server's SPN is registered, NTLM
+    /// otherwise) via the `winauth` feature; on Unix it uses NTLM (no
+    /// Kerberos) via the `sspi-rs` feature.
     #[cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"), doc))]
     #[cfg_attr(
         docsrs,
         doc(cfg(any(all(windows, feature = "winauth"), all(unix, feature = "sspi-rs"))))
     )]
     Windows(WindowsAuth),
-    /// Authenticate as the currently logged in user. On Windows uses SSPI and
-    /// Kerberos on Unix platforms.
+    /// Authenticate as the currently logged in user. On Windows uses SSPI's
+    /// `Negotiate` package (Kerberos or NTLM), and Kerberos (GSSAPI) on Unix
+    /// platforms.
     #[cfg(any(
         all(windows, feature = "winauth"),
         all(unix, feature = "integrated-auth-gssapi"),

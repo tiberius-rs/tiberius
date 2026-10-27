@@ -47,7 +47,7 @@ A native Microsoft SQL Server (TDS) client for Rust.
 | `sql-browser-tokio`      | SQL Browser implementation for the `TcpStream` of Tokio.                                                                         | `disabled` |
 | `sql-browser-smol`       | SQL Browser implementation for the `TcpStream` of smol.                                                                          | `disabled` |
 | `integrated-auth-gssapi` | Support for using Integrated Auth via GSSAPI                                                                                     | `disabled` |
-| `winauth`                | Windows-only SSPI/NTLM integrated authentication (`AuthMethod::Windows`).                                                        | `enabled`  |
+| `winauth`                | Windows-only SSPI `Negotiate` authentication (`AuthMethod::Integrated` and `AuthMethod::Windows`): Kerberos, or NTLM.            | `enabled`  |
 | `sspi-rs`                | Windows-style SSPI/NTLM authentication on Unix via the pure-Rust `sspi` crate (no Kerberos required).                            | `disabled` |
 | `serde`                  | `serde` `Serialize`/`Deserialize` impls for query result types (`Row`, `Column`, `ColumnData`, `Numeric`, etc.).                 | `disabled` |
 
