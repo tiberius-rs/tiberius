@@ -162,8 +162,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         ExecuteResult::new(&mut self.connection).await
     }
 
-    /// Executes SQL statements in the SQL Server, returning resulting rows.
-    /// Useful for `SELECT` statements. The `query` can define the parameter
+    /// Executes SQL statements, streaming rowsets and affected-row counts through
+    /// [`QueryStream`]. The `query` can define the parameter
     /// placement by annotating them with `@PN`, where N is the index of the
     /// parameter, starting from `1`. If executing multiple queries at a time,
     /// delimit them with `;` and refer to [`QueryStream`] on proper stream
@@ -235,8 +235,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         Ok(result)
     }
 
-    /// Execute multiple queries, delimited with `;` and return multiple result
-    /// sets; one for each query.
+    /// Executes SQL statements delimited with `;`, streaming rowsets and
+    /// affected-row counts through [`QueryStream`].
     ///
     /// # Errors
     ///

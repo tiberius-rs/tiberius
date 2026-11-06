@@ -1,5 +1,13 @@
 # Changes
 
+## Unreleased
+
+- BREAKING: `QueryItem::RowsAffected(u64)` reports server-provided counts for
+  statements without rowsets, in statement order. Update exhaustive matches on
+  `QueryItem` to handle the new variant. Row-only collectors ignore these items;
+  metadata lookahead preserves them. Missing `DONE_COUNT` values (including
+  `SET NOCOUNT ON`) and counts associated with rowsets are not emitted.
+
 ## Version 0.13.0
 
 - feat: TLS trust configuration is revamped around two orthogonal axes plus a
