@@ -552,6 +552,7 @@ where
             QueryItem::Row(row) => {
                 assert_eq!(Some("b".repeat(2095).as_str()), row.get(0));
             }
+            QueryItem::RowsAffected(_) => {}
         }
     }
 
@@ -599,9 +600,221 @@ where
             QueryItem::Row(row) => {
                 assert_eq!(Some("b"), row.get(0))
             }
+            QueryItem::RowsAffected(_) => {}
         }
     }
 
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn query_rows_affected_in_statement_order<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let sql = "SET NOCOUNT OFF;
+        DECLARE @items TABLE (id int);
+        INSERT INTO @items VALUES (@P1), (@P1 + 1);
+        SELECT id FROM @items ORDER BY id;
+        UPDATE @items SET id = id WHERE 1 = 0;
+        SELECT id FROM @items WHERE 1 = 0;
+        DELETE FROM @items WHERE id = @P1;";
+
+    for api in ["simple_query", "query", "bound_query"] {
+        let stream = match api {
+            "simple_query" => conn.simple_query(sql.replace("@P1", "7")).await?,
+            "query" => conn.query(sql, &[&7i32]).await?,
+            _ => {
+                let mut query = Query::new(sql);
+                query.bind(7i32);
+                query.query(&mut conn).await?
+            }
+        };
+        let items: Vec<_> = stream.try_collect().await?;
+
+        assert_eq!(7, items.len(), "{api}: {items:?}");
+        assert!(matches!(items[0], QueryItem::RowsAffected(2)));
+        assert_eq!(0, items[1].as_metadata().unwrap().result_index());
+        for (item, expected) in items[2..4].iter().zip([7, 8]) {
+            let row = item.as_row().unwrap();
+            assert_eq!(0, row.result_index());
+            assert_eq!(Some(expected), row.get::<i32, _>(0));
+        }
+        assert!(matches!(items[4], QueryItem::RowsAffected(0)));
+        assert_eq!(1, items[5].as_metadata().unwrap().result_index());
+        assert!(matches!(items[6], QueryItem::RowsAffected(1)));
+    }
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn columns_preserve_rows_affected<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let mut stream = conn
+        .simple_query(
+            "SET NOCOUNT OFF;
+            DECLARE @items TABLE (id int);
+            INSERT INTO @items VALUES (7);
+            SELECT id AS first FROM @items;
+            UPDATE @items SET id = id + 1;
+            DELETE FROM @items WHERE 1 = 0;
+            SELECT id AS second FROM @items;",
+        )
+        .await?;
+
+    for _ in 0..2 {
+        assert_eq!("first", stream.columns().await?.unwrap()[0].name());
+    }
+    assert!(matches!(
+        stream.try_next().await?,
+        Some(QueryItem::RowsAffected(1))
+    ));
+    let metadata = stream.try_next().await?.unwrap().into_metadata().unwrap();
+    assert_eq!(0, metadata.result_index());
+    let row = stream.try_next().await?.unwrap().into_row().unwrap();
+    assert_eq!(Some(7i32), row.get(0));
+
+    for _ in 0..2 {
+        assert_eq!("second", stream.columns().await?.unwrap()[0].name());
+    }
+    for count in [1, 0] {
+        assert!(matches!(
+            stream.try_next().await?,
+            Some(QueryItem::RowsAffected(actual)) if actual == count
+        ));
+    }
+    let metadata = stream.try_next().await?.unwrap().into_metadata().unwrap();
+    assert_eq!(1, metadata.result_index());
+    let row = stream.try_next().await?.unwrap().into_row().unwrap();
+    assert_eq!(Some(8i32), row.get(0));
+    assert!(stream.try_next().await?.is_none());
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn output_and_nocount_suppress_rows_affected<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    for nocount in ["OFF", "ON"] {
+        let items: Vec<_> = conn
+            .simple_query(format!(
+                "SET NOCOUNT {nocount};
+                DECLARE @items TABLE (id int);
+                INSERT INTO @items OUTPUT INSERTED.id VALUES (7);
+                UPDATE @items SET id = id OUTPUT INSERTED.id WHERE 1 = 0;
+                SELECT id FROM @items WHERE 1 = 0;
+                DELETE FROM @items WHERE 1 = 0;
+                SET NOCOUNT OFF;"
+            ))
+            .await?
+            .try_collect()
+            .await?;
+
+        assert_eq!(if nocount == "OFF" { 5 } else { 4 }, items.len());
+        assert_eq!(0, items[0].as_metadata().unwrap().result_index());
+        let row = items[1].as_row().unwrap();
+        assert_eq!(0, row.result_index());
+        assert_eq!(Some(7i32), row.get(0));
+        assert_eq!(1, items[2].as_metadata().unwrap().result_index());
+        assert_eq!(2, items[3].as_metadata().unwrap().result_index());
+        if nocount == "OFF" {
+            assert!(matches!(items[4], QueryItem::RowsAffected(0)));
+        }
+    }
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn row_collectors_ignore_rows_affected<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let sql = "SET NOCOUNT OFF;
+        DECLARE @items TABLE (id int);
+        INSERT INTO @items VALUES (7);
+        SELECT id FROM @items;
+        UPDATE @items SET id = id + 1;
+        SELECT id FROM @items WHERE 1 = 0;
+        SELECT id FROM @items;
+        DELETE FROM @items;";
+
+    let results = conn.simple_query(sql).await?.into_results().await?;
+    assert_eq!(3, results.len());
+    assert_eq!(1, results[0].len());
+    assert_eq!(Some(7i32), results[0][0].get(0));
+    assert!(results[1].is_empty());
+    assert_eq!(1, results[2].len());
+    assert_eq!(Some(8i32), results[2][0].get(0));
+
+    let rows: Vec<_> = conn
+        .simple_query(sql)
+        .await?
+        .into_row_stream()
+        .map_ok(|row| row.get::<i32, _>(0).unwrap())
+        .try_collect()
+        .await?;
+    assert_eq!(vec![7, 8], rows);
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn nested_procedure_rows_affected<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = random_table().await;
+    let inner = random_table().await;
+    let outer = random_table().await;
+    conn.simple_query(format!("CREATE TABLE ##{table} (id int);"))
+        .await?
+        .into_results()
+        .await?;
+    conn.simple_query(format!(
+        "CREATE PROCEDURE #{inner} AS BEGIN
+            SET NOCOUNT OFF;
+            INSERT INTO ##{table} VALUES (7);
+            SELECT id FROM ##{table};
+        END"
+    ))
+    .await?
+    .into_results()
+    .await?;
+    conn.simple_query(format!(
+        "CREATE PROCEDURE #{outer} AS BEGIN
+            EXEC #{inner};
+            UPDATE ##{table} SET id = id WHERE 1 = 0;
+        END"
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    let sql = format!("EXEC #{outer}; DELETE FROM ##{table};");
+    for rpc in [false, true] {
+        let stream = if rpc {
+            conn.query(&sql, &[]).await?
+        } else {
+            conn.simple_query(&sql).await?
+        };
+        let items: Vec<_> = stream.try_collect().await?;
+        assert_eq!(items.len(), 5, "rpc={rpc}: {items:?}");
+        assert!(matches!(items[0], QueryItem::RowsAffected(1)));
+        assert!(items[1].as_metadata().is_some());
+        assert_eq!(items[2].as_row().unwrap().get::<i32, _>(0), Some(7));
+        assert!(matches!(items[3], QueryItem::RowsAffected(0)));
+        assert!(matches!(items[4], QueryItem::RowsAffected(1)));
+    }
+    conn.simple_query(format!("DROP TABLE ##{table};"))
+        .await?
+        .into_results()
+        .await?;
     Ok(())
 }
 

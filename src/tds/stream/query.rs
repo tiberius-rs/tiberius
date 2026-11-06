@@ -1,25 +1,27 @@
-use crate::tds::stream::ReceivedToken;
+use crate::tds::{codec::TokenDone, stream::ReceivedToken};
 use crate::{row::ColumnType, Column, Row};
 use futures_util::{
     ready,
     stream::{BoxStream, Peekable, Stream, StreamExt, TryStreamExt},
 };
 use std::{
+    collections::VecDeque,
     fmt::Debug,
     pin::Pin,
     sync::Arc,
     task::{self, Poll},
 };
 
-/// A set of `Streams` of [`QueryItem`] values, which can be either result
-/// metadata or a row.
+/// A stream of [`QueryItem`] values: result metadata, rows, and affected-row counts.
 ///
 /// The `QueryStream` needs to be polled empty before sending another query to
 /// the [`Client`], failing to do so causes a flush before the next query,
 /// slowing it down in an undeterministic way.
 ///
-/// Every stream starts with metadata, describing the structure of the incoming
-/// rows, e.g. the columns in the order they are presented in every row.
+/// Each rowset starts with metadata describing its columns. Statements without
+/// a rowset yield [`QueryItem::RowsAffected`] when the server reports a count.
+/// Counts are omitted when `SET NOCOUNT ON` suppresses them. Counts associated
+/// with rowsets (including empty rowsets and DML `OUTPUT`) are not emitted.
 ///
 /// If after consuming rows from the stream, another metadata result arrives, it
 /// means the stream has multiple results from different queries. This new
@@ -49,33 +51,25 @@ use std::{
 /// # let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
 /// let mut stream = client
 ///     .query(
-///         "SELECT @P1 AS first; SELECT @P2 AS second",
+///         "DECLARE @items TABLE (id int);
+///          INSERT INTO @items VALUES (@P1), (@P2);
+///          SELECT id FROM @items ORDER BY id;",
 ///         &[&1i32, &2i32],
 ///     )
 ///     .await?;
 ///
-/// // The stream consists of four items, in the following order:
-/// // - Metadata from `SELECT 1`
-/// // - The only resulting row from `SELECT 1`
-/// // - Metadata from `SELECT 2`
-/// // - The only resulting row from `SELECT 2`
+/// // The stream yields the INSERT count, SELECT metadata, then two rows.
 /// while let Some(item) = stream.try_next().await? {
 ///     match item {
-///         // our first item is the column data always
-///         QueryItem::Metadata(meta) if meta.result_index() == 0 => {
-///             // the first result column info can be handled here
-///         }
-///         // ... and from there on from 0..N rows
-///         QueryItem::Row(row) if row.result_index() == 0 => {
-///             assert_eq!(Some(1), row.get(0));
-///         }
-///         // the second result set returns first another metadata item
 ///         QueryItem::Metadata(meta) => {
-///             // .. handling
+///             assert_eq!("id", meta.columns()[0].name());
 ///         }
-///         // ...and, again, we get rows from the second resultset
 ///         QueryItem::Row(row) => {
-///             assert_eq!(Some(2), row.get(0));
+///             let id: Option<i32> = row.get(0);
+///             assert!(matches!(id, Some(1) | Some(2)));
+///         }
+///         QueryItem::RowsAffected(count) => {
+///             assert_eq!(2, count);
 ///         }
 ///     }
 /// }
@@ -92,6 +86,8 @@ pub struct QueryStream<'a> {
     token_stream: Peekable<BoxStream<'a, crate::Result<ReceivedToken>>>,
     columns: Option<Arc<Vec<Column>>>,
     result_set_index: Option<usize>,
+    rowset_active: bool,
+    pending_rows_affected: VecDeque<u64>,
 }
 
 impl<'a> Debug for QueryStream<'a> {
@@ -111,11 +107,24 @@ impl<'a> QueryStream<'a> {
             token_stream: token_stream.peekable(),
             columns: None,
             result_set_index: None,
+            rowset_active: false,
+            pending_rows_affected: VecDeque::new(),
         }
     }
 
-    /// Moves the stream forward until having result metadata, stream end or an
-    /// error.
+    fn affected_rows(&mut self, done: TokenDone) -> Option<u64> {
+        // DONE_COUNT also reports SELECT row counts. Metadata distinguishes
+        // rowsets (including empty ones) from statements returning only a count.
+        let rows = if self.rowset_active {
+            None
+        } else {
+            done.row_count()
+        };
+        self.rowset_active = false;
+        rows
+    }
+
+    /// Looks ahead to metadata or a row, buffering intervening affected counts.
     pub(crate) async fn forward_to_metadata(&mut self) -> crate::Result<()> {
         loop {
             let item = Pin::new(&mut self.token_stream)
@@ -125,10 +134,17 @@ impl<'a> QueryStream<'a> {
                 .transpose()?;
 
             match item {
-                Some(ReceivedToken::NewResultset(_)) => break,
-                Some(_) => {
-                    self.token_stream.try_next().await?;
-                }
+                Some(ReceivedToken::NewResultset(_) | ReceivedToken::Row(_)) => break,
+                Some(_) => match self.token_stream.try_next().await? {
+                    Some(ReceivedToken::Done(done))
+                    | Some(ReceivedToken::DoneInProc(done))
+                    | Some(ReceivedToken::DoneProc(done)) => {
+                        if let Some(rows) = self.affected_rows(done) {
+                            self.pending_rows_affected.push_back(rows);
+                        }
+                    }
+                    _ => {}
+                },
                 None => break,
             }
         }
@@ -136,11 +152,13 @@ impl<'a> QueryStream<'a> {
         Ok(())
     }
 
-    /// The list of columns either for the current result set, or for the next
-    /// one. If the stream is just created, or if the next item in the stream
-    /// contains metadata, the metadata will be taken from the stream. Otherwise
-    /// the columns will be returned from the cache and reflect on the current
-    /// result set.
+    /// Returns the columns for the current or next rowset.
+    ///
+    /// If a row is pending, returns the current rowset's columns. Otherwise,
+    /// looks ahead to the next rowset's metadata, returning the cached columns
+    /// if no further rowset exists. Metadata, rows, and intervening affected-row
+    /// counts remain available in stream order, so the next item after calling
+    /// this method is not necessarily metadata.
     ///
     /// # Example
     ///
@@ -186,46 +204,24 @@ impl<'a> QueryStream<'a> {
     /// # }
     /// ```
     pub async fn columns(&mut self) -> crate::Result<Option<&[Column]>> {
-        use ReceivedToken::*;
-
-        loop {
-            let item = Pin::new(&mut self.token_stream)
-                .peek()
-                .await
-                .map(|r| r.as_ref().map_err(|e| e.clone()))
-                .transpose()?;
-
-            match item {
-                Some(token) => match token {
-                    NewResultset(metadata) => {
-                        self.columns = Some(Arc::new(metadata.columns().collect()));
-                        break;
-                    }
-                    Row(_) => {
-                        break;
-                    }
-                    _ => {
-                        self.token_stream.try_next().await?;
-                        continue;
-                    }
-                },
-                None => {
-                    break;
-                }
-            }
+        self.forward_to_metadata().await?;
+        if let Some(Ok(ReceivedToken::NewResultset(metadata))) =
+            Pin::new(&mut self.token_stream).peek().await
+        {
+            self.columns = Some(Arc::new(metadata.columns().collect()));
         }
 
         Ok(self.columns.as_ref().map(|c| c.as_slice()))
     }
 
-    /// Collects results from all queries in the stream into memory in the order
-    /// of querying.
+    /// Collects all rowsets into memory in stream order, ignoring affected counts.
+    /// Each rowset has its own vector, including rowsets with zero rows.
     pub async fn into_results(self) -> crate::Result<Vec<Vec<Row>>> {
         collect_results(self).await
     }
 
-    /// Collects the output of the first query, dropping any further
-    /// results.
+    /// Collects the first rowset, ignoring affected counts and dropping later
+    /// rowsets. An empty first rowset is not skipped.
     pub async fn into_first_result(self) -> crate::Result<Vec<Row>> {
         let mut results = self.into_results().await?.into_iter();
         let rows = results.next().unwrap_or_default();
@@ -233,20 +229,20 @@ impl<'a> QueryStream<'a> {
         Ok(rows)
     }
 
-    /// Collects the first row from the output of the first query, dropping any
-    /// further rows.
+    /// Collects the first row of the first rowset, ignoring affected counts and
+    /// dropping later rows and rowsets. Returns `None` if the first rowset is empty.
     pub async fn into_row(self) -> crate::Result<Option<Row>> {
         let mut results = self.into_first_result().await?.into_iter();
 
         Ok(results.next())
     }
 
-    /// Convert the stream into a stream of rows, skipping metadata items.
+    /// Convert the stream into a stream of rows, skipping metadata and counts.
     pub fn into_row_stream(self) -> BoxStream<'a, crate::Result<Row>> {
         let s = self.try_filter_map(|item| async {
             match item {
                 QueryItem::Row(row) => Ok(Some(row)),
-                QueryItem::Metadata(_) => Ok(None),
+                QueryItem::Metadata(_) | QueryItem::RowsAffected(_) => Ok(None),
             }
         });
 
@@ -292,6 +288,7 @@ where
                 // a result set on the fly rather than discard a leading row.
                 current.get_or_insert_with(Vec::new).push(row);
             }
+            QueryItem::RowsAffected(_) => {}
         }
     }
 
@@ -317,7 +314,7 @@ impl ResultMetadata {
 
     /// The number of the result set, an incrementing value starting from zero,
     /// which gives an indication of the position of the result set in the
-    /// stream.
+    /// stream. Affected-row counts do not advance this index.
     pub fn result_index(&self) -> usize {
         self.result_index
     }
@@ -330,6 +327,11 @@ pub enum QueryItem {
     Row(Row),
     /// Information of the upcoming row data.
     Metadata(ResultMetadata),
+    /// A server-reported count for a statement without a rowset.
+    ///
+    /// Zero is a valid count. No item is emitted when `DONE_COUNT` is absent,
+    /// for example with `SET NOCOUNT ON`. Triggers can produce extra counts.
+    RowsAffected(u64),
 }
 
 impl QueryItem {
@@ -343,7 +345,7 @@ impl QueryItem {
     /// Returns a reference to the metadata, if the item is of a correct variant.
     pub fn as_metadata(&self) -> Option<&ResultMetadata> {
         match self {
-            QueryItem::Row(_) => None,
+            QueryItem::Row(_) | QueryItem::RowsAffected(_) => None,
             QueryItem::Metadata(ref metadata) => Some(metadata),
         }
     }
@@ -352,14 +354,14 @@ impl QueryItem {
     pub fn as_row(&self) -> Option<&Row> {
         match self {
             QueryItem::Row(ref row) => Some(row),
-            QueryItem::Metadata(_) => None,
+            QueryItem::Metadata(_) | QueryItem::RowsAffected(_) => None,
         }
     }
 
     /// Returns the metadata, if the item is of a correct variant.
     pub fn into_metadata(self) -> Option<ResultMetadata> {
         match self {
-            QueryItem::Row(_) => None,
+            QueryItem::Row(_) | QueryItem::RowsAffected(_) => None,
             QueryItem::Metadata(metadata) => Some(metadata),
         }
     }
@@ -368,7 +370,7 @@ impl QueryItem {
     pub fn into_row(self) -> Option<Row> {
         match self {
             QueryItem::Row(row) => Some(row),
-            QueryItem::Metadata(_) => None,
+            QueryItem::Metadata(_) | QueryItem::RowsAffected(_) => None,
         }
     }
 }
@@ -379,6 +381,10 @@ impl<'a> Stream for QueryStream<'a> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
+        if let Some(rows) = this.pending_rows_affected.pop_front() {
+            return Poll::Ready(Some(Ok(QueryItem::RowsAffected(rows))));
+        }
+
         loop {
             let token = match ready!(this.token_stream.poll_next_unpin(cx)) {
                 Some(res) => res?,
@@ -387,6 +393,7 @@ impl<'a> Stream for QueryStream<'a> {
 
             return match token {
                 ReceivedToken::NewResultset(meta) => {
+                    this.rowset_active = true;
                     let column_meta = meta
                         .columns
                         .iter()
@@ -423,6 +430,12 @@ impl<'a> Stream for QueryStream<'a> {
 
                     Poll::Ready(Some(Ok(QueryItem::Row(row))))
                 }
+                ReceivedToken::Done(done)
+                | ReceivedToken::DoneInProc(done)
+                | ReceivedToken::DoneProc(done) => match this.affected_rows(done) {
+                    Some(rows) => Poll::Ready(Some(Ok(QueryItem::RowsAffected(rows)))),
+                    None => continue,
+                },
                 _ => continue,
             };
         }
@@ -584,10 +597,12 @@ mod tests {
     // ROW-before-metadata guard) and the `into_results`/`into_first_result`/
     // `into_row`/`into_row_stream` helpers end to end.
 
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
     use crate::tds::codec::{
-        BaseMetaDataColumn, FixedLenType, MetaDataColumn, TokenColMetaData, TypeInfo,
+        BaseMetaDataColumn, DoneStatus, FixedLenType, MetaDataColumn, TokenColMetaData, TypeInfo,
     };
     use crate::tds::stream::ReceivedToken;
+    use bytes::{BufMut, BytesMut};
     use futures_util::stream::{StreamExt, TryStreamExt};
     use std::borrow::Cow;
 
@@ -610,6 +625,155 @@ mod tests {
     fn query_stream(tokens: Vec<ReceivedToken>) -> QueryStream<'static> {
         let s = stream::iter(tokens.into_iter().map(Ok::<_, crate::Error>));
         QueryStream::new(s.boxed())
+    }
+
+    async fn done(status: u16, rows: u64) -> TokenDone {
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(status);
+        buf.put_u16_le(0);
+        buf.put_u64_le(rows);
+        TokenDone::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn affected_counts_survive_initial_and_columns_lookahead() {
+        let count = DoneStatus::Count as u16;
+        let mut stream = query_stream(vec![
+            ReceivedToken::Done(done(count, 2).await),
+            ReceivedToken::DoneInProc(done(count, 0).await),
+            token_meta("first"),
+            token_row(),
+            ReceivedToken::Done(done(count, 1).await),
+            ReceivedToken::DoneInProc(done(count, 3).await),
+            token_meta("second"),
+            ReceivedToken::Done(done(count, 0).await),
+            ReceivedToken::DoneProc(done(0, 99).await),
+        ]);
+
+        stream.forward_to_metadata().await.unwrap();
+        assert_eq!(stream.columns().await.unwrap().unwrap()[0].name(), "first");
+        assert_eq!(stream.columns().await.unwrap().unwrap()[0].name(), "first");
+        assert!(matches!(
+            stream.try_next().await.unwrap(),
+            Some(QueryItem::RowsAffected(2))
+        ));
+        assert!(matches!(
+            stream.try_next().await.unwrap(),
+            Some(QueryItem::RowsAffected(0))
+        ));
+        assert!(matches!(
+            stream.try_next().await.unwrap(),
+            Some(QueryItem::Metadata(_))
+        ));
+        assert!(stream.try_next().await.unwrap().unwrap().as_row().is_some());
+
+        assert_eq!(stream.columns().await.unwrap().unwrap()[0].name(), "second");
+        assert!(matches!(
+            stream.try_next().await.unwrap(),
+            Some(QueryItem::RowsAffected(3))
+        ));
+        assert!(matches!(
+            stream.try_next().await.unwrap(),
+            Some(QueryItem::Metadata(_))
+        ));
+        assert!(stream.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn columns_lookahead_preserves_counts_and_errors() {
+        let tokens = vec![
+            Ok(token_meta("first")),
+            Ok(token_row()),
+            Ok(ReceivedToken::Done(done(0, 0).await)),
+            Ok(ReceivedToken::DoneInProc(
+                done(DoneStatus::Count as u16, 2).await,
+            )),
+            Err(crate::Error::Protocol("late error".into())),
+        ];
+        let mut stream = QueryStream::new(stream::iter(tokens).boxed());
+        stream.try_next().await.unwrap();
+        stream.try_next().await.unwrap();
+
+        assert!(matches!(
+            stream.columns().await,
+            Err(crate::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            stream.try_next().await.unwrap(),
+            Some(QueryItem::RowsAffected(2))
+        ));
+        assert!(matches!(
+            stream.try_next().await,
+            Err(crate::Error::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn count_only_stream_preserves_zero_and_skips_missing_count() {
+        let count = DoneStatus::Count as u16;
+        let mut stream = query_stream(vec![
+            ReceivedToken::Done(done(0, 99).await),
+            ReceivedToken::DoneInProc(done(count, 0).await),
+            ReceivedToken::DoneProc(done(count, 4).await),
+            ReceivedToken::DoneProc(done(0, 99).await),
+        ]);
+        stream.forward_to_metadata().await.unwrap();
+        assert!(stream.columns().await.unwrap().is_none());
+        assert!(matches!(
+            stream.try_next().await.unwrap(),
+            Some(QueryItem::RowsAffected(0))
+        ));
+        assert!(matches!(
+            stream.try_next().await.unwrap(),
+            Some(QueryItem::RowsAffected(4))
+        ));
+        assert!(stream.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rowset_without_count_does_not_hide_the_next_affected_count() {
+        let mut stream = query_stream(vec![
+            token_meta("empty"),
+            ReceivedToken::DoneInProc(done(0, 99).await),
+            ReceivedToken::Done(done(DoneStatus::Count as u16, 1).await),
+        ]);
+        assert!(matches!(
+            stream.try_next().await.unwrap(),
+            Some(QueryItem::Metadata(_))
+        ));
+        assert!(matches!(
+            stream.try_next().await.unwrap(),
+            Some(QueryItem::RowsAffected(1))
+        ));
+        assert!(stream.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn row_collectors_ignore_affected_counts() {
+        let cols = columns();
+        let results = collect(vec![
+            QueryItem::RowsAffected(0),
+            meta(&cols, 0),
+            row(&cols, 0),
+            QueryItem::RowsAffected(2),
+            meta(&cols, 1),
+            QueryItem::RowsAffected(3),
+        ])
+        .await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].len(), 1);
+        assert!(results[1].is_empty());
+        assert!(collect(vec![QueryItem::RowsAffected(1)]).await.is_empty());
+    }
+
+    #[test]
+    fn affected_item_is_neither_row_nor_metadata() {
+        assert!(QueryItem::RowsAffected(0).as_row().is_none());
+        assert!(QueryItem::RowsAffected(0).as_metadata().is_none());
+        assert!(QueryItem::RowsAffected(0).into_row().is_none());
+        assert!(QueryItem::RowsAffected(0).into_metadata().is_none());
     }
 
     #[tokio::test]
@@ -661,7 +825,9 @@ mod tests {
 
     #[tokio::test]
     async fn query_stream_into_first_result_and_into_row() {
+        let count = DoneStatus::Count as u16;
         let first = query_stream(vec![
+            ReceivedToken::Done(done(count, 2).await),
             token_meta("first"),
             token_row(),
             token_row(),
@@ -673,27 +839,41 @@ mod tests {
         .expect("into_first_result");
         assert_eq!(first.len(), 2);
 
-        let one = query_stream(vec![token_meta("first"), token_row(), token_row()])
-            .into_row()
-            .await
-            .expect("into_row");
+        let one = query_stream(vec![
+            ReceivedToken::Done(done(count, 2).await),
+            token_meta("first"),
+            token_row(),
+            token_row(),
+        ])
+        .into_row()
+        .await
+        .expect("into_row");
         assert!(one.is_some());
 
-        let none = query_stream(vec![token_meta("first")])
-            .into_row()
-            .await
-            .expect("into_row empty");
+        let none = query_stream(vec![
+            ReceivedToken::Done(done(count, 2).await),
+            token_meta("first"),
+            ReceivedToken::Done(done(count, 0).await),
+            token_meta("second"),
+            token_row(),
+        ])
+        .into_row()
+        .await
+        .expect("into_row empty");
         assert!(none.is_none());
     }
 
     #[tokio::test]
-    async fn query_stream_into_row_stream_skips_metadata() {
+    async fn query_stream_into_row_stream_skips_metadata_and_counts() {
         let rows: Vec<Row> = query_stream(vec![
+            ReceivedToken::Done(done(DoneStatus::Count as u16, 2).await),
             token_meta("first"),
             token_row(),
             token_meta("second"),
             token_row(),
             token_row(),
+            ReceivedToken::Done(done(0, 0).await),
+            ReceivedToken::Done(done(DoneStatus::Count as u16, 3).await),
         ])
         .into_row_stream()
         .try_collect()
