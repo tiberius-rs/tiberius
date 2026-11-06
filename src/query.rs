@@ -175,8 +175,8 @@ impl<'a> Query<'a> {
         ExecuteResult::new(&mut client.connection).await
     }
 
-    /// Executes SQL statements in the SQL Server, returning resulting rows.
-    /// Useful for `SELECT` statements. See [`Client#query`] for a simpler API
+    /// Executes SQL statements, streaming rowsets and affected-row counts through
+    /// [`QueryStream`]. See [`Client#query`] for a simpler API
     /// if the parameters are statically known.
     ///
     /// # Example

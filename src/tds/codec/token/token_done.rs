@@ -72,13 +72,15 @@ impl TokenDone {
     }
 
     pub(crate) fn rows(&self) -> u64 {
+        self.row_count().unwrap_or(0)
+    }
+
+    pub(crate) fn row_count(&self) -> Option<u64> {
         // The row count is only meaningful when the DONE_COUNT status bit is
         // set (MS-TDS §2.2.7.6); otherwise the field is not a valid count.
-        if self.status.contains(DoneStatus::Count) {
-            self.done_rows
-        } else {
-            0
-        }
+        self.status
+            .contains(DoneStatus::Count)
+            .then_some(self.done_rows)
     }
 }
 
@@ -129,6 +131,7 @@ mod tests {
 
         assert!(done.is_final());
         assert_eq!(done.rows(), 0);
+        assert_eq!(done.row_count(), None);
         assert!(format!("{}", done).starts_with("Done with status"));
     }
 
@@ -145,7 +148,30 @@ mod tests {
 
         assert!(!done.is_final());
         assert_eq!(done.rows(), 5);
+        assert_eq!(done.row_count(), Some(5));
         assert!(format!("{}", done).contains("5 rows left"));
+    }
+
+    #[tokio::test]
+    async fn zero_count_is_distinct_from_missing_count() {
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(DoneStatus::Count as u16);
+        buf.put_u16_le(0);
+        buf.put_u64_le(0);
+        let done = TokenDone::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .unwrap();
+        assert_eq!(done.row_count(), Some(0));
+
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(0);
+        buf.put_u16_le(0);
+        buf.put_u64_le(99);
+        let done = TokenDone::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .unwrap();
+        assert_eq!(done.row_count(), None);
+        assert_eq!(done.rows(), 0);
     }
 
     #[tokio::test]
