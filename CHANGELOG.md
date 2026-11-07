@@ -1,5 +1,13 @@
 # Changes
 
+## Unreleased
+
+- feat: `Client::simple_batch` streams everything a batch returns as
+  `BatchItem`s: result sets, the end of each statement with its row count,
+  informational messages (`PRINT`, low-severity `RAISERROR`) and the errors of
+  statements that failed while the batch went on, in server order. `TokenInfo`
+  is now public with getters.
+
 ## Version 0.13.0
 
 - feat: TLS trust configuration is revamped around two orthogonal axes plus a
