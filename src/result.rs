@@ -1,4 +1,4 @@
-pub use crate::tds::stream::{CommandItem, QueryItem, ResultMetadata};
+pub use crate::tds::stream::{BatchItem, BatchStream, CommandItem, QueryItem, ResultMetadata};
 use crate::{
     client::Connection,
     error::Error,

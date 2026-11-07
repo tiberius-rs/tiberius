@@ -21,7 +21,7 @@ use crate::{
     result::ExecuteResult,
     tds::{
         codec::{self, IteratorJoin},
-        stream::{QueryStream, TokenStream},
+        stream::{BatchStream, QueryStream, TokenStream},
     },
     BulkLoadRequest, MetaDataColumn, SqlReadBytes, ToSql,
 };
@@ -292,6 +292,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         result.forward_to_metadata().await?;
 
         Ok(result)
+    }
+
+    /// Executes a batch of SQL statements sent verbatim, as [`simple_query`]
+    /// does, and streams back everything the server returns for it: result
+    /// sets, the end of each statement with its row count, informational
+    /// messages and the errors of statements that failed, in the order they
+    /// arrived. See [`BatchItem`].
+    ///
+    /// # Warning
+    ///
+    /// Do not use this with any user specified input. Please resort to prepared
+    /// statements using the [`query`] method.
+    ///
+    /// [`simple_query`]: #method.simple_query
+    /// [`query`]: #method.query
+    /// [`BatchItem`]: crate::BatchItem
+    pub async fn simple_batch<'a, 'b>(
+        &'a mut self,
+        query: impl Into<Cow<'b, str>>,
+    ) -> crate::Result<BatchStream<'a>>
+    where
+        'a: 'b,
+    {
+        self.connection.flush_stream().await?;
+
+        let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
+
+        let id = self.connection.context_mut().next_packet_id();
+        self.connection.send(PacketHeader::batch(id), req).await?;
+
+        let ts = TokenStream::new(&mut self.connection);
+        Ok(BatchStream::new(ts.try_unfold()))
     }
 
     /// Execute a `BULK INSERT` statement, efficiently storing a large number of

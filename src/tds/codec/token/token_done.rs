@@ -71,6 +71,11 @@ impl TokenDone {
         self.status.contains(DoneStatus::Attention)
     }
 
+    /// `true` when the DONE_COUNT status bit says `rows` holds a count.
+    pub(crate) fn has_count(&self) -> bool {
+        self.status.contains(DoneStatus::Count)
+    }
+
     pub(crate) fn rows(&self) -> u64 {
         // The row count is only meaningful when the DONE_COUNT status bit is
         // set (MS-TDS §2.2.7.6); otherwise the field is not a valid count.

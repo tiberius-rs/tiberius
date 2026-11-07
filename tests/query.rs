@@ -7,7 +7,7 @@ use std::env;
 use std::sync::Once;
 
 use tiberius::FromSql;
-use tiberius::{numeric::Numeric, xml::XmlData, ColumnType, Query, QueryItem, Result};
+use tiberius::{numeric::Numeric, xml::XmlData, BatchItem, ColumnType, Query, QueryItem, Result};
 use uuid::Uuid;
 
 use runtimes_macro::test_on_runtimes;
@@ -109,6 +109,65 @@ where
 
     assert_eq!(Some(-4i32), row.get(0));
 
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn simple_batch_streams_messages_and_counts<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let sql = "CREATE TABLE #batch (x INT);
+        PRINT 'before';
+        INSERT INTO #batch VALUES (1), (2), (3);
+        SELECT x FROM #batch ORDER BY x;
+        SELECT 1 / 0;
+        RAISERROR('note', 1, 1);
+        UPDATE #batch SET x = x + 1 WHERE x > 1;";
+
+    let mut seen = Vec::new();
+    let mut stream = conn.simple_batch(sql).await?;
+    while let Some(item) = stream.try_next().await? {
+        seen.push(match item {
+            BatchItem::Metadata(m) => format!("columns {}", m.columns().len()),
+            BatchItem::Row(r) => format!("row {:?}", r.get::<i32, _>(0)),
+            BatchItem::Done { rows } => format!("done {rows:?}"),
+            BatchItem::Info(i) => format!("info {}", i.message()),
+            BatchItem::Error(e) => format!("error {} line {}", e.code(), e.line()),
+        });
+    }
+    drop(stream);
+    // every statement ends with a DONE, counted or not; the divide by
+    // zero ends its own statement, not the batch
+    assert_eq!(
+        seen,
+        [
+            "done None",
+            "info before",
+            "done None",
+            "done Some(3)",
+            "columns 1",
+            "row Some(1)",
+            "row Some(2)",
+            "row Some(3)",
+            "done Some(3)",
+            "columns 1",
+            "error 8134 line 5",
+            "done None",
+            "info note",
+            "done None",
+            "done Some(2)",
+        ]
+    );
+
+    // the connection is still good
+    let row = conn
+        .simple_query("SELECT 1")
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    assert_eq!(Some(1i32), row.get(0));
     Ok(())
 }
 
