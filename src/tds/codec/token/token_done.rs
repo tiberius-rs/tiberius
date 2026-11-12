@@ -27,6 +27,35 @@ pub enum DoneStatus {
 }
 
 impl TokenDone {
+    /// Reads the DONE token that ends a message from its raw bytes, if it
+    /// acknowledges an Attention signal. `tail` is the token: type byte,
+    /// status, current command and a row count of `row_bytes` (4 or 8).
+    pub(crate) fn attention_ack(tail: &[u8], row_bytes: usize) -> Option<Self> {
+        if tail.len() != 5 + row_bytes {
+            return None;
+        }
+        let done_types = [
+            TokenType::Done as u8,
+            TokenType::DoneProc as u8,
+            TokenType::DoneInProc as u8,
+        ];
+        if !done_types.contains(&tail[0]) {
+            return None;
+        }
+        let status = BitFlags::from_bits_truncate(u16::from_le_bytes([tail[1], tail[2]]));
+        if !status.contains(DoneStatus::Attention) {
+            return None;
+        }
+        let cur_cmd = u16::from_le_bytes([tail[3], tail[4]]);
+        let mut rows = [0u8; 8];
+        rows[..row_bytes].copy_from_slice(&tail[5..]);
+        Some(Self {
+            status,
+            cur_cmd,
+            done_rows: u64::from_le_bytes(rows),
+        })
+    }
+
     pub(crate) async fn decode<R>(src: &mut R) -> crate::Result<Self>
     where
         R: SqlReadBytes + Unpin,
@@ -67,6 +96,7 @@ impl TokenDone {
     /// `true` when the server has set the `DONE_ATTN` status bit, indicating
     /// this DONE token acknowledges a client Attention signal (MS-TDS
     /// section 2.2.7.6).
+    #[cfg(test)]
     pub(crate) fn is_attention(&self) -> bool {
         self.status.contains(DoneStatus::Attention)
     }
@@ -115,6 +145,25 @@ mod tests {
     use super::*;
     use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
     use bytes::BytesMut;
+
+    #[test]
+    fn attention_ack_reads_only_an_attention_done() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(TokenType::Done as u8);
+        buf.put_u16_le(DoneStatus::Attention as u16);
+        buf.put_u16_le(253);
+        buf.put_u64_le(0);
+        let done = TokenDone::attention_ack(&buf, 8).unwrap();
+        assert!(done.is_attention());
+
+        let mut plain = buf.clone();
+        plain[1] = DoneStatus::Error as u8;
+        assert!(TokenDone::attention_ack(&plain, 8).is_none());
+        assert!(TokenDone::attention_ack(&buf[1..], 8).is_none());
+        let mut row = buf.clone();
+        row[0] = TokenType::Row as u8;
+        assert!(TokenDone::attention_ack(&row, 8).is_none());
+    }
 
     #[tokio::test]
     async fn decode_final_done() {
