@@ -1234,7 +1234,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> futures_util::io::AsyncRead for C
                 match item {
                     Ok(packet) => {
                         let (_, payload) = packet.into_parts();
-                        this.buf.extend(payload);
+                        this.buf.extend_from_slice(&payload);
 
                         if this.buf.len() >= size {
                             break;
