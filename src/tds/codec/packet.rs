@@ -26,7 +26,9 @@ impl Encode<BytesMut> for Packet {
         let size = (self.payload.len() as u16 + HEADER_BYTES as u16).to_be_bytes();
 
         self.header.encode(dst)?;
-        dst.extend(self.payload);
+        // `BytesMut::extend` takes a byte iterator and appends one byte at a
+        // time (`put_u8` per byte); `extend_from_slice` is a single copy.
+        dst.extend_from_slice(&self.payload);
 
         dst[2] = size[0];
         dst[3] = size[1];
@@ -91,6 +93,25 @@ mod tests {
         // 8 header bytes + 4 payload bytes.
         assert_eq!(&buf[2..4], &12u16.to_be_bytes());
         assert_eq!(&buf[8..], b"abcd");
+    }
+
+    #[test]
+    fn encode_appends_after_previously_encoded_packets() {
+        let first: Vec<u8> = (0..=255).collect();
+        let second = vec![0xABu8; 4088];
+
+        let mut buf = BytesMut::new();
+        Packet::new(PacketHeader::batch(1), BytesMut::from(&first[..]))
+            .encode(&mut buf)
+            .unwrap();
+        Packet::new(PacketHeader::batch(2), BytesMut::from(&second[..]))
+            .encode(&mut buf)
+            .unwrap();
+
+        let first_len = HEADER_BYTES + first.len();
+        assert_eq!(buf.len(), first_len + HEADER_BYTES + second.len());
+        assert_eq!(&buf[HEADER_BYTES..first_len], &first[..]);
+        assert_eq!(&buf[first_len + HEADER_BYTES..], &second[..]);
     }
 
     #[test]
