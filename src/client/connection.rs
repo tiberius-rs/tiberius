@@ -209,6 +209,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 config.client_name,
                 config.readonly,
                 config.packet_size,
+                config.json_support,
+                config.vector_support,
                 prelogin,
             )
             .await?;
@@ -560,6 +562,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         client_name: Option<String>,
         readonly: bool,
         packet_size: Option<u32>,
+        json_support: bool,
+        vector_support: bool,
         prelogin: PreloginMessage,
     ) -> crate::Result<Self> {
         let mut login_message = LoginMessage::new();
@@ -581,6 +585,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         }
 
         login_message.readonly(readonly);
+        login_message.json_support(json_support);
+        login_message.vector_support(vector_support);
 
         if let Some(size) = packet_size {
             login_message.packet_size(size);

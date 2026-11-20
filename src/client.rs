@@ -900,8 +900,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         'a: 'b,
     {
         let mut param_str = String::new();
+        let vector_supported = self.connection.context().vector_supported();
 
         for (i, param) in params.enumerate() {
+            let param = param.for_negotiated(vector_supported);
             if i > 0 {
                 param_str.push(',')
             }

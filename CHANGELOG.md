@@ -1,5 +1,29 @@
 # Changes
 
+## Unreleased
+
+- feat: native support for the SQL Server 2025 `json` and `vector` types,
+  opt-in with `Config::json_support(true)` / `Config::vector_support(true)`
+  (and the `ConfigBuilder` mirrors). Both default to off, so existing
+  connections behave as before: the server keeps sending these columns as
+  strings.
+  - `json`: the client sends the JSONSUPPORT login feature. Columns arrive as
+    `ColumnType::Json` and are read as `ColumnData::String`, so
+    `row.get::<&str, _>()` works either way. SQL Server 2025 (17.0 CU11) was
+    observed sending `json` values as UTF-16LE rather than the UTF-8 that
+    MS-TDS implies, so both encodings are decoded. Bulk insert into `json`
+    columns sends UTF-8, describing the column as `varchar(max)` in
+    COLMETADATA as Microsoft.Data.SqlClient does.
+  - `vector`: the client sends the VECTORSUPPORT login feature (version 1,
+    `float32` only). Columns arrive as `ColumnType::Vector` and are read as the
+    new `ColumnData::Vector` holding a `tiberius::vector::Vector`. `Vector`
+    works as a query/command parameter and in bulk insert; without native
+    support, vector parameters are sent as JSON-array text, and
+    `row.get::<Vector, _>()` also parses the string form.
+- BREAKING: `ColumnData`, `ColumnType`, `TypeInfo` and `VarLenType` gain new
+  variants (`Vector`; `Json`/`Vector`), which breaks exhaustive matches on
+  them.
+
 ## Version 0.13.0
 
 - feat: TLS trust configuration is revamped around two orthogonal axes plus a

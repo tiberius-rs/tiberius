@@ -4,6 +4,7 @@ mod context;
 pub mod numeric;
 pub mod stream;
 pub mod time;
+pub mod vector;
 pub mod xml;
 
 pub(crate) use collation::*;

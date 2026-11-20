@@ -127,6 +127,14 @@ pub enum LoginTypeFlag {
 }
 
 pub(crate) const FEA_EXT_FEDAUTH: u8 = 0x02u8;
+/// FeatureExt id for native `json` support (SQL Server 2025+).
+pub(crate) const FEA_EXT_JSONSUPPORT: u8 = 0x0Du8;
+/// FeatureExt id for native `vector` support (SQL Server 2025+).
+pub(crate) const FEA_EXT_VECTORSUPPORT: u8 = 0x0Eu8;
+/// The highest JSONSUPPORT version the client understands.
+pub(crate) const JSON_SUPPORT_VERSION: u8 = 0x01;
+/// The VECTORSUPPORT version the client asks for: 1 = `float32` vectors only.
+pub(crate) const VECTOR_SUPPORT_VERSION: u8 = 0x01;
 pub(crate) const FEA_EXT_TERMINATOR: u8 = 0xFFu8;
 pub(crate) const FED_AUTH_LIBRARYSECURITYTOKEN: u8 = 0x01;
 
@@ -199,6 +207,10 @@ pub struct LoginMessage<'a> {
     /// the default database to connect to
     db_name: Cow<'a, str>,
     fed_auth_ext: Option<FedAuthExt>,
+    /// request native `json` values (FeatureExt JSONSUPPORT)
+    json_support: bool,
+    /// request native `vector` values (FeatureExt VECTORSUPPORT)
+    vector_support: bool,
 }
 
 // `SecretString` has no `PartialEq`; this test-only impl compares the exposed
@@ -224,6 +236,8 @@ impl PartialEq for LoginMessage<'_> {
             && self.server_name == other.server_name
             && self.db_name == other.db_name
             && self.fed_auth_ext == other.fed_auth_ext
+            && self.json_support == other.json_support
+            && self.vector_support == other.vector_support
             && self.password.expose_secret() == other.password.expose_secret()
     }
 }
@@ -257,6 +271,8 @@ impl std::fmt::Debug for LoginMessage<'_> {
             .field("server_name", &self.server_name)
             .field("db_name", &self.db_name)
             .field("fed_auth_ext", &self.fed_auth_ext)
+            .field("json_support", &self.json_support)
+            .field("vector_support", &self.vector_support)
             .finish()
     }
 }
@@ -379,6 +395,32 @@ impl<'a> LoginMessage<'a> {
         })
     }
 
+    /// Requests native `json` values (FeatureExt JSONSUPPORT).
+    pub fn json_support(&mut self, enabled: bool) {
+        self.json_support = enabled;
+        self.sync_extension_flag();
+    }
+
+    /// Requests native `float32` `vector` values (FeatureExt VECTORSUPPORT).
+    pub fn vector_support(&mut self, enabled: bool) {
+        self.vector_support = enabled;
+        self.sync_extension_flag();
+    }
+
+    /// `true` if any FeatureExt block has to be written.
+    fn has_feature_ext(&self) -> bool {
+        self.fed_auth_ext.is_some() || self.json_support || self.vector_support
+    }
+
+    /// Keeps `fExtension` in step with whether a FeatureExt block is written.
+    fn sync_extension_flag(&mut self) {
+        if self.has_feature_ext() {
+            self.option_flags_3.insert(OptionFlag3::ExtensionUsed);
+        } else {
+            self.option_flags_3.remove(OptionFlag3::ExtensionUsed);
+        }
+    }
+
     pub fn readonly(&mut self, readonly: bool) {
         if readonly {
             self.type_flags.insert(LoginTypeFlag::ReadOnlyIntent);
@@ -427,14 +469,26 @@ impl<'a> LoginMessage<'a> {
             len += bytes.len();
         }
 
+        if self.has_feature_ext() {
+            // 4 (FeatureExt data offset) + 1 (FEA_EXT_TERMINATOR).
+            len += 5;
+        }
+
         if let Some(ref ext) = self.fed_auth_ext {
-            // 4 (FeatureExt data offset) + 1 (FEA_EXT_FEDAUTH) + 4 (feature ext
-            // length) + 1 (options) + 4 (token length) + token bytes + nonce
-            // + 1 (FEA_EXT_TERMINATOR).
-            len += 15 + utf16_bytes(ext.fed_auth_token.expose_secret());
+            // 1 (FEA_EXT_FEDAUTH) + 4 (feature ext length) + 1 (options)
+            // + 4 (token length) + token bytes + nonce.
+            len += 10 + utf16_bytes(ext.fed_auth_token.expose_secret());
             if ext.nonce.is_some() {
                 len += 32;
             }
+        }
+
+        // 1 (feature id) + 4 (feature data length) + 1 (version) each.
+        if self.json_support {
+            len += 6;
+        }
+        if self.vector_support {
+            len += 6;
         }
 
         len
@@ -570,7 +624,8 @@ impl<'a> LoginMessage<'a> {
         cursor.write_u32::<LittleEndian>(0)?;
 
         // FeatureExt
-        if let Some(fed_auth_ext) = self.fed_auth_ext {
+        let has_feature_ext = self.has_feature_ext();
+        if has_feature_ext {
             // update fea_ext_offset
             cursor.set_position(fea_ext_offset);
             cursor.write_u16::<LittleEndian>(data_offset as u16)?;
@@ -579,7 +634,9 @@ impl<'a> LoginMessage<'a> {
             cursor.set_position(data_offset as u64);
             data_offset += 4;
             cursor.write_u32::<LittleEndian>(data_offset as u32)?;
+        }
 
+        if let Some(fed_auth_ext) = self.fed_auth_ext {
             cursor.write_u8(FEA_EXT_FEDAUTH)?;
 
             // SECURITY (fed-auth token): the token is a bearer credential. Like
@@ -627,7 +684,21 @@ impl<'a> LoginMessage<'a> {
             if let Some(nonce) = fed_auth_ext.nonce {
                 cursor.write_all(nonce.as_ref())?;
             }
+        }
 
+        if self.json_support {
+            cursor.write_u8(FEA_EXT_JSONSUPPORT)?;
+            cursor.write_u32::<LittleEndian>(1)?;
+            cursor.write_u8(JSON_SUPPORT_VERSION)?;
+        }
+
+        if self.vector_support {
+            cursor.write_u8(FEA_EXT_VECTORSUPPORT)?;
+            cursor.write_u32::<LittleEndian>(1)?;
+            cursor.write_u8(VECTOR_SUPPORT_VERSION)?;
+        }
+
+        if has_feature_ext {
             cursor.write_u8(FEA_EXT_TERMINATOR)?;
         }
 
@@ -812,6 +883,17 @@ mod tests {
                             nonce,
                         };
                         ret.fed_auth_ext = Some(fed_auth_ext);
+                    } else if fe == FEA_EXT_JSONSUPPORT || fe == FEA_EXT_VECTORSUPPORT {
+                        let fea_ext_len = cursor.read_u32::<LittleEndian>()?;
+                        assert_eq!(fea_ext_len, 1, "feature {fe:#x} carries one version byte");
+                        let version = cursor.read_u8()?;
+                        if fe == FEA_EXT_JSONSUPPORT {
+                            assert_eq!(version, JSON_SUPPORT_VERSION);
+                            ret.json_support = true;
+                        } else {
+                            assert_eq!(version, VECTOR_SUPPORT_VERSION);
+                            ret.vector_support = true;
+                        }
                     } else {
                         unimplemented!("unsupported feature ext {:?}", fe);
                     }
@@ -897,6 +979,63 @@ mod tests {
                 nonce: Some(nonce)
             }
         )
+    }
+
+    #[test]
+    fn json_and_vector_feature_ext_round_trip() {
+        let mut login = LoginMessage::new();
+        login.user_name("u");
+        login.password("p");
+        login.json_support(true);
+        login.vector_support(true);
+        assert!(login.option_flags_3.contains(OptionFlag3::ExtensionUsed));
+
+        let expected_len = login.encoded_len();
+        let mut payload = BytesMut::new();
+        login.clone().encode(&mut payload).expect("encode");
+        assert_eq!(payload.len(), expected_len);
+
+        // The FeatureExt block ends with: 0x0D, len=1, v1, 0x0E, len=1, v1, 0xFF.
+        let tail = &payload[payload.len() - 13..];
+        assert_eq!(
+            tail,
+            &[0x0D, 1, 0, 0, 0, 1, 0x0E, 1, 0, 0, 0, 1, 0xFF],
+            "JSONSUPPORT and VECTORSUPPORT must be written before the terminator"
+        );
+
+        let decoded = LoginMessage::decode(&mut payload).expect("decode");
+        assert_eq!(login, decoded);
+    }
+
+    #[test]
+    fn json_vector_feature_ext_combines_with_fed_auth() {
+        let mut login = LoginMessage::new();
+        login.aad_token("token", false, None);
+        login.vector_support(true);
+
+        let expected_len = login.encoded_len();
+        let mut payload = BytesMut::new();
+        login.clone().encode(&mut payload).expect("encode");
+        assert_eq!(payload.len(), expected_len);
+
+        let decoded = LoginMessage::decode(&mut payload).expect("decode");
+        assert_eq!(login, decoded);
+        assert!(decoded.fed_auth_ext.is_some());
+        assert!(decoded.vector_support);
+        assert!(!decoded.json_support);
+    }
+
+    #[test]
+    fn disabling_features_clears_extension_flag() {
+        let mut login = LoginMessage::new();
+        login.json_support(true);
+        login.json_support(false);
+        assert!(!login.option_flags_3.contains(OptionFlag3::ExtensionUsed));
+
+        let mut payload = BytesMut::new();
+        login.clone().encode(&mut payload).expect("encode");
+        let decoded = LoginMessage::decode(&mut payload).expect("decode");
+        assert_eq!(login, decoded);
     }
 
     #[test]

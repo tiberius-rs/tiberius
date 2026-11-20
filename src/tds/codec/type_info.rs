@@ -1,7 +1,7 @@
 use asynchronous_codec::BytesMut;
 use bytes::BufMut;
 
-use crate::{tds::Collation, xml::XmlSchema, Error, SqlReadBytes};
+use crate::{tds::Collation, vector::VectorElementType, xml::XmlSchema, Error, SqlReadBytes};
 use std::{convert::TryFrom, sync::Arc};
 
 use super::{encode_b_varchar, Encode};
@@ -43,6 +43,18 @@ pub enum TypeInfo {
     },
     /// A CLR user-defined type (UDT), MS-TDS §2.2.5.5.4.
     Udt(UdtInfo),
+    /// The native `json` type (SQL Server 2025+). Sent only when
+    /// [`Config::json_support`](crate::Config::json_support) was negotiated.
+    /// Carries no length or collation; values are UTF-8 PLP data.
+    Json,
+    /// The native `vector` type (SQL Server 2025+). Sent only when
+    /// [`Config::vector_support`](crate::Config::vector_support) was negotiated.
+    Vector {
+        /// The size of an encoded value in bytes (8-byte header plus elements).
+        size: u16,
+        /// The element (base) type.
+        element_type: VectorElementType,
+    },
 }
 
 /// Metadata describing a CLR user-defined type (UDT) column, as defined by the
@@ -208,6 +220,10 @@ uint_enum! {
         Text = 0x23,
         Image = 0x22,
         NText = 0x63,
+        // Native json (SQL Server 2025+); UTF-8 PLP data, see column_data/json.rs.
+        Json = 0xF4,
+        // Native vector (SQL Server 2025+); see column_data/vector.rs.
+        Vector = 0xF5,
         // sql_variant; fully decoded/encoded (see column_data/sql_variant.rs).
         SSVariant = 0x62, // legacy types (not supported since post-7.2):
                           // Char = 0x2F,
@@ -248,6 +264,10 @@ uint_enum! {
         Text = 0x23,
         Image = 0x22,
         NText = 0x63,
+        // Native json (SQL Server 2025+); UTF-8 PLP data, see column_data/json.rs.
+        Json = 0xF4,
+        // Native vector (SQL Server 2025+); see column_data/vector.rs.
+        Vector = 0xF5,
         // sql_variant; fully decoded/encoded (see column_data/sql_variant.rs).
         SSVariant = 0x62, // legacy types (not supported since post-7.2):
                           // Char = 0x2F,
@@ -306,6 +326,15 @@ impl Encode<BytesMut> for TypeInfo {
                 encode_b_varchar(dst, &info.schema_name)?;
                 encode_b_varchar(dst, &info.type_name)?;
                 encode_us_varchar(dst, &info.assembly_qualified_name)?;
+            }
+            TypeInfo::Json => {
+                // JSON_INFO is empty: no length, no collation.
+                dst.put_u8(VarLenType::Json as u8);
+            }
+            TypeInfo::Vector { size, element_type } => {
+                dst.put_u8(VarLenType::Vector as u8);
+                dst.put_u16_le(size);
+                dst.put_u8(element_type.to_u8());
             }
         }
 
@@ -390,6 +419,14 @@ impl TypeInfo {
                     type_name,
                     assembly_qualified_name,
                 }))
+            }
+            Ok(VarLenType::Json) => Ok(TypeInfo::Json),
+            Ok(VarLenType::Vector) => {
+                // USHORTLEN max size, then the element type in the SCALE byte.
+                let size = src.read_u16_le().await?;
+                let element_type = VectorElementType::from_u8(src.read_u8().await?)?;
+
+                Ok(TypeInfo::Vector { size, element_type })
             }
             Ok(ty) => {
                 let len = match ty {
@@ -788,6 +825,54 @@ mod tests {
             .await
             .expect("decode must succeed");
         assert_eq!(decoded, ti);
+    }
+
+    #[tokio::test]
+    async fn json_and_vector_type_info_round_trip() {
+        for ti in [
+            TypeInfo::Json,
+            TypeInfo::Vector {
+                size: 8 + 3 * 4,
+                element_type: VectorElementType::Float32,
+            },
+        ] {
+            let mut buf = BytesMut::new();
+            ti.clone().encode(&mut buf).expect("encode must succeed");
+
+            let decoded = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+                .await
+                .expect("decode must succeed");
+            assert_eq!(decoded, ti);
+        }
+    }
+
+    #[test]
+    fn json_and_vector_type_info_bytes() {
+        let mut buf = BytesMut::new();
+        TypeInfo::Json.encode(&mut buf).unwrap();
+        assert_eq!(buf.as_ref(), &[0xF4]);
+
+        let mut buf = BytesMut::new();
+        TypeInfo::Vector {
+            size: 20,
+            element_type: VectorElementType::Float32,
+        }
+        .encode(&mut buf)
+        .unwrap();
+        assert_eq!(buf.as_ref(), &[0xF5, 20, 0, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_unknown_vector_element_type() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(VarLenType::Vector as u8);
+        buf.put_u16_le(14);
+        buf.put_u8(0x01); // float16, not negotiated
+
+        let err = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect_err("float16 must be rejected");
+        assert!(matches!(err, Error::Protocol(_)));
     }
 
     #[tokio::test]

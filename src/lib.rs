@@ -250,7 +250,7 @@ pub use tds::{
     collation::Collation,
     numeric,
     stream::{CommandReturnValue, CommandStream, QueryStream},
-    time, xml, EncryptionLevel,
+    time, vector, xml, EncryptionLevel,
 };
 pub use to_sql::{IntoSql, ToSql};
 pub use uuid::Uuid;

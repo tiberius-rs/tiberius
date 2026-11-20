@@ -104,6 +104,10 @@ pub enum ColumnType {
     NText,
     /// An SQL variant type.
     SSVariant,
+    /// A native `json` value (SQL Server 2025+), read as a string.
+    Json,
+    /// A native `vector` value (SQL Server 2025+).
+    Vector,
 }
 
 impl From<&TypeInfo> for ColumnType {
@@ -162,6 +166,8 @@ impl From<&TypeInfo> for ColumnType {
                 VarLenType::Image => Self::Image,
                 VarLenType::NText => Self::NText,
                 VarLenType::SSVariant => Self::SSVariant,
+                VarLenType::Json => Self::Json,
+                VarLenType::Vector => Self::Vector,
             },
             TypeInfo::VarLenSizedPrecision { ty, .. } => match ty {
                 VarLenType::Guid => Self::Guid,
@@ -192,9 +198,13 @@ impl From<&TypeInfo> for ColumnType {
                 VarLenType::Image => Self::Image,
                 VarLenType::NText => Self::NText,
                 VarLenType::SSVariant => Self::SSVariant,
+                VarLenType::Json => Self::Json,
+                VarLenType::Vector => Self::Vector,
             },
             TypeInfo::Xml { .. } => Self::Xml,
             TypeInfo::Udt(_) => Self::Udt,
+            TypeInfo::Json => Self::Json,
+            TypeInfo::Vector { .. } => Self::Vector,
         }
     }
 }

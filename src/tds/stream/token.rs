@@ -2,9 +2,9 @@ use crate::tds::codec::TokenSspi;
 use crate::{
     client::Connection,
     tds::codec::{
-        TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenDone, TokenEnvChange,
-        TokenError, TokenFeatureExtAck, TokenFedAuthInfo, TokenInfo, TokenLoginAck, TokenOrder,
-        TokenReturnValue, TokenRow, TokenSessionState, TokenTabName,
+        FeatureAck, TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenDone,
+        TokenEnvChange, TokenError, TokenFeatureExtAck, TokenFedAuthInfo, TokenInfo, TokenLoginAck,
+        TokenOrder, TokenReturnValue, TokenRow, TokenSessionState, TokenTabName,
     },
     Error, SqlReadBytes, TokenType,
 };
@@ -428,6 +428,18 @@ where
             "FeatureExtAck with {} features",
             ack.features.len()
         );
+
+        for feature in &ack.features {
+            match feature {
+                FeatureAck::JsonSupport(version) => {
+                    self.conn.context_mut().set_json_version(*version)
+                }
+                FeatureAck::VectorSupport(version) => {
+                    self.conn.context_mut().set_vector_version(*version)
+                }
+                FeatureAck::FedAuth(_) => {}
+            }
+        }
         Ok(ReceivedToken::FeatureExtAck(ack))
     }
 
