@@ -1,5 +1,6 @@
 use crate::{
     tds::{codec::ColumnData, Numeric},
+    vector::Vector,
     xml::XmlData,
 };
 use std::borrow::Cow;
@@ -30,6 +31,7 @@ use uuid::Uuid;
 /// |[`Decimal`] (with feature flag `rust_decimal`)|`numeric`/`decimal`|
 /// |[`BigDecimal`] (with feature flag `bigdecimal`)|`numeric`/`decimal`|
 /// |[`XmlData`]|`xml`|
+/// |[`Vector`]|`vector(n)` (as JSON-array text without [`Config::vector_support`])|
 /// |[`NaiveDate`] (with `chrono` feature, TDS 7.3 >)|`date`|
 /// |[`NaiveTime`] (with `chrono` feature, TDS 7.3 >)|`time`|
 /// |[`DateTime`]`<Utc>` (with `chrono` feature, TDS 7.3 >)|`datetime2`|
@@ -55,6 +57,8 @@ use uuid::Uuid;
 /// [`Decimal`]: numeric/struct.Decimal.html
 /// [`BigDecimal`]: numeric/struct.BigDecimal.html
 /// [`XmlData`]: xml/struct.XmlData.html
+/// [`Vector`]: vector/struct.Vector.html
+/// [`Config::vector_support`]: crate::Config::vector_support
 /// [`NaiveDateTime`]: time/chrono/struct.NaiveDateTime.html
 /// [`NaiveDate`]: time/chrono/struct.NaiveDate.html
 /// [`NaiveTime`]: time/chrono/struct.NaiveTime.html
@@ -155,6 +159,18 @@ impl<'a> IntoSql<'a> for Option<&'a XmlData> {
     }
 }
 
+impl<'a> IntoSql<'a> for &'a Vector {
+    fn into_sql(self) -> ColumnData<'a> {
+        ColumnData::Vector(Some(Cow::Borrowed(self)))
+    }
+}
+
+impl<'a> IntoSql<'a> for Option<&'a Vector> {
+    fn into_sql(self) -> ColumnData<'a> {
+        ColumnData::Vector(self.map(Cow::Borrowed))
+    }
+}
+
 impl<'a> IntoSql<'a> for &'a Uuid {
     fn into_sql(self) -> ColumnData<'a> {
         ColumnData::Guid(Some(*self))
@@ -172,6 +188,7 @@ into_sql!(self_,
           Vec<u8>: (ColumnData::Binary, Cow::from(self_));
           Numeric: (ColumnData::Numeric, self_);
           XmlData: (ColumnData::Xml, Cow::Owned(self_));
+          Vector: (ColumnData::Vector, Cow::Owned(self_));
           Uuid: (ColumnData::Guid, self_);
           bool: (ColumnData::Bit, self_);
           u8: (ColumnData::U8, self_);
@@ -198,6 +215,7 @@ to_sql!(self_,
         Vec<u8>: (ColumnData::Binary, Cow::from(self_));
         Numeric: (ColumnData::Numeric, *self_);
         XmlData: (ColumnData::Xml, Cow::Borrowed(self_));
+        Vector: (ColumnData::Vector, Cow::Borrowed(self_));
         Uuid: (ColumnData::Guid, *self_);
 );
 

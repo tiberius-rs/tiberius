@@ -8,7 +8,7 @@ use crate::{
         codec::{RpcParam, RpcStatus::ByRefValue, RpcValue, TypeInfoTvp},
         stream::{CommandStream, TokenStream},
     },
-    Client, ColumnData, IntoSql,
+    Client, ColumnData, IntoSql, SqlReadBytes,
 };
 
 #[doc(inline)]
@@ -292,9 +292,12 @@ impl<'a> Command<'a> {
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let mut rpc_params = Vec::new();
+        let vector_supported = client.connection.context().vector_supported();
         for p in cmd_params {
             let rpc_val = match p.data {
-                CommandParamData::Scalar(col) => RpcValue::Scalar(col),
+                CommandParamData::Scalar(col) => {
+                    RpcValue::Scalar(col.for_negotiated(vector_supported))
+                }
                 CommandParamData::Table(t) => {
                     // `db_type` is interpolated raw into the batch below (T-SQL
                     // cannot parameterize a type name), so reject obviously

@@ -138,6 +138,16 @@ impl<'a> Display for MetaDataColumn<'a> {
             },
             TypeInfo::Xml { .. } => write!(f, "xml")?,
             TypeInfo::Udt(info) => write!(f, "{}.{}", info.schema_name, info.type_name)?,
+            TypeInfo::Json => write!(f, "json")?,
+            TypeInfo::Vector { size, element_type } => {
+                let header = crate::vector::VECTOR_HEADER_SIZE;
+                let elem = element_type.size();
+                let size = *size as usize;
+                if size < header || !(size - header).is_multiple_of(elem) {
+                    return Err(std::fmt::Error);
+                }
+                write!(f, "vector({})", (size - header) / elem)?
+            }
         }
 
         Ok(())
@@ -255,6 +265,10 @@ impl BaseMetaDataColumn {
                 // A null `sql_variant` carries no base type, so surface a
                 // generic null value.
                 VarLenType::SSVariant => ColumnData::String(None),
+                // json/vector have their own `TypeInfo` arms; these sized
+                // contexts are never produced by the decoder.
+                VarLenType::Json => ColumnData::String(None),
+                VarLenType::Vector => ColumnData::Vector(None),
             },
             TypeInfo::VarLenSizedPrecision { ty, .. } => match ty {
                 VarLenType::Guid => ColumnData::Guid(None),
@@ -290,9 +304,15 @@ impl BaseMetaDataColumn {
                 // A null `sql_variant` carries no base type, so surface a
                 // generic null value.
                 VarLenType::SSVariant => ColumnData::String(None),
+                // json/vector have their own `TypeInfo` arms; these sized
+                // contexts are never produced by the decoder.
+                VarLenType::Json => ColumnData::String(None),
+                VarLenType::Vector => ColumnData::Vector(None),
             },
             TypeInfo::Xml { .. } => ColumnData::Xml(None),
             TypeInfo::Udt(_) => ColumnData::Binary(None),
+            TypeInfo::Json => ColumnData::String(None),
+            TypeInfo::Vector { .. } => ColumnData::Vector(None),
         }
     }
 }
@@ -353,7 +373,20 @@ impl Encode<BytesMut> for BaseMetaDataColumn {
                 if matches!(cx.r#type(), VarLenType::Text | VarLenType::NText | VarLenType::Image)
         );
 
-        self.ty.encode(dst)?;
+        match self.ty {
+            // The server rejects the native `json` token in bulk-load
+            // COLMETADATA ("Invalid column type from bcp client"). Like
+            // Microsoft.Data.SqlClient, describe the column as `varchar(max)`
+            // with an empty collation and send each value as UTF-8 PLP data
+            // (see `column_data/json.rs`); the `INSERT BULK` statement still
+            // declares the column as `json`.
+            TypeInfo::Json => {
+                dst.put_u8(VarLenType::BigVarChar as u8);
+                dst.put_u16_le(0xffff);
+                dst.extend_from_slice(&[0u8; 5]);
+            }
+            ty => ty.encode(dst)?,
+        }
 
         if emits_table_name {
             let table_name = self.table_name.as_deref().unwrap_or("");

@@ -70,6 +70,8 @@ standard query, bulk-load, RPC, or transaction path depends on.
 | Numeric / Decimal (incl. automatic scale rescaling of params) | ✅ |
 | SQL_VARIANT (0x62) | ✅ read + write |
 | UDT (0xF0) | ✅ raw-value decode (surfaced as bytes; CLR object deserialization out of scope) |
+| JSON (0xF4, SQL Server 2025) | ✅ opt-in `Config::json_support` (read as `String`, written in bulk loads); without it the server sends `nvarchar(max)` |
+| VECTOR (0xF5, SQL Server 2025) | ✅ opt-in `Config::vector_support`, `float32` as `tiberius::vector::Vector`; `float16` (preview) and without it: JSON-array text, which `Vector` also parses |
 
 ### Encryption & auth
 | Feature | Status |

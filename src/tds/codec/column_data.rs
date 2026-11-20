@@ -13,6 +13,7 @@ mod float;
 mod guid;
 mod image;
 mod int;
+mod json;
 #[cfg(test)]
 mod legacy_codepages;
 #[cfg(test)]
@@ -26,6 +27,7 @@ mod text;
 mod time;
 mod udt;
 mod var_len;
+mod vector;
 mod xml;
 
 /// Upper bound on how many bytes a value decoder will *pre-allocate* from a
@@ -52,7 +54,7 @@ use super::{Encode, FixedLenType, TypeInfo, VarLenType};
 #[cfg(feature = "tds73")]
 use crate::tds::time::{Date, DateTime2, DateTimeOffset, Time};
 use crate::{
-    tds::{time::DateTime, time::SmallDateTime, xml::XmlData, Numeric},
+    tds::{time::DateTime, time::SmallDateTime, vector::Vector, xml::XmlData, Numeric},
     FromSql, FromSqlOwned, IntoSql, SqlReadBytes, ToSql,
 };
 use bytes::BufMut;
@@ -158,6 +160,11 @@ pub enum ColumnData<'a> {
     #[cfg_attr(docsrs, doc(cfg(feature = "tds73")))]
     /// DateTime2 value with an offset.
     DateTimeOffset(Option<DateTimeOffset>),
+    /// A `vector` value (SQL Server 2025+). Read from columns only when
+    /// [`Config::vector_support`](crate::Config::vector_support) was
+    /// negotiated; as a parameter it is sent natively when negotiated and as a
+    /// JSON-array string otherwise.
+    Vector(Option<Cow<'a, Vector>>),
 }
 
 impl<'a> ColumnData<'a> {
@@ -194,6 +201,22 @@ impl<'a> ColumnData<'a> {
             ColumnData::DateTime2(_) => "datetime2".into(),
             #[cfg(feature = "tds73")]
             ColumnData::DateTimeOffset(_) => "datetimeoffset".into(),
+            ColumnData::Vector(Some(ref v)) => format!("vector({})", v.dimensions()).into(),
+            // A NULL vector has no dimension count; it is sent as a NULL of
+            // the declared type, like a NULL string.
+            ColumnData::Vector(None) => "nvarchar(4000)".into(),
+        }
+    }
+
+    /// Prepares a parameter for sending over a connection, given whether the
+    /// server negotiated native `vector` support. Without it (and always for
+    /// a NULL, which has no dimension count) a vector is sent as its
+    /// JSON-array text, which SQL Server converts implicitly.
+    pub(crate) fn for_negotiated(self, vector_supported: bool) -> Self {
+        match self {
+            ColumnData::Vector(Some(v)) if vector_supported => ColumnData::Vector(Some(v)),
+            ColumnData::Vector(v) => ColumnData::String(v.map(|v| Cow::Owned(v.to_json_text()))),
+            other => other,
         }
     }
 
@@ -216,6 +239,8 @@ impl<'a> ColumnData<'a> {
             },
             TypeInfo::Xml { schema, size } => xml::decode(src, *size, schema.clone()).await?,
             TypeInfo::Udt(_) => udt::decode(src).await?,
+            TypeInfo::Json => json::decode(src).await?,
+            TypeInfo::Vector { size, .. } => vector::decode(src, *size).await?,
         };
 
         Ok(res)
@@ -908,6 +933,46 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
 
                 dst.extend_from_slice(headers);
                 num.encode(&mut *dst)?;
+            }
+            (ColumnData::String(opt), Some(TypeInfo::Json)) => {
+                json::encode(dst, opt.as_deref());
+            }
+            (ColumnData::Vector(opt), Some(TypeInfo::Vector { size, .. })) => {
+                if let Some(ref v) = opt {
+                    if v.encoded_len() != *size as usize {
+                        return Err(crate::Error::BulkInput(
+                            format!(
+                                "vector has {} elements ({} bytes) but the column holds {} bytes",
+                                v.dimensions(),
+                                v.encoded_len(),
+                                size
+                            )
+                            .into(),
+                        ));
+                    }
+                }
+                vector::encode(dst, opt.as_deref())?;
+            }
+            // A vector into a column the server reports as a string type,
+            // which is how `vector` columns appear when native support was not
+            // negotiated: send the JSON-array text.
+            (ColumnData::Vector(opt), Some(TypeInfo::VarLenSized(vlc)))
+                if matches!(
+                    vlc.r#type(),
+                    VarLenType::BigVarChar
+                        | VarLenType::BigChar
+                        | VarLenType::NVarchar
+                        | VarLenType::NChar
+                ) =>
+            {
+                ColumnData::String(opt.map(|v| Cow::Owned(v.to_json_text()))).encode(dst)?;
+            }
+            (ColumnData::Vector(Some(v)), None) => {
+                // TYPE_INFO: token, USHORTLEN max size, element type (SCALE).
+                dst.put_u8(VarLenType::Vector as u8);
+                dst.put_u16_le(v.encoded_len() as u16);
+                dst.put_u8(v.element_type().to_u8());
+                vector::encode(dst, Some(&v))?;
             }
             (data, Some(TypeInfo::VarLenSized(vlc))) if vlc.r#type() == VarLenType::SSVariant => {
                 sql_variant::encode(&mut *dst, data)?;

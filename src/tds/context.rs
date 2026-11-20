@@ -32,6 +32,12 @@ pub(crate) struct Context {
     /// [`Config::lossy_codepage_decoding`](crate::Config::lossy_codepage_decoding)
     /// at connect time. Defaults to `false`, independently of `lossy_utf16`.
     lossy_codepage: bool,
+    /// The JSONSUPPORT feature version the server acknowledged at login, or
+    /// `0` when native `json` was not negotiated.
+    json_version: u8,
+    /// The VECTORSUPPORT feature version the server acknowledged at login, or
+    /// `0` when native `vector` was not negotiated.
+    vector_version: u8,
 }
 
 impl Context {
@@ -55,6 +61,8 @@ impl Context {
             command_timeout: None,
             lossy_utf16: false,
             lossy_codepage: false,
+            json_version: 0,
+            vector_version: 0,
         }
     }
 
@@ -127,6 +135,27 @@ impl Context {
     /// Records the code-page decoding preference from the connection config.
     pub(crate) fn set_lossy_codepage(&mut self, lossy: bool) {
         self.lossy_codepage = lossy;
+    }
+
+    /// Records the JSONSUPPORT version acknowledged by the server.
+    pub(crate) fn set_json_version(&mut self, version: u8) {
+        self.json_version = version;
+    }
+
+    /// `true` if the server agreed to send and accept native `json` values.
+    #[allow(dead_code)]
+    pub(crate) fn json_supported(&self) -> bool {
+        self.json_version > 0
+    }
+
+    /// Records the VECTORSUPPORT version acknowledged by the server.
+    pub(crate) fn set_vector_version(&mut self, version: u8) {
+        self.vector_version = version;
+    }
+
+    /// `true` if the server agreed to send and accept native `vector` values.
+    pub(crate) fn vector_supported(&self) -> bool {
+        self.vector_version > 0
     }
 
     pub fn transaction_descriptor(&self) -> [u8; 8] {

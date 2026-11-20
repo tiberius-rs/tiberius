@@ -1,4 +1,4 @@
-use crate::{tds::Numeric, xml::XmlData, ColumnData};
+use crate::{tds::Numeric, vector::Vector, xml::XmlData, ColumnData};
 use uuid::Uuid;
 
 /// A conversion trait from a TDS type by-reference.
@@ -22,6 +22,7 @@ use uuid::Uuid;
 /// |[`Numeric`]|`numeric`/`decimal`|
 /// |[`Decimal`] (with feature flag `rust_decimal`)|`numeric`/`decimal`|
 /// |[`XmlData`]|`xml`|
+/// |[`Vector`]|`vector` (native, or the JSON-array string form)|
 /// |[`NaiveDateTime`] (with feature flag `chrono`)|`datetime`/`datetime2`/`smalldatetime`|
 /// |[`NaiveDate`] (with feature flag `chrono`)|`date`|
 /// |[`NaiveTime`] (with feature flag `chrono`)|`time`|
@@ -37,6 +38,7 @@ use uuid::Uuid;
 /// [`Numeric`]: numeric/struct.Numeric.html
 /// [`Decimal`]: numeric/struct.Decimal.html
 /// [`XmlData`]: xml/struct.XmlData.html
+/// [`Vector`]: vector/struct.Vector.html
 /// [`NaiveDateTime`]: time/chrono/struct.NaiveDateTime.html
 /// [`NaiveDate`]: time/chrono/struct.NaiveDate.html
 /// [`NaiveTime`]: time/chrono/struct.NaiveTime.html
@@ -85,6 +87,50 @@ impl<'a> FromSql<'a> for &'a XmlData {
             ColumnData::Xml(data) => Ok(data.as_ref().map(|s| s.as_ref())),
             v => Err(crate::Error::Conversion(
                 format!("cannot interpret {:?} as a String value", v).into(),
+            )),
+        }
+    }
+}
+
+/// Reads a `vector` value. Accepts the native form (with
+/// [`Config::vector_support`](crate::Config::vector_support)) and the
+/// JSON-array string SQL Server sends otherwise.
+impl FromSqlOwned for Vector {
+    fn from_sql_owned(value: ColumnData<'static>) -> crate::Result<Option<Self>> {
+        match value {
+            ColumnData::Vector(v) => Ok(v.map(|v| v.into_owned())),
+            ColumnData::String(s) => s.map(|s| s.parse()).transpose(),
+            v => Err(crate::Error::Conversion(
+                format!("cannot interpret {:?} as a Vector value", v).into(),
+            )),
+        }
+    }
+}
+
+/// Reads a `vector` value by cloning it. Accepts the native form and the
+/// JSON-array string SQL Server sends without native vector support.
+impl<'a> FromSql<'a> for Vector {
+    fn from_sql(value: &'a ColumnData<'static>) -> crate::Result<Option<Self>> {
+        match value {
+            ColumnData::Vector(v) => Ok(v.as_ref().map(|v| v.as_ref().clone())),
+            ColumnData::String(s) => s.as_ref().map(|s| s.parse()).transpose(),
+            v => Err(crate::Error::Conversion(
+                format!("cannot interpret {:?} as a Vector value", v).into(),
+            )),
+        }
+    }
+}
+
+/// Borrows a native `vector` value. Requires
+/// [`Config::vector_support`](crate::Config::vector_support); use [`Vector`]
+/// by value to also accept the JSON-array string form.
+impl<'a> FromSql<'a> for &'a Vector {
+    fn from_sql(value: &'a ColumnData<'static>) -> crate::Result<Option<Self>> {
+        match value {
+            ColumnData::Vector(v) => Ok(v.as_ref().map(|v| v.as_ref())),
+            ColumnData::String(None) => Ok(None),
+            v => Err(crate::Error::Conversion(
+                format!("cannot interpret {:?} as a Vector value", v).into(),
             )),
         }
     }
@@ -210,6 +256,38 @@ mod tests {
         let data = ColumnData::Numeric(Some(numeric));
         assert_eq!(Some(numeric), Numeric::from_sql(&data).unwrap());
         assert_eq!(Some(numeric), Numeric::from_sql_owned(data).unwrap());
+    }
+
+    #[test]
+    fn vector_from_native_and_text_forms() {
+        use std::borrow::Cow;
+        let v = Vector::from(vec![1.0f32, 2.0]);
+
+        let native = ColumnData::Vector(Some(Cow::Owned(v.clone())));
+        assert_eq!(<&Vector as FromSql>::from_sql(&native).unwrap(), Some(&v));
+        assert_eq!(
+            <Vector as FromSql>::from_sql(&native).unwrap(),
+            Some(v.clone())
+        );
+        assert_eq!(Vector::from_sql_owned(native).unwrap(), Some(v.clone()));
+
+        let text = ColumnData::String(Some(Cow::Borrowed("[1.0000000e+000,2.0000000e+000]")));
+        assert_eq!(
+            <Vector as FromSql>::from_sql(&text).unwrap(),
+            Some(v.clone())
+        );
+        assert!(<&Vector as FromSql>::from_sql(&text).is_err());
+        assert_eq!(Vector::from_sql_owned(text).unwrap(), Some(v));
+
+        assert_eq!(
+            Vector::from_sql_owned(ColumnData::Vector(None)).unwrap(),
+            None
+        );
+        assert_eq!(
+            Vector::from_sql_owned(ColumnData::String(None)).unwrap(),
+            None
+        );
+        assert!(Vector::from_sql_owned(ColumnData::I32(Some(1))).is_err());
     }
 
     #[test]

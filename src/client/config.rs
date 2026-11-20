@@ -64,6 +64,8 @@ pub struct Config {
     pub(crate) command_timeout: Option<Duration>,
     pub(crate) lossy_utf16_decoding: bool,
     pub(crate) lossy_codepage_decoding: bool,
+    pub(crate) json_support: bool,
+    pub(crate) vector_support: bool,
     #[cfg(any(
         feature = "rustls",
         feature = "native-tls",
@@ -258,6 +260,8 @@ impl Default for Config {
             command_timeout: Some(DEFAULT_COMMAND_TIMEOUT),
             lossy_utf16_decoding: false,
             lossy_codepage_decoding: false,
+            json_support: false,
+            vector_support: false,
             #[cfg(any(
                 feature = "rustls",
                 feature = "native-tls",
@@ -738,6 +742,68 @@ impl Config {
     /// See [`Config::lossy_codepage_decoding`] for the scope of this option.
     pub fn get_lossy_codepage_decoding(&self) -> bool {
         self.lossy_codepage_decoding
+    }
+
+    /// Asks the server to send `json` columns (SQL Server 2025 and later) in
+    /// their native form.
+    ///
+    /// Defaults to `false`. When disabled, the server sends `json` values as
+    /// `nvarchar(max)`. When enabled and the server supports it, `json`
+    /// columns are reported as [`ColumnType::Json`] and their UTF-8 values are
+    /// read as [`ColumnData::String`], so `row.get::<&str, _>()` works either
+    /// way. Servers that do not know the feature ignore the request.
+    ///
+    /// ```
+    /// let mut config = tiberius::Config::new();
+    /// config.json_support(true);
+    /// ```
+    ///
+    /// [`ColumnType::Json`]: crate::ColumnType::Json
+    /// [`ColumnData::String`]: crate::ColumnData::String
+    pub fn json_support(&mut self, enabled: bool) {
+        self.json_support = enabled;
+    }
+
+    /// Returns whether native `json` support is requested at login.
+    ///
+    /// See [`Config::json_support`].
+    pub fn get_json_support(&self) -> bool {
+        self.json_support
+    }
+
+    /// Asks the server to send `vector` columns (SQL Server 2025 and later)
+    /// in their native binary form.
+    ///
+    /// Defaults to `false`. When disabled, the server sends `vector` values
+    /// as `varchar(max)` holding a JSON array, read as a string. When enabled
+    /// and the server supports it, `float32` vector columns are reported as
+    /// [`ColumnType::Vector`] and read as [`ColumnData::Vector`] (use
+    /// `row.get::<&Vector, _>()` or `row.get::<Vector, _>()`), and
+    /// [`Vector`] query parameters are sent natively. Without native support,
+    /// [`Vector`] parameters are sent as JSON-array strings, which the server
+    /// converts implicitly.
+    ///
+    /// Only `float32` vectors are negotiated (feature version 1). Columns of
+    /// other base types, such as the preview `float16`, still arrive as
+    /// strings.
+    ///
+    /// ```
+    /// let mut config = tiberius::Config::new();
+    /// config.vector_support(true);
+    /// ```
+    ///
+    /// [`ColumnType::Vector`]: crate::ColumnType::Vector
+    /// [`ColumnData::Vector`]: crate::ColumnData::Vector
+    /// [`Vector`]: crate::vector::Vector
+    pub fn vector_support(&mut self, enabled: bool) {
+        self.vector_support = enabled;
+    }
+
+    /// Returns whether native `vector` support is requested at login.
+    ///
+    /// See [`Config::vector_support`].
+    pub fn get_vector_support(&self) -> bool {
+        self.vector_support
     }
 
     /// Supplies a client certificate and private key used to authenticate the
@@ -1221,6 +1287,22 @@ impl ConfigBuilder {
     /// See [`Config::lossy_codepage_decoding`] for the scope of this option.
     pub fn lossy_codepage_decoding(mut self, lossy: bool) -> Self {
         self.inner.lossy_codepage_decoding = lossy;
+        self
+    }
+
+    /// Requests native `json` columns at login. Defaults to `false`.
+    ///
+    /// See [`Config::json_support`].
+    pub fn json_support(mut self, enabled: bool) -> Self {
+        self.inner.json_support = enabled;
+        self
+    }
+
+    /// Requests native `vector` columns at login. Defaults to `false`.
+    ///
+    /// See [`Config::vector_support`].
+    pub fn vector_support(mut self, enabled: bool) -> Self {
+        self.inner.vector_support = enabled;
         self
     }
 
@@ -1709,6 +1791,24 @@ mod tests {
         config.lossy_codepage_decoding(false);
         assert!(!config.get_lossy_codepage_decoding());
         assert!(config.get_lossy_utf16_decoding());
+    }
+
+    #[test]
+    fn json_and_vector_support_default_off_and_setters() {
+        let mut config = Config::new();
+        assert!(!config.get_json_support());
+        assert!(!config.get_vector_support());
+        config.json_support(true);
+        config.vector_support(true);
+        assert!(config.get_json_support());
+        assert!(config.get_vector_support());
+
+        let built = Config::builder()
+            .json_support(true)
+            .vector_support(true)
+            .build();
+        assert!(built.get_json_support());
+        assert!(built.get_vector_support());
     }
 
     #[test]

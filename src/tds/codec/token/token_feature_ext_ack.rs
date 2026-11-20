@@ -1,4 +1,7 @@
-use crate::{Error, SqlReadBytes, FEA_EXT_FEDAUTH, FEA_EXT_TERMINATOR};
+use crate::{
+    Error, SqlReadBytes, FEA_EXT_FEDAUTH, FEA_EXT_JSONSUPPORT, FEA_EXT_TERMINATOR,
+    FEA_EXT_VECTORSUPPORT, JSON_SUPPORT_VERSION, VECTOR_SUPPORT_VERSION,
+};
 use futures_util::AsyncReadExt;
 
 #[derive(Debug)]
@@ -16,6 +19,10 @@ pub enum FedAuthAck {
 #[allow(dead_code)]
 pub enum FeatureAck {
     FedAuth(FedAuthAck),
+    /// The server accepted native `json` values at this JSONSUPPORT version.
+    JsonSupport(u8),
+    /// The server accepted native `vector` values at this VECTORSUPPORT version.
+    VectorSupport(u8),
 }
 
 impl TokenFeatureExtAck {
@@ -50,6 +57,40 @@ impl TokenFeatureExtAck {
                 };
 
                 features.push(FeatureAck::FedAuth(FedAuthAck::SecurityToken { nonce }))
+            } else if feature_id == FEA_EXT_JSONSUPPORT || feature_id == FEA_EXT_VECTORSUPPORT {
+                let data_len = src.read_u32_le().await?;
+                if data_len != 1 {
+                    return Err(Error::Protocol(
+                        format!(
+                            "invalid Feature_Ext_Ack token: feature {feature_id:#04x} has data length {data_len}, expected 1"
+                        )
+                        .into(),
+                    ));
+                }
+
+                let version = src.read_u8().await?;
+                // The server must not acknowledge a version above the one we
+                // asked for: a higher vector version would mean base types
+                // (e.g. float16) in a binary form this client does not decode.
+                let max = if feature_id == FEA_EXT_JSONSUPPORT {
+                    JSON_SUPPORT_VERSION
+                } else {
+                    VECTOR_SUPPORT_VERSION
+                };
+                if version == 0 || version > max {
+                    return Err(Error::Protocol(
+                        format!(
+                            "invalid Feature_Ext_Ack token: feature {feature_id:#04x} acknowledged unsupported version {version}"
+                        )
+                        .into(),
+                    ));
+                }
+
+                features.push(if feature_id == FEA_EXT_JSONSUPPORT {
+                    FeatureAck::JsonSupport(version)
+                } else {
+                    FeatureAck::VectorSupport(version)
+                });
             } else {
                 return Err(Error::Protocol(
                     format!("unsupported feature {}", feature_id).into(),
@@ -84,6 +125,7 @@ mod tests {
             FeatureAck::FedAuth(FedAuthAck::SecurityToken { nonce }) => {
                 assert_eq!(*nonce, Some([7u8; 32]));
             }
+            other => panic!("unexpected ack {other:?}"),
         }
     }
 
@@ -102,6 +144,7 @@ mod tests {
             FeatureAck::FedAuth(FedAuthAck::SecurityToken { nonce }) => {
                 assert!(nonce.is_none());
             }
+            other => panic!("unexpected ack {other:?}"),
         }
     }
 
@@ -128,6 +171,53 @@ mod tests {
         let err = TokenFeatureExtAck::decode(&mut buf.into_sql_read_bytes())
             .await
             .expect_err("unsupported feature must error");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn decodes_json_and_vector_support() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(FEA_EXT_JSONSUPPORT);
+        buf.put_u32_le(1);
+        buf.put_u8(1);
+        buf.put_u8(FEA_EXT_VECTORSUPPORT);
+        buf.put_u32_le(1);
+        buf.put_u8(1);
+        buf.put_u8(FEA_EXT_TERMINATOR);
+
+        let ack = TokenFeatureExtAck::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .unwrap();
+
+        assert!(matches!(ack.features[0], FeatureAck::JsonSupport(1)));
+        assert!(matches!(ack.features[1], FeatureAck::VectorSupport(1)));
+    }
+
+    #[tokio::test]
+    async fn rejects_vector_version_above_requested() {
+        // We only ask for float32 (v1); a v2 ack would mean float16 columns in a
+        // binary form we cannot decode.
+        let mut buf = BytesMut::new();
+        buf.put_u8(FEA_EXT_VECTORSUPPORT);
+        buf.put_u32_le(1);
+        buf.put_u8(2);
+
+        let err = TokenFeatureExtAck::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect_err("v2 vector ack must error");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_json_ack_with_bad_length() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(FEA_EXT_JSONSUPPORT);
+        buf.put_u32_le(2);
+        buf.extend_from_slice(&[1, 1]);
+
+        let err = TokenFeatureExtAck::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect_err("bad length must error");
         assert!(matches!(err, Error::Protocol(_)));
     }
 

@@ -154,6 +154,24 @@ Type mappings are available via `FromSql`/`ToSql`, with optional `chrono`,
 `Client::column_metadata()` exposes column type, size, precision/scale,
 nullability and identity flags.
 
+### SQL Server 2025 `json` and `vector`
+
+Both types are opt-in at login. Without the opt-in the server sends them as
+text, and the same code still works:
+
+```rust,ignore
+use tiberius::vector::Vector;
+
+config.json_support(true);    // json columns arrive as ColumnType::Json
+config.vector_support(true);  // float32 vectors travel in binary form
+
+let doc: Option<&str> = row.get("doc");
+let emb: Option<Vector> = row.get("emb");
+
+let probe = Vector::from(vec![0.1f32, 0.2, 0.3]);
+client.query("SELECT TOP 5 id FROM docs ORDER BY VECTOR_DISTANCE('cosine', emb, @P1)", &[&probe]).await?;
+```
+
 ## Bulk insert
 
 Efficiently stream many rows into a table:
