@@ -47,12 +47,23 @@ impl Collation {
         self.info
     }
 
+    /// `fUTF8` (MS-TDS §2.2.5.1.2), bit 26 of the collation info: the `*_UTF8`
+    /// collations (SQL Server 2019+) store their character data as UTF-8.
+    fn is_utf8(&self) -> bool {
+        self.info & (1 << 26) != 0
+    }
+
     /// Returns an `encoding_rs` encoding for a given collation.
     ///
-    /// CP437 and CP850 are supported by internal row/bulk codecs, but cannot
-    /// be represented by `encoding_rs::Encoding`; this method still returns
-    /// an error for those code pages.
+    /// `*_UTF8` collations resolve to UTF-8. CP437 and CP850 are supported by
+    /// internal row/bulk codecs, but cannot be represented by
+    /// `encoding_rs::Encoding`; this method still returns an error for those
+    /// code pages.
     pub fn encoding(&self) -> crate::Result<&'static Encoding> {
+        if self.is_utf8() {
+            return Ok(encoding_rs::UTF_8);
+        }
+
         let res = if self.sort_id == 0 {
             lcid_to_encoding(self.lcid())
         } else {
@@ -72,6 +83,10 @@ impl Collation {
     }
 
     pub(crate) fn codec(&self) -> crate::Result<CollationCodec> {
+        if self.is_utf8() {
+            return Ok(CollationCodec::BuiltIn(encoding_rs::UTF_8));
+        }
+
         match self.sort_id {
             30..=35 => Ok(CollationCodec::Cp437),
             40..=45 | 49 | 55..=61 => Ok(CollationCodec::Cp850),
@@ -550,6 +565,36 @@ mod tests {
         let collation = Collation::new(0x0405, 80);
         let encoding = collation.encoding().expect("known sort id must resolve");
         assert_eq!(encoding, encoding_rs::WINDOWS_1250);
+    }
+
+    #[test]
+    fn utf8_flag_selects_utf8_encoding_and_codec() {
+        // *_UTF8 collations (e.g. Latin1_General_100_CI_AS_SC_UTF8) carry fUTF8
+        // (bit 26) on top of the LCID, and sort_id 0.
+        const FUTF8: u32 = 1 << 26;
+        let collation = Collation::new(0x0409 | FUTF8, 0);
+        assert!(collation.is_utf8());
+        assert_eq!(collation.encoding().unwrap(), encoding_rs::UTF_8);
+
+        let codec = collation.codec().unwrap();
+        assert_eq!(codec.decode("中文 café".as_bytes()).unwrap(), "中文 café");
+        assert_eq!(codec.encode("中文 café").unwrap(), "中文 café".as_bytes());
+        assert_eq!(collation.to_string(), "UTF-8");
+    }
+
+    #[test]
+    fn utf8_flag_is_not_set_for_plain_or_legacy_collations() {
+        // Without fUTF8 the LCID's code page is still used, including with the
+        // neighbouring flag bits set: bit 21 (fIgnoreAccent), bit 25 (fBinary2)
+        // and bit 27 (reserved).
+        for info in [0x0409, 0x0020_0409, 0x0200_0409, 0x0800_0409] {
+            assert!(!Collation::new(info, 0).is_utf8(), "info {info:#x}");
+            assert_eq!(
+                Collation::new(info, 0).encoding().unwrap(),
+                encoding_rs::WINDOWS_1252,
+                "info {info:#x}"
+            );
+        }
     }
 
     #[test]
