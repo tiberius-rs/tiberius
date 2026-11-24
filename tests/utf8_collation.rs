@@ -100,3 +100,94 @@ where
 
     Ok(())
 }
+
+type TokioClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
+
+// `utf8_support` is a `Config` option with no connection-string key, so these
+// tests connect with tokio directly instead of through `test_on_runtimes`.
+async fn connect_with_utf8_support(utf8_support: bool) -> Result<TokioClient> {
+    use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+    let mut config = tiberius::Config::from_ado_string(&CONN_STR)?;
+    config.utf8_support(utf8_support);
+    let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+    tiberius::Client::connect(config, tcp.compat_write()).await
+}
+
+/// Creates a `*_UTF8` temp table, stores `SAMPLE`, and returns the column type
+/// and value that come back from a plain `SELECT`.
+async fn read_utf8_column(
+    conn: &mut TokioClient,
+) -> Result<(tiberius::ColumnType, Option<String>)> {
+    conn.simple_query(format!(
+        "CREATE TABLE #u8_optin (c varchar(50) COLLATE {UTF8_COLLATION} NULL)"
+    ))
+    .await?
+    .into_results()
+    .await?;
+    conn.execute("INSERT INTO #u8_optin (c) VALUES (@P1)", &[&SAMPLE])
+        .await?;
+
+    let row = conn
+        .query("SELECT c FROM #u8_optin", &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    let column_type = row.columns()[0].column_type();
+    let value = row.try_get::<&str, _>(0)?.map(str::to_owned);
+    Ok((column_type, value))
+}
+
+/// Default (`utf8_support` off): same column metadata as before the option
+/// existed, the server transcodes the column to `NVARCHAR`.
+#[tokio::test]
+async fn utf8_support_off_reports_nvarchar_column() -> Result<()> {
+    let mut conn = connect_with_utf8_support(false).await?;
+    let (column_type, value) = read_utf8_column(&mut conn).await?;
+
+    assert_eq!(tiberius::ColumnType::NVarchar, column_type);
+    assert_eq!(Some(SAMPLE.to_owned()), value);
+    Ok(())
+}
+
+/// With `utf8_support` on, the server sends the `*_UTF8` column as its native
+/// `VARCHAR` type; the UTF-8 bytes come back unchanged.
+#[tokio::test]
+async fn utf8_support_on_reports_varchar_column() -> Result<()> {
+    let mut conn = connect_with_utf8_support(true).await?;
+    let (column_type, value) = read_utf8_column(&mut conn).await?;
+
+    assert_eq!(tiberius::ColumnType::BigVarChar, column_type);
+    assert_eq!(Some(SAMPLE.to_owned()), value);
+    Ok(())
+}
+
+/// With `utf8_support` on, bulk insert encodes into the `BigVarChar` column
+/// with the UTF-8 codec (`Collation::codec`) and reads back unchanged.
+#[tokio::test]
+async fn utf8_support_on_bulk_insert_round_trip() -> Result<()> {
+    let mut conn = connect_with_utf8_support(true).await?;
+    conn.simple_query(format!(
+        "CREATE TABLE #u8_optin_bulk (c varchar(50) COLLATE {UTF8_COLLATION} NULL)"
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    let mut req = conn.bulk_insert("#u8_optin_bulk").await?;
+    let mut row = TokenRow::new();
+    row.push(SAMPLE.into_sql());
+    req.send(row).await?;
+    req.finalize().await?;
+
+    let row = conn
+        .query("SELECT c FROM #u8_optin_bulk", &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    assert_eq!(Some(SAMPLE), row.try_get::<&str, _>(0)?);
+    Ok(())
+}

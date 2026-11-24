@@ -127,6 +127,9 @@ pub enum LoginTypeFlag {
 }
 
 pub(crate) const FEA_EXT_FEDAUTH: u8 = 0x02u8;
+/// `FEA_EXT_UTF8_SUPPORT` (MS-TDS §2.2.6.4): asks the server to send `*_UTF8`
+/// `CHAR` / `VARCHAR` data unchanged.
+pub(crate) const FEA_EXT_UTF8_SUPPORT: u8 = 0x0Au8;
 pub(crate) const FEA_EXT_TERMINATOR: u8 = 0xFFu8;
 pub(crate) const FED_AUTH_LIBRARYSECURITYTOKEN: u8 = 0x01;
 
@@ -199,6 +202,8 @@ pub struct LoginMessage<'a> {
     /// the default database to connect to
     db_name: Cow<'a, str>,
     fed_auth_ext: Option<FedAuthExt>,
+    /// request the `UTF8_SUPPORT` feature extension
+    utf8_support: bool,
 }
 
 // `SecretString` has no `PartialEq`; this test-only impl compares the exposed
@@ -224,6 +229,7 @@ impl PartialEq for LoginMessage<'_> {
             && self.server_name == other.server_name
             && self.db_name == other.db_name
             && self.fed_auth_ext == other.fed_auth_ext
+            && self.utf8_support == other.utf8_support
             && self.password.expose_secret() == other.password.expose_secret()
     }
 }
@@ -257,6 +263,7 @@ impl std::fmt::Debug for LoginMessage<'_> {
             .field("server_name", &self.server_name)
             .field("db_name", &self.db_name)
             .field("fed_auth_ext", &self.fed_auth_ext)
+            .field("utf8_support", &self.utf8_support)
             .finish()
     }
 }
@@ -387,6 +394,12 @@ impl<'a> LoginMessage<'a> {
         }
     }
 
+    /// Requests (or not) the `UTF8_SUPPORT` feature extension. See
+    /// [`crate::Config::utf8_support`].
+    pub fn utf8_support(&mut self, enabled: bool) {
+        self.utf8_support = enabled;
+    }
+
     /// Sets the requested TDS packet size.
     pub fn packet_size(&mut self, size: u32) {
         self.packet_size = size;
@@ -427,14 +440,20 @@ impl<'a> LoginMessage<'a> {
             len += bytes.len();
         }
 
+        // FeatureExt: the 4-byte data offset and the terminator are shared by
+        // every feature. FEDAUTH: 1 (id) + 4 (length) + 1 (options) + 4 (token
+        // length) + token bytes + nonce. UTF8_SUPPORT: 1 (id) + 4 (length) + 1.
+        if self.fed_auth_ext.is_some() || self.utf8_support {
+            len += 4 + 1;
+        }
         if let Some(ref ext) = self.fed_auth_ext {
-            // 4 (FeatureExt data offset) + 1 (FEA_EXT_FEDAUTH) + 4 (feature ext
-            // length) + 1 (options) + 4 (token length) + token bytes + nonce
-            // + 1 (FEA_EXT_TERMINATOR).
-            len += 15 + utf16_bytes(ext.fed_auth_token.expose_secret());
+            len += 1 + 4 + 1 + 4 + utf16_bytes(ext.fed_auth_token.expose_secret());
             if ext.nonce.is_some() {
                 len += 32;
             }
+        }
+        if self.utf8_support {
+            len += 1 + 4 + 1;
         }
 
         len
@@ -471,7 +490,14 @@ impl<'a> LoginMessage<'a> {
         cursor.write_u8(self.option_flags_1.bits())?;
         cursor.write_u8(self.option_flags_2.bits())?;
         cursor.write_u8(self.type_flags.bits())?;
-        cursor.write_u8(self.option_flags_3.bits())?;
+        // A FeatureExt block is present when FEDAUTH or UTF8_SUPPORT is requested;
+        // the server only reads it when ExtensionUsed is set.
+        let has_feature_ext = self.fed_auth_ext.is_some() || self.utf8_support;
+        let mut option_flags_3 = self.option_flags_3;
+        if has_feature_ext {
+            option_flags_3.insert(OptionFlag3::ExtensionUsed);
+        }
+        cursor.write_u8(option_flags_3.bits())?;
 
         cursor.write_u32::<LittleEndian>(self.client_timezone as u32)?;
         cursor.write_u32::<LittleEndian>(self.client_lcid)?;
@@ -570,7 +596,7 @@ impl<'a> LoginMessage<'a> {
         cursor.write_u32::<LittleEndian>(0)?;
 
         // FeatureExt
-        if let Some(fed_auth_ext) = self.fed_auth_ext {
+        if has_feature_ext {
             // update fea_ext_offset
             cursor.set_position(fea_ext_offset);
             cursor.write_u16::<LittleEndian>(data_offset as u16)?;
@@ -579,7 +605,9 @@ impl<'a> LoginMessage<'a> {
             cursor.set_position(data_offset as u64);
             data_offset += 4;
             cursor.write_u32::<LittleEndian>(data_offset as u32)?;
+        }
 
+        if let Some(fed_auth_ext) = self.fed_auth_ext {
             cursor.write_u8(FEA_EXT_FEDAUTH)?;
 
             // SECURITY (fed-auth token): the token is a bearer credential. Like
@@ -627,7 +655,15 @@ impl<'a> LoginMessage<'a> {
             if let Some(nonce) = fed_auth_ext.nonce {
                 cursor.write_all(nonce.as_ref())?;
             }
+        }
 
+        if self.utf8_support {
+            cursor.write_u8(FEA_EXT_UTF8_SUPPORT)?;
+            cursor.write_u32::<LittleEndian>(1)?; // FeatureDataLen
+            cursor.write_u8(1)?; // 0x01: UTF-8 support requested
+        }
+
+        if has_feature_ext {
             cursor.write_u8(FEA_EXT_TERMINATOR)?;
         }
 
@@ -812,6 +848,11 @@ mod tests {
                             nonce,
                         };
                         ret.fed_auth_ext = Some(fed_auth_ext);
+                    } else if fe == FEA_EXT_UTF8_SUPPORT {
+                        let fea_ext_len = cursor.read_u32::<LittleEndian>()?;
+                        assert_eq!(fea_ext_len, 1, "UTF8_SUPPORT data length");
+                        assert_eq!(cursor.read_u8()?, 1, "UTF8_SUPPORT value");
+                        ret.utf8_support = true;
                     } else {
                         unimplemented!("unsupported feature ext {:?}", fe);
                     }
@@ -1027,6 +1068,91 @@ mod tests {
         let decoded = LoginMessage::decode(&mut payload).expect("decode should succeed");
 
         assert_eq!(login, decoded);
+    }
+
+    /// Reads the FeatureExt block of an encoded LOGIN7 payload: returns the
+    /// `ibFeatureExtLong` pointer and the bytes it points at.
+    fn feature_ext_block(payload: &[u8]) -> (usize, &[u8]) {
+        // ibExtension is `var_data` entry 5: the first OffsetLength pair after
+        // the 36-byte fixed header, so its offset is at 36 + 5 * 4.
+        const IB_EXTENSION: usize = 36 + 5 * 4;
+        let ext_offset = u16::from_le_bytes([payload[IB_EXTENSION], payload[IB_EXTENSION + 1]]);
+        let ext_len = u16::from_le_bytes([payload[IB_EXTENSION + 2], payload[IB_EXTENSION + 3]]);
+        assert_eq!(
+            ext_len, 4,
+            "ibExtension cchExtension must cover the pointer"
+        );
+
+        let ext_offset = ext_offset as usize;
+        let pointer = u32::from_le_bytes(payload[ext_offset..ext_offset + 4].try_into().unwrap());
+        assert_eq!(pointer as usize, ext_offset + 4);
+        (ext_offset, &payload[pointer as usize..])
+    }
+
+    #[test]
+    fn utf8_support_writes_feature_ext_block() {
+        // Without FEDAUTH the block holds only UTF8_SUPPORT, which is the last
+        // thing in the packet: 4 (pointer) + 1 (id) + 4 (len) + 1 (value) + 1
+        // (terminator) = 11 bytes after the pointer's offset.
+        let mut login = LoginMessage::new();
+        login.utf8_support(true);
+        let expected_len = login.encoded_len();
+        let mut payload = BytesMut::new();
+        login
+            .clone()
+            .encode(&mut payload)
+            .expect("encode should succeed");
+
+        assert_eq!(payload.len(), expected_len);
+        let (ext_offset, block) = feature_ext_block(&payload);
+        assert_eq!(payload.len(), ext_offset + 11);
+        assert_eq!(&block[..6], &[FEA_EXT_UTF8_SUPPORT, 1, 0, 0, 0, 0x01]);
+        assert_eq!(block[6], FEA_EXT_TERMINATOR);
+        assert_ne!(
+            payload[27] & OptionFlag3::ExtensionUsed as u8,
+            0,
+            "ExtensionUsed must be set when a FeatureExt block is present"
+        );
+
+        let decoded = LoginMessage::decode(&mut payload).expect("decode should succeed");
+        assert!(decoded.utf8_support);
+        assert!(decoded.fed_auth_ext.is_none());
+    }
+
+    #[test]
+    fn utf8_support_with_fed_auth_round_trips() {
+        let mut login = LoginMessage::new();
+        login.utf8_support(true);
+        login.aad_token("fake-aad-token", false, Some([3u8; 32]));
+        let expected_len = login.encoded_len();
+
+        let mut payload = BytesMut::new();
+        login
+            .clone()
+            .encode(&mut payload)
+            .expect("encode should succeed");
+        assert_eq!(payload.len(), expected_len);
+
+        // FEDAUTH comes first, then UTF8_SUPPORT, then the terminator.
+        let (_, block) = feature_ext_block(&payload);
+        assert_eq!(block[0], FEA_EXT_FEDAUTH);
+        assert!(block.ends_with(&[FEA_EXT_UTF8_SUPPORT, 1, 0, 0, 0, 0x01, FEA_EXT_TERMINATOR]));
+
+        let decoded = LoginMessage::decode(&mut payload).expect("decode should succeed");
+        assert!(decoded.utf8_support);
+        assert_eq!(decoded.fed_auth_ext, login.fed_auth_ext);
+    }
+
+    #[test]
+    fn utf8_support_is_off_by_default() {
+        let mut payload = BytesMut::new();
+        LoginMessage::new()
+            .encode(&mut payload)
+            .expect("encode should succeed");
+
+        assert_eq!(payload[27] & OptionFlag3::ExtensionUsed as u8, 0);
+        let decoded = LoginMessage::decode(&mut payload).expect("decode should succeed");
+        assert!(!decoded.utf8_support);
     }
 
     #[test]
