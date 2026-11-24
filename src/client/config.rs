@@ -1377,10 +1377,7 @@ pub(crate) trait ConfigString {
                 (None, None) => Ok(AuthMethod::Integrated),
                 _ => Ok(AuthMethod::windows(user.unwrap_or(""), pw.unwrap_or(""))),
             },
-            #[cfg(all(
-                feature = "integrated-auth-gssapi",
-                not(all(unix, feature = "sspi-rs"))
-            ))]
+            #[cfg(all(unix, feature = "integrated-auth-gssapi", not(feature = "sspi-rs")))]
             Some(val) if Self::is_sspi_or_truthy(val)? => Ok(AuthMethod::Integrated),
             // Default (no integrated security): SQL Server authentication. A
             // missing user or password is intentionally passed through as an
@@ -1522,7 +1519,7 @@ pub(crate) trait ConfigString {
     #[cfg(any(
         all(windows, feature = "winauth"),
         all(unix, feature = "sspi-rs"),
-        feature = "integrated-auth-gssapi"
+        all(unix, feature = "integrated-auth-gssapi")
     ))]
     fn is_sspi_or_truthy<T: AsRef<str>>(v: T) -> crate::Result<bool> {
         let v = v.as_ref();
