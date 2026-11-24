@@ -64,6 +64,7 @@ pub struct Config {
     pub(crate) command_timeout: Option<Duration>,
     pub(crate) lossy_utf16_decoding: bool,
     pub(crate) lossy_codepage_decoding: bool,
+    pub(crate) utf8_support: bool,
     #[cfg(any(
         feature = "rustls",
         feature = "native-tls",
@@ -258,6 +259,7 @@ impl Default for Config {
             command_timeout: Some(DEFAULT_COMMAND_TIMEOUT),
             lossy_utf16_decoding: false,
             lossy_codepage_decoding: false,
+            utf8_support: false,
             #[cfg(any(
                 feature = "rustls",
                 feature = "native-tls",
@@ -738,6 +740,33 @@ impl Config {
     /// See [`Config::lossy_codepage_decoding`] for the scope of this option.
     pub fn get_lossy_codepage_decoding(&self) -> bool {
         self.lossy_codepage_decoding
+    }
+
+    /// Enables or disables the `UTF8_SUPPORT` LOGIN7 feature extension
+    /// (`FEA_EXT_UTF8_SUPPORT`, MS-TDS §2.2.6.4). Off by default.
+    ///
+    /// When enabled, the server sends `VARCHAR` / `CHAR` columns that use a
+    /// `*_UTF8` collation as their native types, with the UTF-8 bytes
+    /// unchanged. Without it, the server transcodes them to `NVARCHAR` and
+    /// reports the column type as `nvarchar`. Enabling it therefore changes
+    /// the column type metadata seen by existing code, which is why it is
+    /// opt-in.
+    ///
+    /// Only affects `*_UTF8` collations, which need SQL Server 2019 or later.
+    ///
+    /// ```
+    /// let mut config = tiberius::Config::new();
+    /// config.utf8_support(true);
+    /// ```
+    pub fn utf8_support(&mut self, enabled: bool) {
+        self.utf8_support = enabled;
+    }
+
+    /// Returns whether the `UTF8_SUPPORT` feature extension is requested.
+    ///
+    /// See [`Config::utf8_support`] for the scope of this option.
+    pub fn get_utf8_support(&self) -> bool {
+        self.utf8_support
     }
 
     /// Supplies a client certificate and private key used to authenticate the
@@ -1221,6 +1250,14 @@ impl ConfigBuilder {
     /// See [`Config::lossy_codepage_decoding`] for the scope of this option.
     pub fn lossy_codepage_decoding(mut self, lossy: bool) -> Self {
         self.inner.lossy_codepage_decoding = lossy;
+        self
+    }
+
+    /// Enables the `UTF8_SUPPORT` feature extension. Defaults to `false`.
+    ///
+    /// See [`Config::utf8_support`] for the scope of this option.
+    pub fn utf8_support(mut self, enabled: bool) -> Self {
+        self.inner.utf8_support = enabled;
         self
     }
 
@@ -1717,6 +1754,24 @@ mod tests {
         let config = Config::builder().lossy_codepage_decoding(true).build();
         assert!(config.get_lossy_codepage_decoding());
         assert!(!config.get_lossy_utf16_decoding());
+    }
+
+    #[test]
+    fn utf8_support_defaults_and_setter() {
+        let mut config = Config::new();
+        assert!(!config.get_utf8_support());
+        config.utf8_support(true);
+        assert!(config.get_utf8_support());
+        config.utf8_support(false);
+        assert!(!config.get_utf8_support());
+    }
+
+    #[test]
+    fn config_builder_sets_utf8_support() {
+        assert!(!Config::builder().build().get_utf8_support());
+        let config = Config::builder().utf8_support(true).build();
+        assert!(config.get_utf8_support());
+        assert!(!config.get_lossy_codepage_decoding());
     }
 
     #[test]

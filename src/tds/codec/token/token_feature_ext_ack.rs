@@ -1,4 +1,4 @@
-use crate::{Error, SqlReadBytes, FEA_EXT_FEDAUTH, FEA_EXT_TERMINATOR};
+use crate::{Error, SqlReadBytes, FEA_EXT_FEDAUTH, FEA_EXT_TERMINATOR, FEA_EXT_UTF8_SUPPORT};
 use futures_util::AsyncReadExt;
 
 #[derive(Debug)]
@@ -16,6 +16,11 @@ pub enum FedAuthAck {
 #[allow(dead_code)]
 pub enum FeatureAck {
     FedAuth(FedAuthAck),
+    /// `FEA_EXT_UTF8_SUPPORT` acknowledgement; `supported` is the server's
+    /// one-byte answer (`0x01` = UTF-8 support in effect).
+    Utf8Support {
+        supported: bool,
+    },
 }
 
 impl TokenFeatureExtAck {
@@ -50,6 +55,20 @@ impl TokenFeatureExtAck {
                 };
 
                 features.push(FeatureAck::FedAuth(FedAuthAck::SecurityToken { nonce }))
+            } else if feature_id == FEA_EXT_UTF8_SUPPORT {
+                let data_len = src.read_u32_le().await?;
+                if data_len != 1 {
+                    return Err(Error::Protocol(
+                        format!(
+                            "invalid Feature_Ext_Ack token: invalid UTF8_SUPPORT data length {}",
+                            data_len
+                        )
+                        .into(),
+                    ));
+                }
+
+                let supported = src.read_u8().await? == 0x01;
+                features.push(FeatureAck::Utf8Support { supported });
             } else {
                 return Err(Error::Protocol(
                     format!("unsupported feature {}", feature_id).into(),
@@ -84,6 +103,7 @@ mod tests {
             FeatureAck::FedAuth(FedAuthAck::SecurityToken { nonce }) => {
                 assert_eq!(*nonce, Some([7u8; 32]));
             }
+            _ => panic!("expected a FEDAUTH ack"),
         }
     }
 
@@ -102,6 +122,7 @@ mod tests {
             FeatureAck::FedAuth(FedAuthAck::SecurityToken { nonce }) => {
                 assert!(nonce.is_none());
             }
+            _ => panic!("expected a FEDAUTH ack"),
         }
     }
 
@@ -128,6 +149,55 @@ mod tests {
         let err = TokenFeatureExtAck::decode(&mut buf.into_sql_read_bytes())
             .await
             .expect_err("unsupported feature must error");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn decodes_utf8_support_ack() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(FEA_EXT_UTF8_SUPPORT);
+        buf.put_u32_le(1);
+        buf.put_u8(0x01);
+        buf.put_u8(FEA_EXT_TERMINATOR);
+
+        let ack = TokenFeatureExtAck::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ack.features.as_slice(),
+            [FeatureAck::Utf8Support { supported: true }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn decodes_utf8_support_ack_not_supported() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(FEA_EXT_UTF8_SUPPORT);
+        buf.put_u32_le(1);
+        buf.put_u8(0x00);
+        buf.put_u8(FEA_EXT_TERMINATOR);
+
+        let ack = TokenFeatureExtAck::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ack.features.as_slice(),
+            [FeatureAck::Utf8Support { supported: false }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_invalid_utf8_support_length() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(FEA_EXT_UTF8_SUPPORT);
+        buf.put_u32_le(2);
+        buf.extend_from_slice(&[0x01, 0x00]);
+
+        let err = TokenFeatureExtAck::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect_err("UTF8_SUPPORT ack with length != 1 must error");
         assert!(matches!(err, Error::Protocol(_)));
     }
 
